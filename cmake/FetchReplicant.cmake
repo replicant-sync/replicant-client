@@ -113,7 +113,7 @@ function(fetch_replicant)
 
     # Platform-specific link dependencies
     if(APPLE)
-        target_link_libraries(replicant_client INTERFACE "-framework Security" "-framework Foundation")
+        target_link_libraries(replicant_client INTERFACE "-framework Security" "-framework Foundation" "-framework SystemConfiguration")
     elseif(UNIX)
         target_link_libraries(replicant_client INTERFACE pthread dl m)
     elseif(WIN32)
