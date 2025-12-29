@@ -12,7 +12,7 @@ name = "replicant-server"
 path = "src/main.rs"
 
 [dependencies]
-replicant-core = { path = "../replicant-core" }
+replicant-core = { path = "../replicant-core", features = ["server"] }
 tokio = { workspace = true }
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
 axum = { version = "0.7", features = ["ws"] }

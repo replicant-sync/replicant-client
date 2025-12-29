@@ -3,6 +3,10 @@ name = "replicant-core"
 version = "0.1.1"
 edition = "2021"
 
+[features]
+default = []
+server = ["sqlx/postgres", "axum", "argon2"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -12,8 +16,8 @@ thiserror = { workspace = true }
 json-patch = "1.2"
 sha2 = "0.10"
 strum = { version = "0.26", features = ["derive"] }
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "json", "uuid", "chrono", "migrate"] }
-argon2 = "0.5"
-axum = { version = "0.7", features = ["ws"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "json", "uuid", "chrono", "migrate"] }
+argon2 = { version = "0.5", optional = true }
+axum = { version = "0.7", features = ["ws"], optional = true }
 tracing = { workspace = true }
 tokio = { workspace = true }

@@ -1,10 +1,13 @@
 use crate::protocol;
+#[cfg(feature = "server")]
 use axum::http::StatusCode;
+#[cfg(feature = "server")]
 use axum::response::{IntoResponse, Response};
 use chrono::ParseError;
 use std::fmt::{Display, Formatter};
 use thiserror::Error;
 use tokio::sync::mpsc::error::SendError;
+#[cfg(feature = "server")]
 use tracing::log::warn;
 #[derive(Error, Debug)]
 #[non_exhaustive]
@@ -61,6 +64,7 @@ pub enum ServerError {
     #[error("{0}")]
     ApiError(#[from] ApiError),
 
+    #[cfg(feature = "server")]
     #[error("argon2 Library Error: {0}")]
     HashingError(argon2::password_hash::Error),
 
@@ -99,6 +103,7 @@ pub enum ClientError {
     ChannelClosed,
 }
 
+#[cfg(feature = "server")]
 impl From<argon2::password_hash::Error> for SyncError {
     fn from(error: argon2::password_hash::Error) -> Self {
         SyncError::Server(ServerError::HashingError(error))
@@ -178,6 +183,7 @@ impl Display for ApiError {
         }
     }
 }
+#[cfg(feature = "server")]
 impl IntoResponse for SyncError {
     fn into_response(self) -> Response {
         #[derive(serde::Serialize)]
