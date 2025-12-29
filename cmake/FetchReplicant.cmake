@@ -3,8 +3,10 @@
 #
 # Usage:
 #   include(FetchReplicant)
-#   fetch_replicant()                    # Fetches latest release
+#   fetch_replicant()                    # Fetches latest release (static linking)
+#   fetch_replicant(SHARED)              # Use dynamic linking
 #   fetch_replicant(VERSION 0.1.0)       # Fetches specific version
+#   fetch_replicant(VERSION 0.1.0 STATIC) # Explicit static linking
 #
 # After calling fetch_replicant(), the target 'replicant_client' is available
 # for linking with target_link_libraries().
@@ -12,10 +14,15 @@
 include(FetchContent)
 
 function(fetch_replicant)
-    set(options "")
+    set(options STATIC SHARED)
     set(oneValueArgs VERSION)
     set(multiValueArgs "")
     cmake_parse_arguments(REPLICANT "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
+
+    # Default to STATIC if neither specified
+    if(NOT REPLICANT_STATIC AND NOT REPLICANT_SHARED)
+        set(REPLICANT_STATIC TRUE)
+    endif()
 
     if (TARGET replicant_client)
         return()
@@ -75,13 +82,29 @@ function(fetch_replicant)
     )
     FetchContent_MakeAvailable(replicant)
 
-    # Find the static library
-    find_library(REPLICANT_CLIENT_LIB
-        NAMES replicant_client
-        PATHS ${replicant_SOURCE_DIR}/lib
-        NO_DEFAULT_PATH
-        REQUIRED
-    )
+    # Find the library (static or shared based on option)
+    if(REPLICANT_STATIC)
+        if(WIN32)
+            set(LIB_NAME "replicant_client.lib")
+        else()
+            set(LIB_NAME "libreplicant_client.a")
+        endif()
+        find_library(REPLICANT_CLIENT_LIB
+            NAMES ${LIB_NAME}
+            PATHS ${replicant_SOURCE_DIR}/lib
+            NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH
+        )
+    else()
+        find_library(REPLICANT_CLIENT_LIB
+            NAMES replicant_client
+            PATHS ${replicant_SOURCE_DIR}/lib
+            NO_DEFAULT_PATH
+        )
+    endif()
+
+    if(NOT REPLICANT_CLIENT_LIB)
+        message(FATAL_ERROR "Could not find Replicant library in ${replicant_SOURCE_DIR}/lib")
+    endif()
 
     # Create interface target
     add_library(replicant_client INTERFACE)
@@ -97,5 +120,9 @@ function(fetch_replicant)
         target_link_libraries(replicant_client INTERFACE ws2_32 userenv bcrypt ntdll secur32 legacy_stdio_definitions)
     endif()
 
-    message(STATUS "Replicant SDK configured from: ${replicant_SOURCE_DIR}")
+    if(REPLICANT_STATIC)
+        message(STATUS "Replicant SDK configured (static) from: ${replicant_SOURCE_DIR}")
+    else()
+        message(STATUS "Replicant SDK configured (shared) from: ${replicant_SOURCE_DIR}")
+    endif()
 endfunction()
