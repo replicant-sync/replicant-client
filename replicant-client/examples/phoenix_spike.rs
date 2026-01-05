@@ -1,8 +1,11 @@
 //! Spike test for phoenix_channels_client against Elixir/Phoenix server
 //!
 //! Run with:
-//!   1. Start Phoenix server: cd ../replicant_server && mix phx.server
-//!   2. Run spike: cargo run --example phoenix_spike
+//!   1. Start Phoenix server: cd replicant_server && mix phx.server
+//!   2. Generate credentials: mix replicant.gen.credentials --name "spike"
+//!   3. Run spike:
+//!      REPLICANT_API_KEY="rpa_..." REPLICANT_API_SECRET="rps_..." \
+//!      cargo run --example phoenix_spike
 //!
 //! Pass criteria:
 //!   - Clean connect/join/leave lifecycle

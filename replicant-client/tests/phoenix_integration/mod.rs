@@ -1,6 +1,6 @@
 //! Integration tests for Rust client ↔ Phoenix server communication.
 //!
-//! These tests require a running Phoenix server:
+//! These tests require a running Phoenix server and API credentials:
 //!
 //! ```bash
 //! # Terminal 1: Start Phoenix server
@@ -9,9 +9,15 @@
 //! mix ecto.setup
 //! mix phx.server
 //!
+//! # Generate credentials (one-time)
+//! mix replicant.gen.credentials --name "integration-test"
+//!
 //! # Terminal 2: Run integration tests
-//! cd replicant-client
-//! SYNC_SERVER_URL=ws://localhost:4000/socket/websocket cargo test --test integration
+//! cd replicant-client/replicant-client
+//! REPLICANT_API_KEY="rpa_..." \
+//! REPLICANT_API_SECRET="rps_..." \
+//! RUN_INTEGRATION_TESTS=1 \
+//! cargo test --test integration
 //! ```
 
 mod basic_sync_test;
