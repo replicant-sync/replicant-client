@@ -26,6 +26,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct WebSocketClient {
     channel: Arc<Channel>,
     tx: mpsc::Sender<ServerMessage>,
+    user_id: Uuid,
 }
 
 pub struct WebSocketReceiver {
@@ -37,6 +38,7 @@ impl WebSocketClient {
         server_url: &str,
         email: &str,
         client_id: Uuid,
+        user_id: Uuid,
         api_key: &str,
         api_secret: &str,
         event_dispatcher: Option<Arc<EventDispatcher>>,
@@ -46,6 +48,7 @@ impl WebSocketClient {
             server_url,
             email,
             client_id,
+            user_id,
             api_key,
             api_secret,
             event_dispatcher,
@@ -58,6 +61,7 @@ impl WebSocketClient {
         server_url: &str,
         email: &str,
         client_id: Uuid,
+        user_id: Uuid,
         api_key: &str,
         api_secret: &str,
         event_dispatcher: Option<Arc<EventDispatcher>>,
@@ -113,7 +117,7 @@ impl WebSocketClient {
         }
 
         let (tx, rx) = mpsc::channel::<ServerMessage>(100);
-        Self::setup_broadcast_handlers(&channel, tx.clone(), is_connected);
+        Self::setup_broadcast_handlers(&channel, tx.clone(), user_id, is_connected);
 
         // Emit auth success
         let _ = tx
@@ -123,7 +127,14 @@ impl WebSocketClient {
             })
             .await;
 
-        Ok((Self { channel, tx }, WebSocketReceiver { rx }))
+        Ok((
+            Self {
+                channel,
+                tx,
+                user_id,
+            },
+            WebSocketReceiver { rx },
+        ))
     }
 
     fn to_websocket_url(server_url: &str) -> SyncResult<String> {
@@ -144,6 +155,7 @@ impl WebSocketClient {
     fn setup_broadcast_handlers(
         channel: &Arc<Channel>,
         tx: mpsc::Sender<ServerMessage>,
+        user_id: Uuid,
         is_connected: Arc<AtomicBool>,
     ) {
         let events = channel.events();
@@ -159,7 +171,9 @@ impl WebSocketClient {
 
                         match event_name.as_str() {
                             "document_created" => {
-                                if let Some(doc) = payload_json.as_ref().and_then(json_to_document)
+                                if let Some(doc) = payload_json
+                                    .as_ref()
+                                    .and_then(|j| json_to_document(j, user_id))
                                 {
                                     let _ = tx_clone
                                         .send(ServerMessage::DocumentCreated { document: doc })
@@ -299,7 +313,7 @@ impl WebSocketClient {
             Ok(j) => {
                 if let Some(docs) = j.get("documents").and_then(|v| v.as_array()) {
                     for doc_json in docs {
-                        if let Some(document) = json_to_document(doc_json) {
+                        if let Some(document) = json_to_document(doc_json, self.user_id) {
                             let _ = self.tx.send(ServerMessage::SyncDocument { document }).await;
                         }
                     }
@@ -434,14 +448,10 @@ fn payload_to_value(p: &Payload) -> Option<Value> {
     }
 }
 
-fn json_to_document(j: &Value) -> Option<Document> {
+fn json_to_document(j: &Value, user_id: Uuid) -> Option<Document> {
     Some(Document {
-        id: Uuid::parse_str(j.get("id")?.as_str()?).ok()?,
-        user_id: j
-            .get("user_id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| Uuid::parse_str(s).ok())
-            .unwrap_or_else(Uuid::nil),
+        id: Uuid::parse_str(j.get("document_id")?.as_str()?).ok()?,
+        user_id,
         content: j.get("content")?.clone(),
         sync_revision: j.get("sync_revision")?.as_i64()?,
         content_hash: j
