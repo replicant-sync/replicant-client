@@ -14,8 +14,7 @@
 // Re-export client types
 pub use replicant_client::Client;
 
-// Re-export server types
-pub use replicant_server::AppState as Server;
+// Server is now Elixir/Phoenix - see replicant-server/ in repo root
 
 // Re-export core types that external applications may need
 pub use replicant_core::errors::SyncError;
