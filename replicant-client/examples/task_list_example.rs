@@ -54,20 +54,16 @@ struct Cli {
     #[arg(short, long)]
     user: Option<String>,
 
-    /// Server WebSocket URL
-    #[arg(short, long, default_value = "ws://localhost:8080/ws")]
+    /// Server WebSocket URL (Phoenix server)
+    #[arg(short, long, default_value = "ws://localhost:4000/socket/websocket")]
     server: String,
 
-    /// API key for authentication
-    #[arg(
-        short = 'k',
-        long,
-        default_value = "rpa_demo123456789012345678901234567890"
-    )]
+    /// API key for authentication (from: mix replicant.gen.credentials)
+    #[arg(short = 'k', long, env = "REPLICANT_API_KEY")]
     api_key: String,
 
-    /// API secret for authentication
-    #[arg(long, default_value = "rps_demo123456789012345678901234567890")]
+    /// API secret for authentication (from: mix replicant.gen.credentials)
+    #[arg(long, env = "REPLICANT_API_SECRET")]
     api_secret: String,
 }
 

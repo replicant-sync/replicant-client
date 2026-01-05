@@ -22,7 +22,7 @@ url = "2.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.4", features = ["derive", "env"] }
 dialoguer = "0.11"
 colored = "2.1"
 ratatui = "0.26"
