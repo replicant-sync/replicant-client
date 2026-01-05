@@ -28,6 +28,15 @@ dialoguer = "0.11"
 colored = "2.1"
 ratatui = "0.26"
 crossterm = "0.27"
+phoenix_channels_client = { git = "https://github.com/liveview-native/phoenix-channels-client" }
+anyhow = "1.0"
+url = "2.5"
+env_logger = "0.11"
+log = "0.4"
+
+[[example]]
+name = "phoenix_spike"
+path = "examples/phoenix_spike.rs"
 
 [build-dependencies]
 cbindgen = "0.26"
