@@ -54,20 +54,16 @@ struct Cli {
     #[arg(short, long)]
     user: Option<String>,
 
-    /// Server WebSocket URL
-    #[arg(short, long, default_value = "ws://localhost:8080/ws")]
+    /// Server WebSocket URL (Phoenix server)
+    #[arg(short, long, default_value = "ws://localhost:4000/socket/websocket")]
     server: String,
 
-    /// API key for authentication
-    #[arg(
-        short = 'k',
-        long,
-        default_value = "rpa_demo123456789012345678901234567890"
-    )]
+    /// API key for authentication (from: mix replicant.gen.credentials)
+    #[arg(short = 'k', long, env = "REPLICANT_API_KEY")]
     api_key: String,
 
-    /// API secret for authentication
-    #[arg(long, default_value = "rps_demo123456789012345678901234567890")]
+    /// API secret for authentication (from: mix replicant.gen.credentials)
+    #[arg(long, env = "REPLICANT_API_SECRET")]
     api_secret: String,
 }
 
@@ -902,15 +898,15 @@ fn ui(f: &mut Frame, state: &SharedState) {
 }
 
 fn render_task_list(f: &mut Frame, area: Rect, app_state: &AppState) {
-    let pending_count = app_state
+    let todo_count = app_state
         .tasks
         .iter()
         .filter(|t| t.status != "completed")
         .count();
     let block = Block::default().borders(Borders::ALL).title(format!(
-        "Tasks ({} total, {} pending)",
+        "Tasks ({} total, {} todo)",
         app_state.tasks.len(),
-        pending_count
+        todo_count
     ));
 
     let items: Vec<ListItem> = app_state
@@ -1063,7 +1059,7 @@ fn render_task_details(f: &mut Frame, area: Rect, app_state: &AppState) {
         let status_display = match task.status.as_str() {
             "completed" => "✅ Completed",
             "in_progress" => "🔄 In Progress",
-            "pending" => "⏳ Pending",
+            "todo" => "📋 Todo",
             _ => &task.status,
         };
 
@@ -1773,12 +1769,9 @@ async fn toggle_task_completion(
 
     let mut content = doc.content.clone();
     if let Some(obj) = content.as_object_mut() {
-        let current_status = obj
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("pending");
+        let current_status = obj.get("status").and_then(|v| v.as_str()).unwrap_or("todo");
         let new_status = if current_status == "completed" {
-            "pending"
+            "todo"
         } else {
             "completed"
         };
@@ -1841,7 +1834,7 @@ async fn create_sample_task(
     let content = json!({
         "title": title.clone(),
         "description": "Created from task list UI",
-        "status": "pending",
+        "status": "todo",
         "priority": "medium",
         "tags": vec!["ui", "demo"],
         "created_at": chrono::Utc::now().to_rfc3339(),

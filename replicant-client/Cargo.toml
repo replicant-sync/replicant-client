@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 replicant-core = { path = "../replicant-core" }
 tokio = { workspace = true }
-tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+phoenix_channels_client = { git = "https://github.com/liveview-native/phoenix-channels-client" }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "json", "uuid", "chrono", "tls-rustls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -14,20 +14,27 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-futures-util = "0.3"
-backon = "1.2"
 json-patch = "1.2"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+url = "2.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.4", features = ["derive", "env"] }
 dialoguer = "0.11"
 colored = "2.1"
 ratatui = "0.26"
 crossterm = "0.27"
+anyhow = "1.0"
+env_logger = "0.11"
+log = "0.4"
+serial_test = "3.0"
+
+[[example]]
+name = "phoenix_spike"
+path = "examples/phoenix_spike.rs"
 
 [build-dependencies]
 cbindgen = "0.26"

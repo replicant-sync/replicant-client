@@ -87,6 +87,7 @@ impl Client {
             server_url,
             email,
             client_id,
+            user_id,
             api_key,
             api_secret,
             Some(event_dispatcher.clone()),
@@ -1562,6 +1563,7 @@ impl Client {
         let api_key = self.api_key.clone();
         let api_secret = self.api_secret.clone();
         let client_id = self.client_id;
+        let user_id = self.user_id;
         let event_dispatcher = self.event_dispatcher.clone();
         let db = self.db.clone();
         let pending_uploads = self.pending_uploads.clone();
@@ -1597,6 +1599,7 @@ impl Client {
                         &server_url,
                         &email,
                         client_id,
+                        user_id,
                         &api_key,
                         &api_secret,
                         Some(event_dispatcher.clone()),

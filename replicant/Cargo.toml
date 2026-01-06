@@ -7,4 +7,4 @@ description = "Offline-first document synchronization library"
 [dependencies]
 replicant-core = { path = "../replicant-core" }
 replicant-client = { path = "../replicant-client" }
-replicant-server = { path = "../replicant-server" }
+# Server is now Elixir/Phoenix - see replicant-server/ in repo root
