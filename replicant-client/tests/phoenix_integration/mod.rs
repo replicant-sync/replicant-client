@@ -189,7 +189,7 @@ fn payload_to_value(p: &Payload) -> Option<Value> {
 /// Parse a document from a JSON response
 pub fn parse_document(v: &Value) -> Option<Document> {
     Some(Document {
-        id: Uuid::parse_str(v.get("id")?.as_str()?).ok()?,
+        id: Uuid::parse_str(v.get("document_id")?.as_str()?).ok()?,
         user_id: v
             .get("user_id")
             .and_then(|v| v.as_str())

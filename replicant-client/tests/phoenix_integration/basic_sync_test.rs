@@ -111,7 +111,7 @@ async fn test_create_and_delete_document() {
         .and_then(|v| v.as_array())
         .unwrap();
     let found = documents.iter().any(|d| {
-        d.get("id")
+        d.get("document_id")
             .and_then(|v| v.as_str())
             .map(|s| s == doc_id.to_string())
             .unwrap_or(false)
@@ -150,7 +150,7 @@ async fn test_full_sync() {
         .and_then(|v| v.as_array())
         .unwrap();
     let found = documents.iter().any(|d| {
-        d.get("id")
+        d.get("document_id")
             .and_then(|v| v.as_str())
             .map(|s| s == doc_id.to_string())
             .unwrap_or(false)
@@ -253,7 +253,7 @@ async fn test_large_document_sync() {
         .and_then(|v| v.as_str())
         .unwrap();
     let doc = documents.iter().find(|d| {
-        d.get("id")
+        d.get("document_id")
             .and_then(|v| v.as_str())
             .map(|s| s == doc_id)
             .unwrap_or(false)
@@ -308,7 +308,7 @@ async fn test_array_operations_no_duplication() {
         .and_then(|v| v.as_array())
         .unwrap();
     let doc = documents.iter().find(|d| {
-        d.get("id")
+        d.get("document_id")
             .and_then(|v| v.as_str())
             .map(|s| s == doc_id.to_string())
             .unwrap_or(false)
