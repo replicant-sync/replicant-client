@@ -31,7 +31,7 @@ async fn test_create_document() {
     assert!(result.is_ok(), "Create failed: {:?}", result.err());
 
     let response = result.unwrap();
-    assert!(response.get("document_id").is_some());
+    assert!(response.get("id").is_some());
     assert!(response.get("sync_revision").is_some());
     assert!(response.get("content_hash").is_some());
 }
@@ -111,7 +111,7 @@ async fn test_create_and_delete_document() {
         .and_then(|v| v.as_array())
         .unwrap();
     let found = documents.iter().any(|d| {
-        d.get("document_id")
+        d.get("id")
             .and_then(|v| v.as_str())
             .map(|s| s == doc_id.to_string())
             .unwrap_or(false)
@@ -150,7 +150,7 @@ async fn test_full_sync() {
         .and_then(|v| v.as_array())
         .unwrap();
     let found = documents.iter().any(|d| {
-        d.get("document_id")
+        d.get("id")
             .and_then(|v| v.as_str())
             .map(|s| s == doc_id.to_string())
             .unwrap_or(false)
@@ -239,7 +239,7 @@ async fn test_large_document_sync() {
     );
 
     let response = result.unwrap();
-    assert!(response.get("document_id").is_some());
+    assert!(response.get("id").is_some());
 
     // Verify via full sync that the document exists and has correct structure
     let sync_result = client.request_full_sync().await.unwrap();
@@ -248,12 +248,9 @@ async fn test_large_document_sync() {
         .and_then(|v| v.as_array())
         .unwrap();
 
-    let doc_id = response
-        .get("document_id")
-        .and_then(|v| v.as_str())
-        .unwrap();
+    let doc_id = response.get("id").and_then(|v| v.as_str()).unwrap();
     let doc = documents.iter().find(|d| {
-        d.get("document_id")
+        d.get("id")
             .and_then(|v| v.as_str())
             .map(|s| s == doc_id)
             .unwrap_or(false)
@@ -308,7 +305,7 @@ async fn test_array_operations_no_duplication() {
         .and_then(|v| v.as_array())
         .unwrap();
     let doc = documents.iter().find(|d| {
-        d.get("document_id")
+        d.get("id")
             .and_then(|v| v.as_str())
             .map(|s| s == doc_id.to_string())
             .unwrap_or(false)

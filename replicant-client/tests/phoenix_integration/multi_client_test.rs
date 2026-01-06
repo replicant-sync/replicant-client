@@ -38,7 +38,7 @@ async fn test_two_clients_same_user() {
         .and_then(|v| v.as_array())
         .unwrap();
     let found = documents.iter().any(|d| {
-        d.get("document_id")
+        d.get("id")
             .and_then(|v| v.as_str())
             .map(|s| s == doc_id.to_string())
             .unwrap_or(false)
@@ -86,7 +86,7 @@ async fn test_update_propagates_to_other_client() {
         .and_then(|v| v.as_array())
         .unwrap();
     let doc = documents.iter().find(|d| {
-        d.get("document_id")
+        d.get("id")
             .and_then(|v| v.as_str())
             .map(|s| s == doc_id.to_string())
             .unwrap_or(false)
@@ -131,7 +131,7 @@ async fn test_delete_propagates_to_other_client() {
         .and_then(|v| v.as_array())
         .unwrap();
     let found_before = documents.iter().any(|d| {
-        d.get("document_id")
+        d.get("id")
             .and_then(|v| v.as_str())
             .map(|s| s == doc_id.to_string())
             .unwrap_or(false)
@@ -151,7 +151,7 @@ async fn test_delete_propagates_to_other_client() {
         .and_then(|v| v.as_array())
         .unwrap();
     let found_after = documents.iter().any(|d| {
-        d.get("document_id")
+        d.get("id")
             .and_then(|v| v.as_str())
             .map(|s| s == doc_id.to_string())
             .unwrap_or(false)
@@ -231,7 +231,7 @@ async fn test_bidirectional_sync() {
 
     let has_doc_a_id = |docs: &[serde_json::Value]| {
         docs.iter().any(|d| {
-            d.get("document_id")
+            d.get("id")
                 .and_then(|v| v.as_str())
                 .map(|s| s == doc_a_id.to_string())
                 .unwrap_or(false)
@@ -240,7 +240,7 @@ async fn test_bidirectional_sync() {
 
     let has_doc_b_id = |docs: &[serde_json::Value]| {
         docs.iter().any(|d| {
-            d.get("document_id")
+            d.get("id")
                 .and_then(|v| v.as_str())
                 .map(|s| s == doc_b_id.to_string())
                 .unwrap_or(false)
@@ -294,7 +294,7 @@ async fn test_three_clients_full_crud() {
         let sync = client.request_full_sync().await.unwrap();
         let docs = sync.get("documents").and_then(|v| v.as_array()).unwrap();
         let found = docs.iter().any(|d| {
-            d.get("document_id")
+            d.get("id")
                 .and_then(|v| v.as_str())
                 .map(|s| s == doc_id.to_string())
                 .unwrap_or(false)
@@ -322,7 +322,7 @@ async fn test_three_clients_full_crud() {
     let sync_3 = client_3.request_full_sync().await.unwrap();
     let docs_3 = sync_3.get("documents").and_then(|v| v.as_array()).unwrap();
     let doc = docs_3.iter().find(|d| {
-        d.get("document_id")
+        d.get("id")
             .and_then(|v| v.as_str())
             .map(|s| s == doc_id.to_string())
             .unwrap_or(false)
@@ -347,7 +347,7 @@ async fn test_three_clients_full_crud() {
         let sync = client.request_full_sync().await.unwrap();
         let docs = sync.get("documents").and_then(|v| v.as_array()).unwrap();
         let found = docs.iter().any(|d| {
-            d.get("document_id")
+            d.get("id")
                 .and_then(|v| v.as_str())
                 .map(|s| s == doc_id.to_string())
                 .unwrap_or(false)
@@ -386,7 +386,7 @@ async fn test_no_duplicate_broadcast_to_sender() {
     let matching_docs: Vec<_> = docs
         .iter()
         .filter(|d| {
-            d.get("document_id")
+            d.get("id")
                 .and_then(|v| v.as_str())
                 .map(|s| s == doc_id.to_string())
                 .unwrap_or(false)

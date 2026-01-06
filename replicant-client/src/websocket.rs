@@ -190,7 +190,7 @@ impl WebSocketClient {
                             "document_deleted" => {
                                 if let Some(id) = payload_json
                                     .as_ref()
-                                    .and_then(|j| j.get("document_id")?.as_str())
+                                    .and_then(|j| j.get("id")?.as_str())
                                     .and_then(|s| Uuid::parse_str(s).ok())
                                 {
                                     let _ = tx_clone
@@ -243,7 +243,7 @@ impl WebSocketClient {
         let resp = self.call("create_document", &payload).await;
 
         let (success, error) = match &resp {
-            Ok(j) => (j.get("document_id").is_some(), None),
+            Ok(j) => (j.get("id").is_some(), None),
             Err(e) => (false, Some(format!("{:?}", e))),
         };
 
@@ -260,7 +260,7 @@ impl WebSocketClient {
 
     async fn update_document(&self, patch: DocumentPatch) -> SyncResult<()> {
         let payload = json!({
-            "document_id": patch.document_id.to_string(),
+            "id": patch.document_id.to_string(),
             "patch": patch.patch,
             "content_hash": patch.content_hash
         });
@@ -287,7 +287,7 @@ impl WebSocketClient {
     }
 
     async fn delete_document(&self, document_id: Uuid) -> SyncResult<()> {
-        let payload = json!({"document_id": document_id.to_string()});
+        let payload = json!({"id": document_id.to_string()});
         let resp = self.call("delete_document", &payload).await;
 
         let (success, error) = match &resp {
@@ -450,7 +450,7 @@ fn payload_to_value(p: &Payload) -> Option<Value> {
 
 fn json_to_document(j: &Value, user_id: Uuid) -> Option<Document> {
     Some(Document {
-        id: Uuid::parse_str(j.get("document_id")?.as_str()?).ok()?,
+        id: Uuid::parse_str(j.get("id")?.as_str()?).ok()?,
         user_id,
         content: j.get("content")?.clone(),
         sync_revision: j.get("sync_revision")?.as_i64()?,
@@ -469,7 +469,7 @@ fn json_to_patch(j: &Value) -> Option<DocumentPatch> {
     let patch_value = j.get("patch")?;
     let patch: json_patch::Patch = serde_json::from_value(patch_value.clone()).ok()?;
     Some(DocumentPatch {
-        document_id: Uuid::parse_str(j.get("document_id")?.as_str()?).ok()?,
+        document_id: Uuid::parse_str(j.get("id")?.as_str()?).ok()?,
         patch,
         content_hash: j
             .get("content_hash")
@@ -482,7 +482,7 @@ fn json_to_patch(j: &Value) -> Option<DocumentPatch> {
 fn json_to_change_event(j: &Value) -> Option<ChangeEvent> {
     Some(ChangeEvent {
         sequence: j.get("sequence")?.as_u64()?,
-        document_id: Uuid::parse_str(j.get("document_id")?.as_str()?).ok()?,
+        document_id: Uuid::parse_str(j.get("id")?.as_str()?).ok()?,
         user_id: Uuid::nil(),
         event_type: match j.get("event_type")?.as_str()? {
             "create" => ChangeEventType::Create,

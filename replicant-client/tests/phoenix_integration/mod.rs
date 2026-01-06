@@ -135,7 +135,7 @@ impl TestClient {
         content_hash: &str,
     ) -> Result<Value, String> {
         let payload = json!({
-            "document_id": document_id.to_string(),
+            "id": document_id.to_string(),
             "patch": patch,
             "content_hash": content_hash
         });
@@ -143,7 +143,7 @@ impl TestClient {
     }
 
     pub async fn delete_document(&self, document_id: Uuid) -> Result<Value, String> {
-        let payload = json!({"document_id": document_id.to_string()});
+        let payload = json!({"id": document_id.to_string()});
         self.call("delete_document", &payload).await
     }
 
@@ -189,7 +189,7 @@ fn payload_to_value(p: &Payload) -> Option<Value> {
 /// Parse a document from a JSON response
 pub fn parse_document(v: &Value) -> Option<Document> {
     Some(Document {
-        id: Uuid::parse_str(v.get("document_id")?.as_str()?).ok()?,
+        id: Uuid::parse_str(v.get("id")?.as_str()?).ok()?,
         user_id: v
             .get("user_id")
             .and_then(|v| v.as_str())
