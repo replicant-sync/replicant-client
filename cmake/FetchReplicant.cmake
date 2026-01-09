@@ -41,10 +41,10 @@ function(fetch_replicant)
 
     if (REPLICANT_VERSION)
         # Specific version requested
-        set(RELEASE_API_URL "https://api.github.com/repos/adamski/replicant/releases/tags/v${REPLICANT_VERSION}")
+        set(RELEASE_API_URL "https://api.github.com/repos/replicant-sync/replicant-client/releases/tags/v${REPLICANT_VERSION}")
     else()
         # Latest version
-        set(RELEASE_API_URL "https://api.github.com/repos/adamski/replicant/releases/latest")
+        set(RELEASE_API_URL "https://api.github.com/repos/replicant-sync/replicant-client/releases/latest")
     endif()
 
     # Query GitHub API for release info
