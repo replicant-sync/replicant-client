@@ -19,7 +19,7 @@ use crate::{Client as CoreClient, ClientDatabase};
 
 /// Opaque handle to a Replicant client instance
 pub struct Replicant {
-    engine: Option<CoreClient>,
+    engine: Arc<std::sync::Mutex<Option<CoreClient>>>,
     database: Arc<ClientDatabase>,
     runtime: Runtime,
     pub(crate) event_dispatcher: Arc<EventDispatcher>,
@@ -120,17 +120,40 @@ pub unsafe extern "C" fn replicant_create(
         return ptr::null_mut();
     }
 
-    let event_dispatcher = Arc::new(EventDispatcher::new());
+    // Ensure user config exists so offline operations work immediately
+    if runtime
+        .block_on(async {
+            database
+                .ensure_user_config_with_identifier(server_url, email)
+                .await
+        })
+        .is_err()
+    {
+        return ptr::null_mut();
+    }
 
-    // Try to create sync engine (optional - can work offline)
-    let engine = runtime.block_on(async {
-        let sync_engine = CoreClient::new(database_url, server_url, email, api_key, api_secret)
-            .await
-            .ok()?;
-        // We can't easily replace the event dispatcher in an existing SyncEngine,
-        // so we'll use separate dispatchers for now. In a production system,
-        // you'd want to refactor to share the same dispatcher.
-        Some(sync_engine)
+    let event_dispatcher = Arc::new(EventDispatcher::new());
+    let engine = Arc::new(std::sync::Mutex::new(None));
+
+    // Spawn background task to create sync engine (connect + initial sync)
+    let engine_slot = engine.clone();
+    let event_dispatcher_clone = event_dispatcher.clone();
+    let database_url = database_url.to_string();
+    let server_url = server_url.to_string();
+    let email = email.to_string();
+    let api_key = api_key.to_string();
+    let api_secret = api_secret.to_string();
+    runtime.spawn(async move {
+        match CoreClient::new(&database_url, &server_url, &email, &api_key, &api_secret).await {
+            Ok(client) => {
+                *engine_slot.lock().unwrap() = Some(client);
+                event_dispatcher_clone.emit_connection_succeeded(&server_url);
+                event_dispatcher_clone.emit_sync_completed(0);
+            }
+            Err(e) => {
+                event_dispatcher_clone.emit_sync_error(&format!("Background init failed: {}", e));
+            }
+        }
     });
 
     Box::into_raw(Box::new(Replicant {
@@ -186,7 +209,8 @@ pub unsafe extern "C" fn replicant_create_document(
         Err(_) => return SyncResult::ErrorSerialization,
     };
 
-    let doc_id = if let Some(ref sync_engine) = engine.engine {
+    let engine_guard = engine.engine.lock().unwrap();
+    let doc_id = if let Some(ref sync_engine) = *engine_guard {
         // Online mode - use sync engine
         match engine
             .runtime
@@ -202,6 +226,7 @@ pub unsafe extern "C" fn replicant_create_document(
             Err(_) => return SyncResult::ErrorConnection,
         }
     } else {
+        drop(engine_guard);
         // Offline mode - create locally
         let doc_id = Uuid::new_v4();
         let user_id = match engine
@@ -305,7 +330,8 @@ pub unsafe extern "C" fn replicant_create_document_with_id(
         Err(_) => return SyncResult::ErrorSerialization,
     };
 
-    if let Some(ref sync_engine) = engine.engine {
+    let engine_guard = engine.engine.lock().unwrap();
+    if let Some(ref sync_engine) = *engine_guard {
         // Online mode - use sync engine
         match engine.runtime.block_on(async {
             sync_engine
@@ -320,6 +346,7 @@ pub unsafe extern "C" fn replicant_create_document_with_id(
             Err(_) => return SyncResult::ErrorConnection,
         }
     } else {
+        drop(engine_guard);
         // Offline mode - create locally
         let user_id = match engine
             .runtime
@@ -401,7 +428,8 @@ pub unsafe extern "C" fn replicant_update_document(
         Err(_) => return SyncResult::ErrorSerialization,
     };
 
-    if let Some(ref sync_engine) = engine.engine {
+    let engine_guard = engine.engine.lock().unwrap();
+    if let Some(ref sync_engine) = *engine_guard {
         // Online mode
         match engine
             .runtime
@@ -411,6 +439,7 @@ pub unsafe extern "C" fn replicant_update_document(
             Err(_) => SyncResult::ErrorConnection,
         }
     } else {
+        drop(engine_guard);
         // Offline mode - update locally
         let doc = match engine
             .runtime
@@ -474,7 +503,8 @@ pub unsafe extern "C" fn replicant_delete_document(
         Err(_) => return SyncResult::ErrorInvalidInput,
     };
 
-    if let Some(ref sync_engine) = engine.engine {
+    let engine_guard = engine.engine.lock().unwrap();
+    if let Some(ref sync_engine) = *engine_guard {
         // Online mode
         match engine
             .runtime
@@ -484,6 +514,7 @@ pub unsafe extern "C" fn replicant_delete_document(
             Err(_) => SyncResult::ErrorConnection,
         }
     } else {
+        drop(engine_guard);
         // Offline mode
         match engine
             .runtime
@@ -890,8 +921,9 @@ pub unsafe extern "C" fn replicant_is_connected(engine: *mut Replicant) -> bool 
 
     let engine = &*engine;
 
-    match &engine.engine {
-        Some(sync_engine) => sync_engine.is_connected(),
+    let engine_guard = engine.engine.lock().unwrap();
+    match *engine_guard {
+        Some(ref sync_engine) => sync_engine.is_connected(),
         None => false,
     }
 }
@@ -919,7 +951,8 @@ pub unsafe extern "C" fn replicant_count_pending_sync(
     let engine = &*engine;
 
     // If we have a sync engine, use it; otherwise check database directly
-    let count = if let Some(ref sync_engine) = engine.engine {
+    let engine_guard = engine.engine.lock().unwrap();
+    let count = if let Some(ref sync_engine) = *engine_guard {
         match engine
             .runtime
             .block_on(async { sync_engine.count_pending_sync().await })
@@ -928,6 +961,7 @@ pub unsafe extern "C" fn replicant_count_pending_sync(
             Err(_) => return SyncResult::ErrorDatabase,
         }
     } else {
+        drop(engine_guard);
         // Offline mode - check pending documents in database
         match engine
             .runtime

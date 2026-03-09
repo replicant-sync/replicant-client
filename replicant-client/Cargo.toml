@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 replicant-core = { path = "../replicant-core" }
 tokio = { workspace = true }
-phoenix_channels_client = { git = "https://github.com/liveview-native/phoenix-channels-client" }
+phoenix_channels_client = { git = "https://github.com/liveview-native/phoenix-channels-client", features = ["native-tls"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "json", "uuid", "chrono", "tls-rustls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
