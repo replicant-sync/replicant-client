@@ -22,7 +22,7 @@ pub fn make_document(user_id: Uuid, title: &str, text: &str, sync_revision: i64)
 
     Document {
         id: Uuid::new_v4(),
-        user_id,
+        user_id: Some(user_id),
         content: content.clone(),
         sync_revision,
         content_hash: None,

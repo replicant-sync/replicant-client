@@ -193,8 +193,7 @@ pub fn parse_document(v: &Value) -> Option<Document> {
         user_id: v
             .get("user_id")
             .and_then(|v| v.as_str())
-            .and_then(|s| Uuid::parse_str(s).ok())
-            .unwrap_or_else(Uuid::nil),
+            .and_then(|s| Uuid::parse_str(s).ok()),
         content: v.get("content")?.clone(),
         sync_revision: v.get("sync_revision")?.as_i64()?,
         content_hash: v

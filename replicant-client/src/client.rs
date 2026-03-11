@@ -356,7 +356,7 @@ impl Client {
     ) -> SyncResult<Document> {
         let doc = Document {
             id,
-            user_id: self.user_id,
+            user_id: Some(self.user_id),
             content,
             sync_revision: 1,
             content_hash: None,

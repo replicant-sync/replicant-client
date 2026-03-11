@@ -143,7 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             full_content["title"] = serde_json::json!(title);
             let doc = replicant_core::models::Document {
                 id: Uuid::new_v4(),
-                user_id,
+                user_id: Some(user_id),
                 content: full_content.clone(),
                 sync_revision: 1,
                 content_hash: None,

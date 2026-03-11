@@ -1847,7 +1847,7 @@ async fn create_sample_task(
         // Offline create
         let doc = Document {
             id: Uuid::new_v4(),
-            user_id,
+            user_id: Some(user_id),
             content: content.clone(),
             sync_revision: 1,
             content_hash: None,

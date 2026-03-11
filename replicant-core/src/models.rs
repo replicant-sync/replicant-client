@@ -6,7 +6,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub id: Uuid,
-    pub user_id: Uuid,
+    pub user_id: Option<Uuid>,
     pub content: serde_json::Value,
     pub sync_revision: i64,
     pub content_hash: Option<String>, // SHA256 hash for integrity verification
@@ -37,7 +37,7 @@ mod tests {
         // Test document with title
         let doc_with_title = Document {
             id: Uuid::new_v4(),
-            user_id: Uuid::new_v4(),
+            user_id: Some(Uuid::new_v4()),
             content: serde_json::json!({"title": "My Document", "test": true}),
             sync_revision: 1,
             content_hash: None,
@@ -53,7 +53,7 @@ mod tests {
         // Test document without title
         let doc_without_title = Document {
             id: Uuid::new_v4(),
-            user_id: Uuid::new_v4(),
+            user_id: Some(Uuid::new_v4()),
             content: serde_json::json!({"test": true}),
             sync_revision: 1,
             content_hash: None,

@@ -317,7 +317,7 @@ async fn create_task(
         full_content["title"] = serde_json::json!(title);
         let doc = Document {
             id: Uuid::new_v4(),
-            user_id,
+            user_id: Some(user_id),
             content: full_content.clone(),
             sync_revision: 1,
             content_hash: None,

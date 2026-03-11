@@ -207,7 +207,7 @@ async fn test_title_extraction() {
     let content_no_title = serde_json::json!({"text": "No title content"});
     let doc_no_title = Document {
         id: Uuid::new_v4(),
-        user_id,
+        user_id: Some(user_id),
         content: content_no_title,
         sync_revision: 1,
         content_hash: None,

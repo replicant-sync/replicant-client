@@ -78,7 +78,7 @@ mod tests {
         });
         let doc = Document {
             id: Uuid::new_v4(),
-            user_id,
+            user_id: Some(user_id),
             content: content.clone(),
             content_hash: None,
             title: None,
@@ -110,7 +110,7 @@ mod tests {
         let create_msg = ClientMessage::CreateDocument {
             document: Document {
                 id: doc_id,
-                user_id: Uuid::new_v4(),
+                user_id: Some(Uuid::new_v4()),
                 content: test_content.clone(),
                 sync_revision: 1,
                 content_hash: None,
@@ -182,7 +182,7 @@ mod tests {
         });
         let doc = Document {
             id: Uuid::new_v4(),
-            user_id,
+            user_id: Some(user_id),
             content: content.clone(),
             content_hash: None,
             title: None,
@@ -257,7 +257,7 @@ mod tests {
         let content = json!({"title": "Original", "text": "First version"});
         let doc = Document {
             id: specific_id,
-            user_id,
+            user_id: Some(user_id),
             content: content.clone(),
             content_hash: None,
             title: None,
@@ -278,7 +278,7 @@ mod tests {
         let updated_content = json!({"title": "Updated", "text": "Second version"});
         let doc2 = Document {
             id: specific_id,
-            user_id,
+            user_id: Some(user_id),
             content: updated_content.clone(),
             content_hash: None,
             title: None,

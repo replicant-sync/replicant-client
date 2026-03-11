@@ -448,7 +448,13 @@ fn payload_to_value(p: &Payload) -> Option<Value> {
     }
 }
 
-fn json_to_document(j: &Value, user_id: Uuid) -> Option<Document> {
+fn json_to_document(j: &Value, default_user_id: Uuid) -> Option<Document> {
+    // Use server-provided user_id if present (null = public doc), otherwise fall back to default
+    let user_id = if let Some(uid_value) = j.get("user_id") {
+        uid_value.as_str().and_then(|s| Uuid::parse_str(s).ok())
+    } else {
+        Some(default_user_id)
+    };
     Some(Document {
         id: Uuid::parse_str(j.get("id")?.as_str()?).ok()?,
         user_id,

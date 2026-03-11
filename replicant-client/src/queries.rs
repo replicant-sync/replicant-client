@@ -9,7 +9,7 @@ use uuid::Uuid;
 /// Type alias for document parameters tuple
 pub type DocumentParams = (
     String,         // id
-    String,         // user_id
+    Option<String>, // user_id
     String,         // content
     i64,            // sync_revision
     String,         // created_at
@@ -33,7 +33,7 @@ impl Queries {
 
         CREATE TABLE IF NOT EXISTS documents (
             id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
+            user_id TEXT,
             content JSON NOT NULL,
             sync_revision INTEGER NOT NULL DEFAULT 1,
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -207,7 +207,7 @@ impl DbHelpers {
     /// Parse a document from a database row
     pub fn parse_document(row: &SqliteRow) -> SyncResult<Document> {
         let id: String = row.get("id");
-        let user_id: String = row.get("user_id");
+        let user_id: Option<String> = row.get("user_id");
         let content: String = row.get("content");
         let sync_revision: i64 = row
             .try_get::<i64, _>("sync_revision")
@@ -219,7 +219,7 @@ impl DbHelpers {
 
         Ok(Document {
             id: Uuid::parse_str(&id)?,
-            user_id: Uuid::parse_str(&user_id)?,
+            user_id: user_id.map(|s| Uuid::parse_str(&s)).transpose()?,
             content: serde_json::from_str(&content)?,
             sync_revision,
             content_hash: None, // Not stored in client database
@@ -249,7 +249,7 @@ impl DbHelpers {
 
         Ok((
             doc.id.to_string(),
-            doc.user_id.to_string(),
+            doc.user_id.map(|id| id.to_string()),
             serde_json::to_string(&doc.content)?,
             doc.sync_revision,
             doc.created_at.to_rfc3339(),

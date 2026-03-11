@@ -239,7 +239,7 @@ pub unsafe extern "C" fn replicant_create_document(
 
         let doc = replicant_core::models::Document {
             id: doc_id,
-            user_id,
+            user_id: Some(user_id),
             content: content.clone(),
             sync_revision: 1,
             content_hash: None,
@@ -358,7 +358,7 @@ pub unsafe extern "C" fn replicant_create_document_with_id(
 
         let doc = replicant_core::models::Document {
             id: doc_id,
-            user_id,
+            user_id: Some(user_id),
             content: content.clone(),
             sync_revision: 1,
             content_hash: None,
