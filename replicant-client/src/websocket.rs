@@ -25,6 +25,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub struct WebSocketClient {
     channel: Arc<Channel>,
+    _public_channel: Arc<Channel>,
     tx: mpsc::Sender<ServerMessage>,
     user_id: Uuid,
 }
@@ -96,9 +97,10 @@ impl WebSocketClient {
             "timestamp": timestamp
         });
 
+        // Join per-user channel
         let channel = socket
             .channel(
-                Topic::from_string("sync:main".to_string()),
+                Topic::from_string(format!("sync:user:{}", user_id)),
                 Some(to_payload(&join_payload)?),
             )
             .await
@@ -111,13 +113,30 @@ impl WebSocketClient {
             ws_err(format!("Join failed: {:?}", e))
         })?;
 
+        // Join public channel for public document events
+        let public_channel = socket
+            .channel(
+                Topic::from_string("sync:public".to_string()),
+                Some(to_payload(&join_payload)?),
+            )
+            .await
+            .map_err(|e| ws_err(format!("Public channel create failed: {:?}", e)))?;
+
+        public_channel.join(JOIN_TIMEOUT).await.map_err(|e| {
+            if let Some(ref d) = event_dispatcher {
+                d.emit_sync_error(&format!("Public channel join failed: {:?}", e));
+            }
+            ws_err(format!("Public channel join failed: {:?}", e))
+        })?;
+
         is_connected.store(true, Ordering::Relaxed);
         if let Some(ref d) = event_dispatcher {
             d.emit_connection_succeeded(&ws_url);
         }
 
         let (tx, rx) = mpsc::channel::<ServerMessage>(100);
-        Self::setup_broadcast_handlers(&channel, tx.clone(), user_id, is_connected);
+        Self::setup_broadcast_handlers(&channel, tx.clone(), user_id, is_connected.clone());
+        Self::setup_broadcast_handlers(&public_channel, tx.clone(), user_id, is_connected);
 
         // Emit auth success
         let _ = tx
@@ -130,6 +149,7 @@ impl WebSocketClient {
         Ok((
             Self {
                 channel,
+                _public_channel: public_channel,
                 tx,
                 user_id,
             },
