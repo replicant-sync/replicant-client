@@ -144,7 +144,16 @@ pub unsafe extern "C" fn replicant_create(
     let api_key = api_key.to_string();
     let api_secret = api_secret.to_string();
     runtime.spawn(async move {
-        match CoreClient::new(&database_url, &server_url, &email, &api_key, &api_secret).await {
+        match CoreClient::with_event_dispatcher(
+            &database_url,
+            &server_url,
+            &email,
+            &api_key,
+            &api_secret,
+            Some(event_dispatcher_clone.clone()),
+        )
+        .await
+        {
             Ok(client) => {
                 *engine_slot.lock().unwrap() = Some(client);
                 event_dispatcher_clone.emit_connection_succeeded(&server_url);

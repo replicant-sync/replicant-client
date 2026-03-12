@@ -63,6 +63,18 @@ impl Client {
         api_key: &str,
         api_secret: &str,
     ) -> SyncResult<Self> {
+        Self::with_event_dispatcher(database_url, server_url, email, api_key, api_secret, None)
+            .await
+    }
+
+    pub async fn with_event_dispatcher(
+        database_url: &str,
+        server_url: &str,
+        email: &str,
+        api_key: &str,
+        api_secret: &str,
+        event_dispatcher: Option<Arc<EventDispatcher>>,
+    ) -> SyncResult<Self> {
         let db = Arc::new(ClientDatabase::new(database_url).await?);
         db.run_migrations().await?;
 
@@ -72,8 +84,7 @@ impl Client {
 
         let (user_id, client_id) = db.get_user_and_client_id().await?;
 
-        // Create the event dispatcher first
-        let event_dispatcher = Arc::new(EventDispatcher::new());
+        let event_dispatcher = event_dispatcher.unwrap_or_else(|| Arc::new(EventDispatcher::new()));
 
         // Create a channel for messages
         let (tx, rx) = mpsc::channel(100);
