@@ -22,6 +22,7 @@
 
 mod basic_sync_test;
 mod conflict_test;
+mod live_sync_test;
 mod multi_client_test;
 
 pub use serial_test::serial;
@@ -33,6 +34,7 @@ use serde_json::{json, Value};
 use sha2::Sha256;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use url::Url;
 use uuid::Uuid;
 
@@ -61,10 +63,27 @@ pub fn skip_if_no_server() -> bool {
     std::env::var("RUN_INTEGRATION_TESTS").is_err()
 }
 
+/// Generate deterministic user ID from email (matches server's Auth.deterministic_user_id/1)
+pub fn deterministic_user_id(email: &str) -> Uuid {
+    const APP_ID: &str = "com.example.sync-task-list";
+    let app_namespace = Uuid::new_v5(&Uuid::NAMESPACE_DNS, APP_ID.as_bytes());
+    Uuid::new_v5(&app_namespace, email.as_bytes())
+}
+
+/// A broadcast event received from the server
+#[derive(Debug)]
+pub struct BroadcastEvent {
+    pub event: String,
+    pub payload: Value,
+}
+
 /// Test client for integration tests
 pub struct TestClient {
     pub channel: Arc<Channel>,
+    pub public_channel: Arc<Channel>,
     pub email: String,
+    pub user_id: Uuid,
+    broadcast_rx: mpsc::Receiver<BroadcastEvent>,
 }
 
 impl TestClient {
@@ -78,6 +97,7 @@ impl TestClient {
         api_secret: &str,
     ) -> Result<Self, String> {
         let url = Url::parse(&server_url()).map_err(|e| format!("Invalid URL: {}", e))?;
+        let user_id = deterministic_user_id(email);
 
         let socket = Socket::spawn(url, None, None)
             .await
@@ -98,23 +118,86 @@ impl TestClient {
             "timestamp": timestamp
         });
 
+        // Join per-user channel
         let channel = socket
             .channel(
-                Topic::from_string("sync:main".to_string()),
+                Topic::from_string(format!("sync:user:{}", user_id)),
                 Some(to_payload(&join_payload)?),
             )
             .await
-            .map_err(|e| format!("Channel create failed: {:?}", e))?;
+            .map_err(|e| format!("User channel create failed: {:?}", e))?;
 
         channel
             .join(Duration::from_secs(10))
             .await
-            .map_err(|e| format!("Join failed: {:?}", e))?;
+            .map_err(|e| format!("User channel join failed: {:?}", e))?;
+
+        // Join public channel
+        let public_channel = socket
+            .channel(
+                Topic::from_string("sync:public".to_string()),
+                Some(to_payload(&join_payload)?),
+            )
+            .await
+            .map_err(|e| format!("Public channel create failed: {:?}", e))?;
+
+        public_channel
+            .join(Duration::from_secs(10))
+            .await
+            .map_err(|e| format!("Public channel join failed: {:?}", e))?;
+
+        // Set up broadcast event receiver
+        let (tx, rx) = mpsc::channel::<BroadcastEvent>(100);
+        Self::spawn_event_listener(&channel, tx.clone());
+        Self::spawn_event_listener(&public_channel, tx);
 
         Ok(Self {
             channel,
+            public_channel,
             email: email.to_string(),
+            user_id,
+            broadcast_rx: rx,
         })
+    }
+
+    fn spawn_event_listener(channel: &Arc<Channel>, tx: mpsc::Sender<BroadcastEvent>) {
+        let events = channel.events();
+        tokio::spawn(async move {
+            loop {
+                match events.event().await {
+                    Ok(event_payload) => {
+                        let event_name = event_payload.event.to_string();
+                        let payload_json =
+                            payload_to_value(&event_payload.payload).unwrap_or(Value::Null);
+                        let _ = tx
+                            .send(BroadcastEvent {
+                                event: event_name,
+                                payload: payload_json,
+                            })
+                            .await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    /// Receive the next broadcast event, with a timeout.
+    /// Returns None if the timeout expires before an event arrives.
+    pub async fn recv_broadcast(&mut self, timeout: Duration) -> Option<BroadcastEvent> {
+        tokio::time::timeout(timeout, self.broadcast_rx.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Drain any pending broadcast events (call before the action you want to observe).
+    pub async fn drain_broadcasts(&mut self) {
+        while self
+            .recv_broadcast(Duration::from_millis(50))
+            .await
+            .is_some()
+        {}
     }
 
     pub async fn create_document(&self, content: Value) -> Result<Value, String> {
