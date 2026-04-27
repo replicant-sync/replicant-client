@@ -2036,7 +2036,7 @@ checksum = "2b15c43186be67a4fd63bee50d0303afffcef381492ebe2c5d87f324e1b8815c"
 
 [[package]]
 name = "replicant"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "replicant-client",
  "replicant-core",
@@ -2044,7 +2044,7 @@ dependencies = [
 
 [[package]]
 name = "replicant-client"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "cbindgen",
@@ -2076,7 +2076,7 @@ dependencies = [
 
 [[package]]
 name = "replicant-core"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "axum",
