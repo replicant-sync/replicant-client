@@ -35,6 +35,8 @@ function(fetch_replicant)
         # Default to static CRT (self-contained, no runtime dependencies)
         # Use windows-x64-dynamic-crt.zip if you need dynamic CRT linking
         set(ASSET_PATTERN "windows-x64-static-crt\\.zip")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+        set(ASSET_PATTERN "linux-arm64\\.tar\\.gz")
     else()
         set(ASSET_PATTERN "linux-x64\\.tar\\.gz")
     endif()

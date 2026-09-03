@@ -19,6 +19,9 @@ jobs:
           - os: ubuntu-latest
             platform: linux-x64
             archive-ext: tar.gz
+          - os: ubuntu-24.04-arm
+            platform: linux-arm64
+            archive-ext: tar.gz
           - os: macos-latest
             platform: macos-universal
             archive-ext: tar.gz
@@ -43,7 +46,7 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
     - name: Build SDK (macOS - all variants)
       if: runner.os == 'macOS'
@@ -172,6 +175,7 @@ jobs:
       with:
         files: |
           artifacts/replicant-sdk-linux-x64/*
+          artifacts/replicant-sdk-linux-arm64/*
           artifacts/replicant-sdk-macos/*
           artifacts/replicant-sdk-windows/*
         generate_release_notes: true
