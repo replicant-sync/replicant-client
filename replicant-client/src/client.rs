@@ -24,6 +24,11 @@ use uuid::Uuid;
 // Ping intervals for heartbeat detection
 const PING_INTERVAL: Duration = Duration::from_secs(10); // Send ping every 10 seconds
 
+/// How long `shutdown` waits for the `ws_client` guard before giving up on
+/// closing the socket cleanly. Short on purpose: it is a courtesy, not a step
+/// anything else depends on (see `Client::shutdown`).
+const SOCKET_RELEASE_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Rebase rounds a single document may spend on `hash_mismatch` in one session.
 ///
 /// Two clients writing to the same document in a tight loop can reject each
@@ -318,6 +323,43 @@ impl Client {
         event_dispatcher: Option<Arc<EventDispatcher>>,
     ) -> SyncResult<Self> {
         let db = Arc::new(ClientDatabase::new(database_url).await?);
+
+        // Everything after the pool exists runs in `build`, so that a failure
+        // anywhere in it still closes the pool. Dropping a `ClientDatabase`
+        // un-closed leaves one detached sqlx worker thread per connection
+        // running this module's code for the life of the process — only
+        // `Pool::close()` joins them (DEV-1118). Failing here is not exotic: it
+        // is what a contended migration does once it outlasts sqlite's busy
+        // timeout, which is the very scenario that produced the crash.
+        match Self::build(
+            db.clone(),
+            server_url,
+            email,
+            api_key,
+            api_secret,
+            canonical_user_id,
+            event_dispatcher,
+        )
+        .await
+        {
+            Ok(client) => Ok(client),
+            Err(e) => {
+                db.close().await;
+                Err(e)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build(
+        db: Arc<ClientDatabase>,
+        server_url: &str,
+        email: &str,
+        api_key: &str,
+        api_secret: &str,
+        canonical_user_id: Option<Uuid>,
+        event_dispatcher: Option<Arc<EventDispatcher>>,
+    ) -> SyncResult<Self> {
         db.run_migrations().await?;
 
         // Ensure user_config exists with deterministic user ID based on email
@@ -426,6 +468,49 @@ impl Client {
 
     pub fn event_dispatcher(&self) -> Arc<EventDispatcher> {
         self.event_dispatcher.clone()
+    }
+
+    /// Releases everything this client holds that outlives a plain drop: the
+    /// WebSocket and, most importantly, the sqlite pool.
+    ///
+    /// Dropping the client only drops its `Pool` handle, which marks the pool
+    /// closed without waiting for anything; each sqlite connection lives on a
+    /// dedicated OS thread that sqlx spawns and never joins, so a drop can
+    /// leave those threads running. Awaiting `close()` waits for them to
+    /// finish, which matters when the caller is a dynamically loaded module
+    /// about to be unmapped (DEV-1118).
+    ///
+    /// Idempotent, and safe to call while background tasks are still running:
+    /// they see a closed pool and error out rather than hang.
+    ///
+    /// The pool is closed FIRST and unconditionally. Taking the socket first
+    /// looks tidier — background work would stop querying a pool that is about
+    /// to close — but `ws_client` is an async mutex that live tasks hold across
+    /// un-timed network sends (`send`, the heartbeat, `fetch_document`), so on a
+    /// half-open socket that guard may never arrive. Making it a precondition
+    /// for closing the pool would mean a stalled socket keeps every sqlx worker
+    /// thread alive for the life of the process, which is the very failure this
+    /// shutdown exists to prevent.
+    pub async fn shutdown(&self) {
+        self.is_connected.store(false, Ordering::SeqCst);
+        self.db.close().await;
+
+        // Best effort, and bounded: nothing downstream depends on it, since a
+        // closed pool already stops the background tasks, and the socket goes
+        // down with the runtime moments later either way.
+        match tokio::time::timeout(SOCKET_RELEASE_TIMEOUT, self.ws_client.lock()).await {
+            Ok(mut guard) => {
+                guard.take();
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "CLIENT {}: socket still in use after {:?} during shutdown; \
+                     leaving it to the runtime",
+                    self.client_id,
+                    SOCKET_RELEASE_TIMEOUT
+                );
+            }
+        }
     }
 
     async fn spawn_background_tasks(&mut self) -> SyncResult<()> {

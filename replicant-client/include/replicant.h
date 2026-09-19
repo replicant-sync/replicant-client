@@ -354,10 +354,86 @@ struct Replicant *replicant_create(const char *database_url,
 /**
  * Destroy a sync engine instance and free memory
  *
+ * NON-BLOCKING, fire-and-forget: it returns immediately and the teardown —
+ * closing both sqlite pools and joining this instance's threads — finishes on
+ * a Replicant-owned thread afterwards. The handle is invalid the moment this
+ * returns; no further call may use it.
+ *
+ * This is safe to call on a UI or audio-host thread (plugin scans, project
+ * close) precisely because it does not wait. The consequence is that threads
+ * Replicant started can still be running Replicant code for a short time after
+ * it returns — normally milliseconds, longer if sqlite is contended.
+ *
+ * THEREFORE: any caller that can be UNLOADED FROM MEMORY — every plugin —
+ * MUST make sure its own binary is never unmapped, or one of those threads
+ * will be executing code at an address that no longer exists (the DEV-1118
+ * crash: an execute access violation on an unmapped image). Pin the module
+ * once, at load:
+ *
+ *   * Windows: `GetModuleHandleExW` with `GET_MODULE_HANDLE_EX_FLAG_PIN`
+ *     (plus `GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS`) on an address in your
+ *     own module.
+ *   * macOS / Linux: `dlopen` your own image with `RTLD_NOLOAD | RTLD_NODELETE`.
+ *
+ * Pinning is the primary defence, not a workaround. A host process that only
+ * ever exits (a standalone app) does not need it; anything a host can unload
+ * does.
+ *
+ * UPGRADING FROM 0.6.2 OR EARLIER WITHOUT PINNING IS A REGRESSION. The old
+ * destroy dropped the handle, which joined the tokio runtime's threads before
+ * returning and left only sqlx's workers running; this one returns with the
+ * background init, both pools, the runtime's threads and the sqlx workers all
+ * still live. The total time any thread of ours is alive goes down — the pools
+ * are now actually closed, so nothing lingers for the life of the process — but
+ * the exposure *at the moment destroy returns* goes up.
+ *
+ * A second instance may be created immediately; it shares nothing with the one
+ * being torn down. Note only that the outgoing instance may still be writing to
+ * the same database file for a moment, so an immediate re-create against it can
+ * see sqlite contention (and `replicant_create` returns NULL if that outlasts
+ * sqlite's 5s busy timeout). `replicant_destroy_and_wait` avoids the overlap.
+ *
+ * Callers that *can* afford to wait — standalone apps shutting down, tests —
+ * should use `replicant_destroy_and_wait` instead, which reports whether the
+ * teardown actually finished.
+ *
+ * # Safety
+ * Caller must ensure engine pointer was created by replicant_create and hasn't been freed.
+ * As with any free function, no other call on this handle may be in progress on
+ * any thread — which includes destroying it from inside a Replicant callback
+ * while the call that dispatched that callback is still on the stack.
+ */
+void replicant_destroy(struct Replicant *engine);
+
+/**
+ * Destroy a sync engine instance and wait for its teardown to finish.
+ *
+ * Same as `replicant_destroy` (the handle is invalid either way, whatever this
+ * returns) but BLOCKS for up to `timeout_ms` waiting for Replicant to close
+ * its sqlite pools and join its threads.
+ *
+ * Returns `true` when the teardown completed: no REPLICANT-OWNED thread — its
+ * tokio runtime, its sqlite workers — is running any more. That is the claim,
+ * and it is narrower than "this module has no threads in it": libraries linked
+ * into Replicant (the WebSocket and TLS stacks in particular) may keep threads
+ * of their own that Replicant neither owns nor can join, so a module that has
+ * ever connected should still be pinned rather than unloaded.
+ *
+ * Returns `false` if the wait ran out, or if the caller cannot wait (destroy
+ * from inside a Replicant callback on a Replicant runtime thread) — the teardown
+ * then carries on in the background.
+ *
+ * `timeout_ms` of 0 does not wait at all; it reports whether the teardown had
+ * already finished. Pass a large value (`UINT32_MAX`) to wait in effect
+ * indefinitely.
+ *
+ * Intended for standalone applications and tests. A plugin should call
+ * `replicant_destroy` and pin its module instead of blocking a host thread.
+ *
  * # Safety
  * Caller must ensure engine pointer was created by replicant_create and hasn't been freed
  */
-void replicant_destroy(struct Replicant *engine);
+bool replicant_destroy_and_wait(struct Replicant *engine, uint32_t timeout_ms);
 
 /**
  * Create a new document

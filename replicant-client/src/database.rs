@@ -6,8 +6,32 @@ use replicant_core::{
     models::{Document, SyncStatus},
     SyncError, SyncResult,
 };
-use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    Row, SqlitePool,
+};
+use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use uuid::Uuid;
+
+/// Number of sqlx-sqlite worker threads this process has started for a
+/// Replicant pool.
+///
+/// sqlx dedicates one OS thread to every sqlite connection and never hands out
+/// a `JoinHandle` for it (`sqlx_sqlite::connection::worker`), so this counter
+/// exists to make crash dumps and shutdown logs readable: it says how many
+/// such threads Replicant is responsible for having started.
+static SQLITE_WORKERS_STARTED: AtomicU64 = AtomicU64::new(0);
+
+/// How many sqlx-sqlite worker threads Replicant has started in this process.
+pub fn sqlite_workers_started() -> u64 {
+    SQLITE_WORKERS_STARTED.load(Ordering::Relaxed)
+}
+
+/// How long sqlite waits on a lock another process holds before returning
+/// SQLITE_BUSY. This is sqlx's own default, restated so the bound on a
+/// contended connection setup is visible at the call site.
+const SQLITE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The state a caller verified before deciding to write. Passing it back to a
 /// `*_if_unchanged` write turns read-check-write into a compare-and-swap, so a
@@ -32,14 +56,69 @@ pub struct ClientDatabase {
     pub pool: SqlitePool,
 }
 
+/// Dropping a pool without closing it is the DEV-1118 bug in miniature.
+///
+/// NOTHING JOINS sqlx's per-connection worker threads — sqlx spawns them
+/// detached and keeps no `JoinHandle`. Awaiting `Pool::close()` is as close as
+/// the API gets: it resolves only once the pool's size reaches zero, so every
+/// connection, including ones still inside `establish()` or mid-statement, has
+/// finished and had `sqlite3_close` called on it. What remains after that is the
+/// worker's own thread epilogue, which is libstd code linked into this module
+/// and runs for a few microseconds more. Closing shrinks the window; it does not
+/// remove it, which is why a module that can be unloaded must still be pinned
+/// (see `replicant_destroy`).
+///
+/// A plain drop is much worse than that: it ends an *idle* worker (the command
+/// channel closes and its loop exits) but tells a busy one nothing, so a worker
+/// blocked on SQLITE_BUSY keeps running here for as long as sqlite takes.
+///
+/// Nothing in this impl can close the pool — `close()` is async and `Drop` is
+/// not — so it only says so, loudly, for the next person to find in a log.
+impl Drop for ClientDatabase {
+    fn drop(&mut self) {
+        if !self.pool.is_closed() {
+            tracing::warn!(
+                "DB: a ClientDatabase was dropped without close(); a busy sqlite \
+                 worker thread can outlive it and keep executing this module"
+            );
+        }
+    }
+}
+
 impl ClientDatabase {
     pub async fn new(database_url: &str) -> SyncResult<Self> {
+        // Same URL parsing `SqlitePoolOptions::connect` would do; spelled out so
+        // the connect options can be named:
+        //
+        //  * `thread_name` labels sqlx's per-connection worker threads as ours,
+        //    which is how DEV-1118 was identified in a minidump, and counts
+        //    them so shutdown can report how many we started.
+        //  * `busy_timeout` is sqlx's own default, restated here because it is
+        //    the bound on how long a contended `establish()` can keep a worker
+        //    thread alive inside this module (see `ffi::Replicant::shutdown`).
+        let connect_options = SqliteConnectOptions::from_str(database_url)?
+            .busy_timeout(SQLITE_BUSY_TIMEOUT)
+            .thread_name(|id| {
+                SQLITE_WORKERS_STARTED.fetch_add(1, Ordering::Relaxed);
+                format!("replicant-sqlite-{id}")
+            });
+
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(database_url)
+            .connect_with(connect_options)
             .await?;
 
         Ok(Self { pool })
+    }
+
+    /// Closes the pool, awaiting every connection's shutdown.
+    ///
+    /// `Pool::close()` only resolves once the pool's size reaches zero, which
+    /// covers connections still inside `establish()` as well as live ones, so
+    /// awaiting it is what stops a sqlite worker thread from running on past
+    /// the handle that started it. Idempotent.
+    pub async fn close(&self) {
+        self.pool.close().await;
     }
 
     pub async fn run_migrations(&self) -> SyncResult<()> {
