@@ -1,5 +1,91 @@
 # Changelog
 
+## 0.6.3 - unreleased
+
+Patch release: `replicant_destroy` keeps its signature and stays non-blocking,
+and the new wait entry point is purely additive, so no API change.
+
+Release with `cargo release 0.6.3`, naming the version explicitly: `cargo release
+patch` would produce 0.6.2, and that tag already exists — v0.6.2 points at a CI
+commit that carried no version bump, which is also why `Cargo.toml` still reads
+0.6.1.
+
+- `replicant_destroy` now actually tears the instance down instead of just
+  dropping it, and the teardown closes both sqlite pools and joins the threads
+  the handle started (DEV-1118). Previously destroy was a plain drop: the tokio
+  runtime went down (cancelling the background init task) and the pools were
+  dropped without being closed, leaving sqlx's per-connection worker threads —
+  which sqlx spawns detached and never joins — running code inside the caller's
+  module. A host that unloaded the module at that point faulted on an unmapped
+  image: a `0xC0000005` in Entonal Studio 2's CLAP plugin about one
+  clap-validator run in nine, but only in the validator's parallel mode, where
+  several processes contend on one database and SQLITE_BUSY keeps a worker alive
+  past the instance that started it.
+
+  The teardown waits for the background init task (rather than cancelling it
+  mid-connect), awaits `Pool::close()` on both pools, and drops the runtime so
+  its workers are joined. It runs on a dedicated `replicant-shutdown` thread and
+  is deliberately unbounded, because every bound would mean abandoning a pool
+  mid-close — the very thing it exists to prevent.
+
+  `replicant_destroy` keeps its signature and stays non-blocking: it starts that
+  teardown and returns at once, so a plugin host can call it on a UI thread
+  during a scan or project close without being stalled by another process's lock.
+  A `replicant_create` that fails now also closes the pool it opened, since no
+  handle comes back for anyone to destroy.
+
+- New `bool replicant_destroy_and_wait(handle, timeout_ms)`: same teardown, but
+  waits up to `timeout_ms` for it and returns whether it finished — `true` means
+  no Replicant thread is left and unloading the module is safe. `0` does not wait
+  at all; `UINT32_MAX` waits in effect indefinitely. Additive; for standalone
+  apps and tests. Plugins should keep using `replicant_destroy`.
+
+- Because `replicant_destroy` is fire-and-forget, Replicant-owned threads can
+  briefly outlive it, so a caller that a host can unload MUST pin its own module:
+  Windows `GetModuleHandleExW` with `GET_MODULE_HANDLE_EX_FLAG_PIN`, POSIX
+  `dlopen(RTLD_NOLOAD | RTLD_NODELETE)` on its own image. That is now the
+  documented primary defence (see `replicant.h`), not a workaround — the pools
+  being closed and joined shrinks the window from seconds to microseconds, it
+  does not remove it, because sqlx exposes no way to join its worker threads.
+
+- **Upgrading without pinning is a regression.** 0.6.2's destroy dropped the
+  handle, which joined the tokio runtime's threads before returning and left only
+  sqlx's workers running — forever. This one returns with the background init,
+  both pools, the runtime's threads and the sqlx workers all still live, and then
+  closes and joins them. Total hazard duration goes down; exposure at the moment
+  destroy returns goes up. The pin is what covers it.
+
+- `replicant_destroy` returning early means the outgoing instance may still be
+  writing to the database for a moment, so a host that re-instantiates
+  immediately can meet sqlite contention, and `replicant_create` returns NULL if
+  that outlasts the 5s busy timeout. `replicant_destroy_and_wait` avoids the
+  overlap. Documented on both calls in `replicant.h`.
+
+- `Client::shutdown` closes its pool before touching the socket. The `ws_client`
+  guard is held across un-timed network sends by live background tasks, so making
+  it a precondition would let a half-open socket keep every sqlx worker thread
+  alive for the life of the process — the failure this change exists to remove.
+  The socket is now released best-effort with a 500ms bound.
+
+- sqlite worker threads are now named `replicant-sqlite-N` and counted, so the
+  next crash dump says whose threads they are.
+
+- The destruction contract is documented where integrators actually read it:
+  `replicant.hpp`'s `Client`, whose `unique_ptr` deleter is what calls
+  `replicant_destroy`, not only the generated `replicant.h`.
+
+- A `Client` whose construction fails now closes the pool it opened instead of
+  dropping it un-closed, which left one unjoined sqlite worker thread per
+  connection running for the life of the process. Same fix as for a failed
+  `replicant_create`, on the background path — and this is the failure mode the
+  crash was reported against: parallel instances whose migrations outlast
+  sqlite's busy timeout.
+
+## 0.6.2 - 2026-09-13
+
+- CI publishes a linux-arm64 SDK asset. No library changes; the tag carried no
+  version bump, so `Cargo.toml` remained at 0.6.1.
+
 ## 0.6.1 - 2026-09-02
 
 - Release macOS libs now pin `MACOSX_DEPLOYMENT_TARGET` per architecture

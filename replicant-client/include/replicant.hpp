@@ -50,6 +50,62 @@ private:
  * auto doc_id = client.create_document(R"({"title":"My Document","content":"Hello World"})");
  * client.update_document(doc_id, R"({"content":"Updated content"})");
  * ```
+ *
+ * ## Destruction: YOUR MODULE MUST NEVER BE UNLOADED
+ *
+ * The destructor calls `replicant_destroy`, which is deliberately
+ * non-blocking — a plugin host destroys clients on its UI thread during scans
+ * and project close, and must not be stalled there. Replicant-owned threads
+ * therefore keep running for a short time AFTER this object is gone: normally
+ * milliseconds, seconds if another process has the sqlite database locked.
+ *
+ * Those threads execute code inside YOUR binary. If a host unloads it in that
+ * window, they run at addresses that no longer exist — an execute access
+ * violation on an unmapped image (DEV-1118). So every plugin MUST pin its own
+ * module once, at load:
+ *
+ * ```cpp
+ * #if defined(_WIN32)
+ *   #include <windows.h>
+ * #else
+ *   #include <dlfcn.h>
+ * #endif
+ *
+ * // Call once, from plugin entry / module init. Safe to call more than once.
+ * void pinThisModule()
+ * {
+ * #if defined(_WIN32)
+ *     HMODULE self {};
+ *     // PIN makes the loader keep this module mapped for the process lifetime.
+ *     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN
+ *                            | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+ *                        reinterpret_cast<LPCWSTR>(&pinThisModule),
+ *                        &self);
+ * #else
+ *     Dl_info info {};
+ *     if (dladdr(reinterpret_cast<void*>(&pinThisModule), &info) != 0
+ *         && info.dli_fname != nullptr)
+ *     {
+ *         // The handle is retained deliberately and never dlclose()d: holding it
+ *         // with RTLD_NODELETE is what keeps the image mapped.
+ *         static void* pinned = nullptr;
+ *         if (pinned == nullptr)
+ *             pinned = dlopen(info.dli_fname, RTLD_NOLOAD | RTLD_NODELETE);
+ *         (void) pinned;
+ *     }
+ * #endif
+ * }
+ * ```
+ *
+ * This is the primary defence, not a workaround. A process that only ever exits
+ * (a standalone application) does not need it; anything a host can unload does.
+ * Upgrading from 0.6.2 or earlier without pinning is a regression: the old
+ * destroy left fewer threads running at the moment it returned, even though it
+ * leaked them for the life of the process.
+ *
+ * A standalone application that wants to wait instead can call
+ * `replicant_destroy_and_wait(handle, timeout_ms)` directly; it returns true
+ * once no Replicant-owned thread is left. Plugins should not: it blocks.
  */
 class Client
 {
@@ -106,6 +162,9 @@ public:
             {
                 if (r)
                 {
+                    // Non-blocking by design: Replicant-owned threads may still
+                    // be running briefly after this returns, so the module that
+                    // contains them must be pinned. See the class docs above.
                     replicant_destroy(r);
                 }
             }

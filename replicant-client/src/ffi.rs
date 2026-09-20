@@ -4,10 +4,13 @@
 //! The generated header file will be available after building.
 
 use serde_json::Value;
+use std::cell::Cell;
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
@@ -24,6 +27,243 @@ pub struct Replicant {
     database: Arc<ClientDatabase>,
     runtime: Runtime,
     pub(crate) event_dispatcher: Arc<EventDispatcher>,
+    /// The background task `replicant_create` spawns to build the sync engine.
+    /// Kept so shutdown can wait for it instead of cancelling it: cancelling it
+    /// mid-`establish()` is what orphaned a sqlite worker thread in DEV-1118.
+    init_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Identifies this instance's runtime threads, so shutdown can tell that it
+    /// was called from inside its own runtime (where joining would deadlock).
+    instance_id: u64,
+}
+
+/// `begin_teardown` hands the handle to its thread as an address, which erases
+/// the `Send` bound the compiler would otherwise check. Keep checking it here,
+/// so that adding a `!Send` field to `Replicant` fails to build instead of
+/// silently moving something across threads.
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<Replicant>();
+};
+
+static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    /// `instance_id` of the Replicant whose tokio runtime owns this thread, or
+    /// 0 for any other thread.
+    static RUNTIME_OWNER: Cell<u64> = const { Cell::new(0) };
+}
+
+/// A teardown started by `replicant_destroy`, and whether the caller is allowed
+/// to wait for it.
+enum Teardown {
+    /// Running on its own thread, which this caller may join.
+    Waitable(std::thread::JoinHandle<()>),
+    /// Running, but not joinable from this caller — or never started at all.
+    /// Either way nothing may block on it.
+    Detached,
+}
+
+impl Replicant {
+    /// Closes everything this handle owns and joins every thread it started,
+    /// then frees it. Always runs on the dedicated thread `begin_teardown`
+    /// spawns, so that dropping the runtime is never done from inside that
+    /// runtime, and so that no FFI caller is held up by it.
+    ///
+    /// Deliberately unbounded. Nothing waits on this thread unless a caller
+    /// asks to, so there is no host to hang — and every bound one could impose
+    /// here would mean *abandoning* a pool mid-close, which is the very thing
+    /// this exists to prevent. It finishes when sqlite lets it finish (each step
+    /// is bounded in practice by sqlite's 5s busy timeout per contended
+    /// statement).
+    ///
+    /// Order matters, and every pool close is unconditional — nothing that could
+    /// stall may stand between this function and a `Pool::close()`, because
+    /// `Pool::close()` is the only thing that joins a sqlite worker thread
+    /// (dropping the runtime joins tokio's threads and no others):
+    ///
+    /// 1. Close the handle's own pool, awaited. First, so that a hang anywhere
+    ///    later cannot keep it open. It is independent of the sync engine's pool,
+    ///    so closing it early disturbs nothing. `Pool::close()` resolves only
+    ///    when the pool's size reaches zero, i.e. every connection — including
+    ///    ones still being established — is done.
+    /// 2. Wait for the background init task. Its `ClientDatabase::new` may have
+    ///    a sqlx worker thread sitting inside `establish()` retrying on
+    ///    SQLITE_BUSY; cancelling the task (which is what dropping the runtime
+    ///    does) abandons that thread *and* the pool handle that could have
+    ///    closed it. Awaiting the task means that pool always exists to close.
+    ///    Bounded in practice by the socket connect timeout and sqlite's busy
+    ///    timeout, both of which are finite.
+    /// 3. Close the sync engine's pool (and release its socket best-effort — see
+    ///    `Client::shutdown`, which closes the pool before touching the socket
+    ///    for the same reason).
+    /// 4. Drop the runtime. A plain drop joins the runtime's worker and
+    ///    blocking threads (`shutdown_background`/`shutdown_timeout` would
+    ///    deliberately not), so on return no tokio thread of ours is left.
+    fn shutdown(self) {
+        let Replicant {
+            engine,
+            database,
+            runtime,
+            event_dispatcher,
+            init_task,
+            instance_id,
+        } = self;
+
+        let started = Instant::now();
+
+        // Poisoning must never be read as "nothing to close". Every other FFI
+        // function holds these guards across a `block_on` with `unwrap()`, so a
+        // single panicking operation poisons the mutex — and skipping the close
+        // would leave behind exactly the threads this exists to join.
+        let init_task = init_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+
+        // 1. The handle's own pool, before anything that could stall.
+        runtime.block_on(database.close());
+        drop(database);
+
+        // 2. Background init: let it finish so nothing is abandoned mid-connect.
+        if let Some(handle) = init_task {
+            if let Err(e) = runtime.block_on(handle) {
+                tracing::warn!("FFI: background init ended abnormally during shutdown: {e}");
+            }
+        }
+
+        // 3. The sync engine's own pool, then its socket.
+        let client = engine
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(client) = client {
+            runtime.block_on(client.shutdown());
+            drop(client);
+        }
+        drop(engine);
+        drop(event_dispatcher);
+
+        // 4. Joins the runtime's worker and blocking threads.
+        drop(runtime);
+
+        tracing::info!(
+            "FFI: Replicant {} shut down in {:?} ({} sqlite worker thread(s) started \
+             by this process)",
+            instance_id,
+            started.elapsed(),
+            crate::database::sqlite_workers_started()
+        );
+    }
+
+    /// Runs `fut` on this instance's runtime, marking the calling thread as one
+    /// of that runtime's own for the duration.
+    ///
+    /// Every FFI function that drives async work goes through here. The mark is
+    /// what makes a *re-entrant* destroy — one issued from a callback dispatched
+    /// while an FFI call is still on this thread's stack — take the `Detached`
+    /// path instead of waiting for a teardown that cannot finish until this
+    /// frame returns. (Freeing the handle from inside a call that is still using
+    /// it is a use-after-free no library can undo; the mark keeps it from also
+    /// being a deadlock.)
+    fn block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
+        struct Restore(u64);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                RUNTIME_OWNER.with(|owner| owner.set(self.0));
+            }
+        }
+
+        let _restore = Restore(RUNTIME_OWNER.with(|owner| owner.replace(self.instance_id)));
+        self.runtime.block_on(fut)
+    }
+
+    /// Hands the handle to a dedicated thread that tears it down, and reports
+    /// whether this caller may wait for that thread.
+    ///
+    /// The teardown never runs on the caller's thread: dropping a tokio runtime
+    /// from inside itself panics, and joining a runtime's threads from one of
+    /// them deadlocks. A caller that *is* one of this instance's runtime threads
+    /// (a destroy from inside a Replicant callback, say) therefore gets
+    /// `Detached` — the teardown still happens, it just cannot be waited for
+    /// from there — rather than a deadlock or a panic across the FFI boundary.
+    fn begin_teardown(handle: Box<Replicant>) -> Teardown {
+        let instance_id = handle.instance_id;
+        let called_from_own_runtime = RUNTIME_OWNER.with(|owner| owner.get()) == instance_id;
+
+        // Handed over as an address, not as a `Box`, so that a failed spawn
+        // leaks the handle instead of dropping it on the caller's thread. That
+        // drop would block the caller joining the runtime — against this
+        // function's whole contract — and would panic outright if the caller is
+        // itself a runtime thread. A leak is the lesser evil: the memory stays
+        // valid for whatever is still running in it.
+        let raw = Box::into_raw(handle) as usize;
+
+        let worker = std::thread::Builder::new()
+            .name("replicant-shutdown".to_string())
+            .spawn(move || {
+                // SAFETY: `raw` came from `Box::into_raw` just above and is
+                // handed to exactly one thread, which is the only owner now.
+                unsafe { Box::from_raw(raw as *mut Replicant) }.shutdown()
+            });
+
+        match worker {
+            Err(e) => {
+                tracing::error!(
+                    "FFI: could not spawn the shutdown thread ({e}); \
+                     Replicant {instance_id} was leaked deliberately and its \
+                     threads will outlive this handle"
+                );
+                Teardown::Detached
+            }
+            Ok(_) if called_from_own_runtime => {
+                tracing::warn!(
+                    "FFI: Replicant {} was destroyed from its own runtime thread; \
+                     its teardown cannot be waited for from there.",
+                    instance_id
+                );
+                Teardown::Detached
+            }
+            Ok(worker) => Teardown::Waitable(worker),
+        }
+    }
+}
+
+/// Waits up to `timeout` for a teardown thread, without ever joining one that
+/// cannot be joined from here. Returns whether it finished.
+fn wait_for_teardown(teardown: Teardown, timeout: Duration) -> bool {
+    let worker = match teardown {
+        Teardown::Waitable(worker) => worker,
+        Teardown::Detached => return false,
+    };
+
+    let deadline = Instant::now() + timeout;
+    while !worker.is_finished() {
+        if Instant::now() >= deadline {
+            // The thread keeps running: abandoning the teardown is what leaves
+            // threads in an unloadable module, so it is never cut short.
+            tracing::warn!(
+                "FFI: teardown did not finish within {:?} and is still running \
+                 ({} sqlite worker thread(s) started by this process)",
+                timeout,
+                crate::database::sqlite_workers_started()
+            );
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // A panic in the teardown thread means the teardown did NOT complete: say so
+    // rather than reporting a clean shutdown.
+    match worker.join() {
+        Ok(()) => true,
+        Err(_) => {
+            tracing::error!(
+                "FFI: the teardown thread panicked; pools may not have been closed and \
+                 Replicant threads may still be running"
+            );
+            false
+        }
+    }
 }
 
 /// Result codes for C API functions
@@ -119,7 +359,17 @@ pub unsafe extern "C" fn replicant_create(
         Err(_) => return ptr::null_mut(),
     };
 
-    let runtime = match Runtime::new() {
+    let instance_id = NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
+
+    // Equivalent to `Runtime::new()`, plus named threads and an owner marker so
+    // shutdown can recognise its own runtime threads (see `destroy_blocking`).
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name(format!("replicant-{instance_id}"))
+        .on_thread_start(move || RUNTIME_OWNER.with(|owner| owner.set(instance_id)))
+        .on_thread_stop(|| RUNTIME_OWNER.with(|owner| owner.set(0)))
+        .build()
+    {
         Ok(rt) => rt,
         Err(_) => return ptr::null_mut(),
     };
@@ -129,12 +379,24 @@ pub unsafe extern "C" fn replicant_create(
         Err(_) => return ptr::null_mut(),
     };
 
+    // Failing here hands no handle back, so nothing will ever call
+    // `replicant_destroy` for this pool: close it on the way out, or its sqlite
+    // worker threads outlive a `replicant_create` the caller believes did
+    // nothing. Contended creation (migrations blocked on SQLITE_BUSY) is
+    // exactly when this path is taken.
+    let close_and_fail = |runtime: Runtime, database: Arc<ClientDatabase>| -> *mut Replicant {
+        runtime.block_on(database.close());
+        drop(database);
+        drop(runtime);
+        ptr::null_mut()
+    };
+
     // Run migrations
     if runtime
         .block_on(async { database.run_migrations().await })
         .is_err()
     {
-        return ptr::null_mut();
+        return close_and_fail(runtime, database);
     }
 
     // Ensure user config exists so offline operations work immediately
@@ -146,7 +408,7 @@ pub unsafe extern "C" fn replicant_create(
         })
         .is_err()
     {
-        return ptr::null_mut();
+        return close_and_fail(runtime, database);
     }
 
     let event_dispatcher = Arc::new(EventDispatcher::new());
@@ -160,7 +422,7 @@ pub unsafe extern "C" fn replicant_create(
     let email = email.to_string();
     let api_key = api_key.to_string();
     let api_secret = api_secret.to_string();
-    runtime.spawn(async move {
+    let init_task = runtime.spawn(async move {
         match CoreClient::with_event_dispatcher(
             &database_url,
             &server_url,
@@ -173,11 +435,38 @@ pub unsafe extern "C" fn replicant_create(
         .await
         {
             Ok(client) => {
-                *engine_slot.lock().unwrap() = Some(client);
+                // Never panic here: the client is already built, and unwinding
+                // out of this task would drop it — and its pool — un-closed,
+                // leaving a sqlx worker thread per connection running in this
+                // module. A poisoned mutex is recovered instead, so shutdown
+                // still finds the client and can close it.
+                // The slot must be empty: this task is its only writer, and
+                // teardown waits for this task before taking the slot. If that
+                // ever stopped holding, the assignment would drop a live client
+                // — and its pool — un-closed, which is the hazard itself.
+                match engine_slot.lock() {
+                    Ok(mut slot) => {
+                        debug_assert!(slot.is_none(), "engine slot was already occupied");
+                        *slot = Some(client);
+                    }
+                    Err(poisoned) => {
+                        tracing::warn!(
+                            "FFI: engine slot mutex was poisoned; storing the client anyway \
+                             so its pool can still be closed"
+                        );
+                        let mut slot = poisoned.into_inner();
+                        debug_assert!(slot.is_none(), "engine slot was already occupied");
+                        *slot = Some(client);
+                    }
+                }
                 event_dispatcher_clone.emit_connection_succeeded(&server_url);
                 event_dispatcher_clone.emit_sync_completed(0);
             }
             Err(e) => {
+                // The pool this init opened is already closed:
+                // `with_event_dispatcher` closes it on every failure path, which
+                // is what joins its sqlite worker threads. Nothing is left to
+                // clean up here, and the slot stays `None`.
                 event_dispatcher_clone.emit_sync_error(
                     ReplicantErrorCode::Unknown,
                     &format!("Background init failed: {}", e),
@@ -191,17 +480,129 @@ pub unsafe extern "C" fn replicant_create(
         database,
         runtime,
         event_dispatcher,
+        init_task: std::sync::Mutex::new(Some(init_task)),
+        instance_id,
     }))
 }
 
 /// Destroy a sync engine instance and free memory
 ///
+/// NON-BLOCKING, fire-and-forget: it returns immediately and the teardown —
+/// closing both sqlite pools and joining this instance's threads — finishes on
+/// a Replicant-owned thread afterwards. The handle is invalid the moment this
+/// returns; no further call may use it.
+///
+/// This is safe to call on a UI or audio-host thread (plugin scans, project
+/// close) precisely because it does not wait. The consequence is that threads
+/// Replicant started can still be running Replicant code for a short time after
+/// it returns — normally milliseconds, longer if sqlite is contended.
+///
+/// THEREFORE: any caller that can be UNLOADED FROM MEMORY — every plugin —
+/// MUST make sure its own binary is never unmapped, or one of those threads
+/// will be executing code at an address that no longer exists (the DEV-1118
+/// crash: an execute access violation on an unmapped image). Pin the module
+/// once, at load:
+///
+///   * Windows: `GetModuleHandleExW` with `GET_MODULE_HANDLE_EX_FLAG_PIN`
+///     (plus `GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS`) on an address in your
+///     own module.
+///   * macOS / Linux: `dlopen` your own image with `RTLD_NOLOAD | RTLD_NODELETE`.
+///
+/// Pinning is the primary defence, not a workaround. A host process that only
+/// ever exits (a standalone app) does not need it; anything a host can unload
+/// does.
+///
+/// UPGRADING FROM 0.6.2 OR EARLIER WITHOUT PINNING IS A REGRESSION. The old
+/// destroy dropped the handle, which joined the tokio runtime's threads before
+/// returning and left only sqlx's workers running; this one returns with the
+/// background init, both pools, the runtime's threads and the sqlx workers all
+/// still live. The total time any thread of ours is alive goes down — the pools
+/// are now actually closed, so nothing lingers for the life of the process — but
+/// the exposure *at the moment destroy returns* goes up.
+///
+/// A second instance may be created immediately; it shares nothing with the one
+/// being torn down. Note only that the outgoing instance may still be writing to
+/// the same database file for a moment, so an immediate re-create against it can
+/// see sqlite contention (and `replicant_create` returns NULL if that outlasts
+/// sqlite's 5s busy timeout). `replicant_destroy_and_wait` avoids the overlap.
+///
+/// Callers that *can* afford to wait — standalone apps shutting down, tests —
+/// should use `replicant_destroy_and_wait` instead, which reports whether the
+/// teardown actually finished.
+///
+/// # Safety
+/// Caller must ensure engine pointer was created by replicant_create and hasn't been freed.
+/// As with any free function, no other call on this handle may be in progress on
+/// any thread — which includes destroying it from inside a Replicant callback
+/// while the call that dispatched that callback is still on the stack.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_destroy(engine: *mut Replicant) {
+    if engine.is_null() {
+        return;
+    }
+
+    let handle = Box::from_raw(engine);
+
+    // Nothing may unwind into C. A panic here (a poisoned lock, a failing
+    // thread spawn) would otherwise cross the FFI boundary, which is UB.
+    // Dropping the returned Teardown detaches the thread; it does not stop it.
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _ = Replicant::begin_teardown(handle);
+    }))
+    .is_err()
+    {
+        tracing::error!("FFI: replicant_destroy panicked; the handle was leaked deliberately");
+    }
+}
+
+/// Destroy a sync engine instance and wait for its teardown to finish.
+///
+/// Same as `replicant_destroy` (the handle is invalid either way, whatever this
+/// returns) but BLOCKS for up to `timeout_ms` waiting for Replicant to close
+/// its sqlite pools and join its threads.
+///
+/// Returns `true` when the teardown completed: no REPLICANT-OWNED thread — its
+/// tokio runtime, its sqlite workers — is running any more. That is the claim,
+/// and it is narrower than "this module has no threads in it": libraries linked
+/// into Replicant (the WebSocket and TLS stacks in particular) may keep threads
+/// of their own that Replicant neither owns nor can join, so a module that has
+/// ever connected should still be pinned rather than unloaded.
+///
+/// Returns `false` if the wait ran out, or if the caller cannot wait (destroy
+/// from inside a Replicant callback on a Replicant runtime thread) — the teardown
+/// then carries on in the background.
+///
+/// `timeout_ms` of 0 does not wait at all; it reports whether the teardown had
+/// already finished. Pass a large value (`UINT32_MAX`) to wait in effect
+/// indefinitely.
+///
+/// Intended for standalone applications and tests. A plugin should call
+/// `replicant_destroy` and pin its module instead of blocking a host thread.
+///
 /// # Safety
 /// Caller must ensure engine pointer was created by replicant_create and hasn't been freed
 #[no_mangle]
-pub unsafe extern "C" fn replicant_destroy(engine: *mut Replicant) {
-    if !engine.is_null() {
-        let _ = Box::from_raw(engine);
+pub unsafe extern "C" fn replicant_destroy_and_wait(
+    engine: *mut Replicant,
+    timeout_ms: u32,
+) -> bool {
+    if engine.is_null() {
+        return true;
+    }
+
+    let handle = Box::from_raw(engine);
+
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let teardown = Replicant::begin_teardown(handle);
+        wait_for_teardown(teardown, Duration::from_millis(u64::from(timeout_ms)))
+    })) {
+        Ok(finished) => finished,
+        Err(_) => {
+            tracing::error!(
+                "FFI: replicant_destroy_and_wait panicked; the handle was leaked deliberately"
+            );
+            false
+        }
     }
 }
 
@@ -242,10 +643,7 @@ pub unsafe extern "C" fn replicant_create_document(
     let engine_guard = engine.engine.lock().unwrap();
     let doc_id = if let Some(ref sync_engine) = *engine_guard {
         // Online mode - use sync engine
-        match engine
-            .runtime
-            .block_on(async { sync_engine.create_document(content.clone()).await })
-        {
+        match engine.block_on(async { sync_engine.create_document(content.clone()).await }) {
             Ok(doc) => {
                 // Emit event to FFI event dispatcher
                 engine
@@ -266,10 +664,7 @@ pub unsafe extern "C" fn replicant_create_document(
         drop(engine_guard);
         // Offline mode - create locally
         let doc_id = Uuid::new_v4();
-        let user_id = match engine
-            .runtime
-            .block_on(async { engine.database.get_user_id().await })
-        {
+        let user_id = match engine.block_on(async { engine.database.get_user_id().await }) {
             Ok(id) => id,
             Err(_) => return SyncResult::ErrorDatabase,
         };
@@ -290,7 +685,6 @@ pub unsafe extern "C" fn replicant_create_document(
         };
 
         if engine
-            .runtime
             .block_on(async { engine.database.save_document(&doc).await })
             .is_err()
         {
@@ -380,7 +774,7 @@ pub unsafe extern "C" fn replicant_create_document_with_id(
     let engine_guard = engine.engine.lock().unwrap();
     if let Some(ref sync_engine) = *engine_guard {
         // Online mode - use sync engine
-        match engine.runtime.block_on(async {
+        match engine.block_on(async {
             sync_engine
                 .create_document_with_id(doc_id, content.clone())
                 .await
@@ -402,10 +796,7 @@ pub unsafe extern "C" fn replicant_create_document_with_id(
     } else {
         drop(engine_guard);
         // Offline mode - create locally
-        let user_id = match engine
-            .runtime
-            .block_on(async { engine.database.get_user_id().await })
-        {
+        let user_id = match engine.block_on(async { engine.database.get_user_id().await }) {
             Ok(id) => id,
             Err(_) => return SyncResult::ErrorDatabase,
         };
@@ -426,7 +817,6 @@ pub unsafe extern "C" fn replicant_create_document_with_id(
         };
 
         if engine
-            .runtime
             .block_on(async { engine.database.save_document(&doc).await })
             .is_err()
         {
@@ -495,20 +885,14 @@ pub unsafe extern "C" fn replicant_update_document(
     let engine_guard = engine.engine.lock().unwrap();
     if let Some(ref sync_engine) = *engine_guard {
         // Online mode
-        match engine
-            .runtime
-            .block_on(async { sync_engine.update_document(doc_uuid, content).await })
-        {
+        match engine.block_on(async { sync_engine.update_document(doc_uuid, content).await }) {
             Ok(_) => SyncResult::Success,
             Err(_) => SyncResult::ErrorConnection,
         }
     } else {
         drop(engine_guard);
         // Offline mode - update locally
-        let doc = match engine
-            .runtime
-            .block_on(async { engine.database.get_document(&doc_uuid).await })
-        {
+        let doc = match engine.block_on(async { engine.database.get_document(&doc_uuid).await }) {
             Ok(d) => d,
             Err(_) => return SyncResult::ErrorDatabase,
         };
@@ -519,10 +903,7 @@ pub unsafe extern "C" fn replicant_update_document(
         updated_doc.content_hash = None; // Will be recalculated on server
         updated_doc.updated_at = chrono::Utc::now();
 
-        match engine
-            .runtime
-            .block_on(async { engine.database.save_document(&updated_doc).await })
-        {
+        match engine.block_on(async { engine.database.save_document(&updated_doc).await }) {
             Ok(_) => {
                 // Emit event for offline document update
                 engine
@@ -577,20 +958,14 @@ pub unsafe extern "C" fn replicant_delete_document(
     let engine_guard = engine.engine.lock().unwrap();
     if let Some(ref sync_engine) = *engine_guard {
         // Online mode
-        match engine
-            .runtime
-            .block_on(async { sync_engine.delete_document(doc_uuid).await })
-        {
+        match engine.block_on(async { sync_engine.delete_document(doc_uuid).await }) {
             Ok(_) => SyncResult::Success,
             Err(_) => SyncResult::ErrorConnection,
         }
     } else {
         drop(engine_guard);
         // Offline mode
-        match engine
-            .runtime
-            .block_on(async { engine.database.delete_document(&doc_uuid).await })
-        {
+        match engine.block_on(async { engine.database.delete_document(&doc_uuid).await }) {
             Ok(_) => {
                 // Emit event for offline document deletion
                 engine
@@ -638,10 +1013,7 @@ pub unsafe extern "C" fn replicant_get_user_id(
 
     let engine = &*engine;
 
-    let user_id = match engine
-        .runtime
-        .block_on(async { engine.database.get_user_id().await })
-    {
+    let user_id = match engine.block_on(async { engine.database.get_user_id().await }) {
         Ok(id) => id,
         Err(_) => return SyncResult::ErrorDatabase,
     };
@@ -948,10 +1320,7 @@ pub unsafe extern "C" fn replicant_get_document(
         Err(_) => return SyncResult::ErrorInvalidInput,
     };
 
-    let doc = match engine
-        .runtime
-        .block_on(async { engine.database.get_document(&doc_uuid).await })
-    {
+    let doc = match engine.block_on(async { engine.database.get_document(&doc_uuid).await }) {
         Ok(d) => d,
         Err(_) => return SyncResult::ErrorInvalidInput,
     };
@@ -993,10 +1362,7 @@ pub unsafe extern "C" fn replicant_get_all_documents(
 
     let engine = &*engine;
 
-    let docs = match engine
-        .runtime
-        .block_on(async { engine.database.get_all_documents().await })
-    {
+    let docs = match engine.block_on(async { engine.database.get_all_documents().await }) {
         Ok(d) => d,
         Err(_) => return SyncResult::ErrorDatabase,
     };
@@ -1041,7 +1407,6 @@ pub unsafe extern "C" fn replicant_get_all_document_ids(
     let engine = &*engine;
 
     let ids = match engine
-        .runtime
         .block_on(async { engine.database.get_all_document_ids(include_deleted).await })
     {
         Ok(d) => d,
@@ -1085,10 +1450,7 @@ pub unsafe extern "C" fn replicant_count_documents(
 
     let engine = &*engine;
 
-    let count = match engine
-        .runtime
-        .block_on(async { engine.database.count_documents().await })
-    {
+    let count = match engine.block_on(async { engine.database.count_documents().await }) {
         Ok(d) => d,
         Err(_) => return SyncResult::ErrorDatabase,
     };
@@ -1147,20 +1509,14 @@ pub unsafe extern "C" fn replicant_count_pending_sync(
     // If we have a sync engine, use it; otherwise check database directly
     let engine_guard = engine.engine.lock().unwrap();
     let count = if let Some(ref sync_engine) = *engine_guard {
-        match engine
-            .runtime
-            .block_on(async { sync_engine.count_pending_sync().await })
-        {
+        match engine.block_on(async { sync_engine.count_pending_sync().await }) {
             Ok(c) => c,
             Err(_) => return SyncResult::ErrorDatabase,
         }
     } else {
         drop(engine_guard);
         // Offline mode - check pending documents in database
-        match engine
-            .runtime
-            .block_on(async { engine.database.get_pending_documents().await })
-        {
+        match engine.block_on(async { engine.database.get_pending_documents().await }) {
             Ok(docs) => docs.len(),
             Err(_) => return SyncResult::ErrorDatabase,
         }
@@ -1210,10 +1566,7 @@ pub unsafe extern "C" fn replicant_configure_search(
         Err(_) => return SyncResult::ErrorSerialization,
     };
 
-    match engine
-        .runtime
-        .block_on(async { engine.database.configure_search(&paths).await })
-    {
+    match engine.block_on(async { engine.database.configure_search(&paths).await }) {
         Ok(_) => SyncResult::Success,
         Err(_) => SyncResult::ErrorDatabase,
     }
@@ -1262,9 +1615,7 @@ pub unsafe extern "C" fn replicant_search_documents(
 
     let limit = if limit == 0 { 100 } else { limit as i64 };
 
-    let docs = match engine
-        .runtime
-        .block_on(async { engine.database.search_documents(query, limit).await })
+    let docs = match engine.block_on(async { engine.database.search_documents(query, limit).await })
     {
         Ok(d) => d,
         Err(_) => return SyncResult::ErrorDatabase,
@@ -1308,10 +1659,7 @@ pub unsafe extern "C" fn replicant_rebuild_search_index(engine: *mut Replicant) 
 
     let engine = &*engine;
 
-    match engine
-        .runtime
-        .block_on(async { engine.database.rebuild_fts_index().await })
-    {
+    match engine.block_on(async { engine.database.rebuild_fts_index().await }) {
         Ok(_) => SyncResult::Success,
         Err(_) => SyncResult::ErrorDatabase,
     }
