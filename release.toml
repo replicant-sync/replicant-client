@@ -28,8 +28,12 @@ pre-release-hook = ["cargo", "test", "--workspace", "--lib"]
 # Consolidate commits: single commit for all version bumps in workspace
 consolidate-commits = true
 
-# Commit message for version bump
-pre-release-commit-message = "chore: bump version to {{version}}"
+# Commit message for version bump.
+# No {{version}} here: with consolidate-commits the bump is one workspace-wide
+# commit that has no single crate version, so cargo-release cannot render it and
+# emits "Unrendered {{version}} present in template". It shipped literally in two
+# earlier releases before anyone noticed. The version lives on the tag instead.
+pre-release-commit-message = "chore: bump crate versions"
 
 # Allow releasing from main branch only
 allow-branch = ["main"]
