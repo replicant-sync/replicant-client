@@ -2299,7 +2299,7 @@ dependencies = [
 
 [[package]]
 name = "replicant-client"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "anyhow",
  "cbindgen",

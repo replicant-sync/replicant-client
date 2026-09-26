@@ -1,6 +1,27 @@
 # Changelog
 
-## 0.6.3 - unreleased
+## 0.6.4
+
+Patch release: no API change. Event timing changes for hosts that relied on the
+start-up events (#45).
+
+- ConnectionSucceeded and SyncCompleted are emitted only when they happen.
+  `replicant_create` no longer emits them after background init, so an offline
+  engine or a local-only engine (no API key, or a database that never adopted an
+  identity) reports neither. SyncCompleted comes only from the server's
+  `SyncComplete` and is always preceded by SyncStarted, including after a
+  reconnect.
+- The engine is usable before it announces a connection. Start-up is split into
+  connect and start, so documents written by the host during start-up are
+  uploaded by the initial sync instead of staying pending until the next
+  reconnect.
+- A failed initial sync leaves a working client: upload protection is cleared,
+  failed sends release their in-flight entry, and the failure is reported as
+  SyncError.
+- The reconnection monitor stops on shutdown, and a shut-down client stays
+  disconnected even when a reconnect handshake completes after `shutdown()`.
+
+## 0.6.3
 
 Patch release: `replicant_destroy` keeps its signature and stays non-blocking,
 and the new wait entry point is purely additive, so no API change.
