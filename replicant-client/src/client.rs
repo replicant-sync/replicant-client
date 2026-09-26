@@ -36,6 +36,17 @@ const SOCKET_RELEASE_TIMEOUT: Duration = Duration::from_millis(500);
 /// user can see.
 const MAX_REBASE_ATTEMPTS: u32 = 3;
 
+/// Whether `shutdown` has begun. If so, also marks the client disconnected,
+/// since a connect that finished meanwhile may have marked it connected.
+fn shutdown_requested(stopped: &AtomicBool, is_connected: &AtomicBool) -> bool {
+    if stopped.load(Ordering::SeqCst) {
+        is_connected.store(false, Ordering::SeqCst);
+        true
+    } else {
+        false
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PendingUpload {
     operation_type: UploadType,
@@ -3105,7 +3116,7 @@ impl Client {
             let mut connection_attempts = 0;
 
             loop {
-                if stopped.load(Ordering::SeqCst) {
+                if shutdown_requested(&stopped, &is_connected) {
                     tracing::info!(
                         "CLIENT {}: Client shut down, reconnection monitor stopping",
                         client_id
@@ -3137,6 +3148,9 @@ impl Client {
                     .await
                     {
                         Ok((new_client, receiver)) => {
+                            if shutdown_requested(&stopped, &is_connected) {
+                                break;
+                            }
                             tracing::info!(
                                 "✅ CLIENT {}: Reconnection successful after {} attempts!",
                                 client_id,
@@ -3147,23 +3161,28 @@ impl Client {
                             // Update the client
                             {
                                 let mut guard = ws_client.lock().await;
-                                if stopped.load(Ordering::SeqCst) {
+                                if shutdown_requested(&stopped, &is_connected) {
                                     break;
                                 }
                                 *guard = Some(new_client);
                             }
+                            is_connected.store(true, Ordering::Relaxed);
                             // Shutdown may have run while the lock was held.
-                            if stopped.load(Ordering::SeqCst) {
+                            if shutdown_requested(&stopped, &is_connected) {
                                 break;
                             }
-                            is_connected.store(true, Ordering::Relaxed);
 
                             // Reset ping timer on successful connection
                             *last_ping_time.lock().await = Some(Instant::now());
 
-                            // Emit connection event
+                            if shutdown_requested(&stopped, &is_connected) {
+                                break;
+                            }
                             event_dispatcher.emit_connection_succeeded(&server_url);
 
+                            if shutdown_requested(&stopped, &is_connected) {
+                                break;
+                            }
                             // Start message receiver forwarding with connection monitoring
                             let (tx, mut rx) = mpsc::channel(100);
                             let receiver_is_connected = is_connected.clone();
@@ -3264,6 +3283,9 @@ impl Client {
                                 client_id
                             );
 
+                            if shutdown_requested(&stopped, &is_connected) {
+                                break;
+                            }
                             if let Err(e) = reconnect_sync_tx.try_send(()) {
                                 tracing::error!(
                                     "CLIENT {}: Failed to trigger reconnection sync: {}",
@@ -5988,5 +6010,6 @@ mod start_and_shutdown_tests {
         // The monitor would try again within its 5 s interval if still running.
         tokio::time::sleep(Duration::from_secs(6)).await;
         assert_eq!(attempts(&seen), at_shutdown);
+        assert!(!client.is_connected());
     }
 }

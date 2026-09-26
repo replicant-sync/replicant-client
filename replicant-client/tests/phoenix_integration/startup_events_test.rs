@@ -9,12 +9,13 @@
 //! `REPLICANT_API_KEY`, `REPLICANT_API_SECRET` and `REPLICANT_TEST_USER_ID`.
 
 use super::{
-    canonical_user_id, serial, server_url, skip_if_no_server, temp_db_path, test_api_key,
-    test_api_secret, TEST_EMAIL,
+    canonical_user_id, remove_temp_db, serial, server_url, skip_if_no_server, temp_db_path,
+    test_api_key, test_api_secret, TEST_EMAIL,
 };
 use crate::ffi_events::{
     create_engine, destroy_and_remove_db, pump_events_until, register_event_log, EventLog,
 };
+use replicant_client::events::EventDispatcher;
 use replicant_client::events::EventType;
 use replicant_client::ffi::{
     replicant_count_pending_sync, replicant_create_document, replicant_is_connected,
@@ -22,7 +23,7 @@ use replicant_client::ffi::{
 };
 use std::ffi::{c_char, CString};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -98,6 +99,8 @@ unsafe fn pending_count(engine: *mut Replicant) -> u64 {
 struct ServerProxy {
     port: u16,
     online: Arc<AtomicBool>,
+    hold: Arc<Mutex<Duration>>,
+    accepted: Arc<AtomicUsize>,
     stopping: Arc<AtomicBool>,
     streams: Arc<Mutex<Vec<TcpStream>>>,
     pumps: Arc<Mutex<Vec<JoinHandle<()>>>>,
@@ -115,12 +118,15 @@ impl ServerProxy {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let online = Arc::new(AtomicBool::new(false));
+        let hold = Arc::new(Mutex::new(Duration::ZERO));
+        let accepted = Arc::new(AtomicUsize::new(0));
         let stopping = Arc::new(AtomicBool::new(false));
         let streams = Arc::new(Mutex::new(Vec::<TcpStream>::new()));
         let pumps = Arc::new(Mutex::new(Vec::new()));
 
         let acceptor = {
             let (online, stopping) = (online.clone(), stopping.clone());
+            let (hold, accepted) = (hold.clone(), accepted.clone());
             let (streams, pumps) = (streams.clone(), pumps.clone());
             std::thread::spawn(move || {
                 for downstream in listener.incoming().flatten() {
@@ -130,6 +136,8 @@ impl ServerProxy {
                     if !online.load(Ordering::SeqCst) {
                         continue;
                     }
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(*hold.lock().unwrap());
                     let Ok(upstream) = TcpStream::connect(&upstream) else {
                         continue;
                     };
@@ -149,6 +157,8 @@ impl ServerProxy {
         Self {
             port,
             online,
+            hold,
+            accepted,
             stopping,
             streams,
             pumps,
@@ -170,6 +180,17 @@ impl ServerProxy {
 
     fn go_online(&self) {
         self.online.store(true, Ordering::SeqCst);
+    }
+
+    /// Goes online, but holds each new connection for `delay` before
+    /// forwarding it, so its handshake is still in progress meanwhile.
+    fn go_online_after(&self, delay: Duration) {
+        *self.hold.lock().unwrap() = delay;
+        self.go_online();
+    }
+
+    fn accepted(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst)
     }
 }
 
@@ -270,4 +291,66 @@ fn offline_startup_reports_connection_then_sync_after_reconnect() {
         destroy_and_remove_db(engine, &db_path);
     }
     drop(proxy);
+}
+
+#[tokio::test]
+#[serial]
+async fn shutdown_during_a_reconnect_leaves_the_client_disconnected() {
+    if skip_if_no_server() {
+        eprintln!("skipping startup events test: RUN_INTEGRATION_TESTS not set");
+        return;
+    }
+    std::fs::create_dir_all("databases").ok();
+    let db_path = temp_db_path("shutdown_reconnect");
+    let proxy = ServerProxy::start_offline();
+    let dispatcher = Arc::new(EventDispatcher::new());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    dispatcher
+        .register_rust_callback(move |event| sink.lock().unwrap().push(event.event_type()))
+        .unwrap();
+    let connected_events = || {
+        dispatcher.process_events().unwrap();
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|e| **e == EventType::ConnectionSucceeded)
+            .count()
+    };
+
+    let client = replicant_client::Client::with_event_dispatcher(
+        &format!("sqlite:{}?mode=rwc", db_path),
+        &proxy.url(),
+        TEST_EMAIL,
+        &test_api_key(),
+        &test_api_secret(),
+        Some(canonical_user_id()),
+        Some(dispatcher.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(!client.is_connected());
+
+    // The monitor's next reconnect is held in its handshake for 3 s; shut
+    // down while it is.
+    proxy.go_online_after(Duration::from_secs(3));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while proxy.accepted() == 0 {
+        assert!(Instant::now() < deadline, "the monitor never reconnected");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    client.shutdown().await;
+    let at_shutdown = connected_events();
+
+    // Let the held handshake finish.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(
+        !client.is_connected(),
+        "a shut-down client must not report connected"
+    );
+    assert_eq!(connected_events(), at_shutdown);
+
+    drop(client);
+    drop(proxy);
+    remove_temp_db(&db_path);
 }
