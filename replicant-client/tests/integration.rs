@@ -8,3 +8,5 @@
 
 #[path = "phoenix_integration/mod.rs"]
 mod phoenix_integration;
+
+mod ffi_events;

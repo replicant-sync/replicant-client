@@ -1,118 +1,41 @@
-//! Start-up connection and sync events, observed through the FFI (#45).
+//! Start-up connection and sync events, observed through the FFI.
 //!
-//! `replicant_create` must report ConnectionSucceeded only for a real connect,
-//! and SyncCompleted only once the server has answered the full sync, whether
-//! the server is reachable at start-up or only later.
+//! `replicant_create` reports ConnectionSucceeded only for a real connect, and
+//! SyncCompleted only once the server has answered the full sync, whether the
+//! server is reachable at start-up or only later.
 //!
 //! Gated behind `RUN_INTEGRATION_TESTS`; needs `SYNC_SERVER_URL`,
 //! `REPLICANT_API_KEY`, `REPLICANT_API_SECRET` and `REPLICANT_TEST_USER_ID`.
 
 use super::{
-    canonical_user_id, remove_temp_db, serial, server_url, skip_if_no_server, temp_db_path,
-    test_api_key, test_api_secret, TEST_EMAIL,
+    canonical_user_id, serial, server_url, skip_if_no_server, temp_db_path, test_api_key,
+    test_api_secret, TEST_EMAIL,
+};
+use crate::ffi_events::{
+    create_engine, destroy_and_remove_db, pump_events_until, register_event_log, EventLog,
 };
 use replicant_client::events::EventType;
-use replicant_client::ffi::{
-    replicant_create, replicant_destroy, replicant_is_connected, replicant_process_events,
-    replicant_register_connection_callback, replicant_register_error_callback,
-    replicant_register_sync_callback, Replicant, SyncResult,
-};
-use std::ffi::{c_char, c_void, CString};
-use std::net::{TcpListener, TcpStream};
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use replicant_client::ffi::{replicant_is_connected, Replicant};
+use std::net::{Shutdown, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 use url::Url;
 
-#[derive(Default)]
-struct EventLog(Mutex<Vec<EventType>>);
-
-impl EventLog {
-    fn events(&self) -> Vec<EventType> {
-        self.0.lock().unwrap().clone()
-    }
-
-    fn position(&self, event_type: EventType) -> Option<usize> {
-        self.events().iter().position(|e| *e == event_type)
-    }
-}
-
-extern "C" fn log_sync_event(event_type: EventType, _count: u64, context: *mut c_void) {
-    let log = unsafe { &*(context as *const EventLog) };
-    log.0.lock().unwrap().push(event_type);
-}
-
-extern "C" fn log_connection_event(
-    event_type: EventType,
-    _connected: bool,
-    _attempt: u32,
-    context: *mut c_void,
-) {
-    let log = unsafe { &*(context as *const EventLog) };
-    log.0.lock().unwrap().push(event_type);
-}
-
-extern "C" fn log_error_event(
-    event_type: EventType,
-    _code: i32,
-    _message: *const c_char,
-    context: *mut c_void,
-) {
-    let log = unsafe { &*(context as *const EventLog) };
-    log.0.lock().unwrap().push(event_type);
-}
-
-unsafe fn create_engine(db_url: &str, server_url: &str, log: &EventLog) -> *mut Replicant {
-    let db_url = CString::new(db_url).unwrap();
-    let server_url = CString::new(server_url).unwrap();
-    let email = CString::new(TEST_EMAIL).unwrap();
-    let api_key = CString::new(test_api_key()).unwrap();
-    let api_secret = CString::new(test_api_secret()).unwrap();
-    let user_id = CString::new(canonical_user_id().to_string()).unwrap();
-
-    let engine = replicant_create(
-        db_url.as_ptr(),
-        server_url.as_ptr(),
-        email.as_ptr(),
-        api_key.as_ptr(),
-        api_secret.as_ptr(),
-        user_id.as_ptr(),
+unsafe fn create_subject(db_path: &str, server_url: &str, log: &EventLog) -> *mut Replicant {
+    let user_id = canonical_user_id().to_string();
+    let engine = create_engine(
+        db_path,
+        server_url,
+        TEST_EMAIL,
+        &test_api_key(),
+        &test_api_secret(),
+        Some(&user_id),
     );
     assert!(!engine.is_null(), "replicant_create failed");
-
-    let context = log as *const EventLog as *mut c_void;
-    assert_eq!(
-        replicant_register_sync_callback(engine, log_sync_event, context),
-        SyncResult::Success
-    );
-    assert_eq!(
-        replicant_register_connection_callback(engine, log_connection_event, context),
-        SyncResult::Success
-    );
-    assert_eq!(
-        replicant_register_error_callback(engine, log_error_event, context),
-        SyncResult::Success
-    );
+    register_event_log(engine, log);
     engine
-}
-
-/// Pumps events until `done` holds or `timeout` passes; returns whether `done` held.
-unsafe fn pump_events_until(
-    engine: *mut Replicant,
-    log: &EventLog,
-    timeout: Duration,
-    done: impl Fn(&[EventType]) -> bool,
-) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        replicant_process_events(engine, std::ptr::null_mut());
-        if done(&log.events()) {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
 }
 
 fn assert_connected_then_synced(log: &EventLog) {
@@ -125,35 +48,101 @@ fn assert_connected_then_synced(log: &EventLog) {
     );
 }
 
-/// A port that nothing listens on yet.
-fn unused_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// A TCP forwarder to the sync server. While offline it accepts and at once
+/// closes each connection, so the server looks unreachable on its port.
+struct ServerProxy {
+    port: u16,
+    online: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
+    streams: Arc<Mutex<Vec<TcpStream>>>,
+    pumps: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    acceptor: Option<JoinHandle<()>>,
 }
 
-/// Starts forwarding `port` to the sync server, making the server reachable there.
-fn start_proxy_to_server(port: u16) {
-    let server = Url::parse(&server_url()).unwrap();
-    let upstream = format!(
-        "{}:{}",
-        server.host_str().unwrap(),
-        server.port_or_known_default().unwrap()
-    );
-    let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
-    std::thread::spawn(move || {
-        for downstream in listener.incoming().flatten() {
-            let Ok(upstream) = TcpStream::connect(&upstream) else {
-                continue;
-            };
-            let (mut down_read, mut up_write) = (downstream.try_clone().unwrap(), upstream);
-            let (mut up_read, mut down_write) = (up_write.try_clone().unwrap(), downstream);
-            std::thread::spawn(move || std::io::copy(&mut down_read, &mut up_write));
-            std::thread::spawn(move || std::io::copy(&mut up_read, &mut down_write));
+impl ServerProxy {
+    fn start_offline() -> Self {
+        let server = Url::parse(&server_url()).unwrap();
+        let upstream = format!(
+            "{}:{}",
+            server.host_str().unwrap(),
+            server.port_or_known_default().unwrap()
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let online = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::new(AtomicBool::new(false));
+        let streams = Arc::new(Mutex::new(Vec::<TcpStream>::new()));
+        let pumps = Arc::new(Mutex::new(Vec::new()));
+
+        let acceptor = {
+            let (online, stopping) = (online.clone(), stopping.clone());
+            let (streams, pumps) = (streams.clone(), pumps.clone());
+            std::thread::spawn(move || {
+                for downstream in listener.incoming().flatten() {
+                    if stopping.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if !online.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    let Ok(upstream) = TcpStream::connect(&upstream) else {
+                        continue;
+                    };
+                    let mut streams = streams.lock().unwrap();
+                    streams.push(downstream.try_clone().unwrap());
+                    streams.push(upstream.try_clone().unwrap());
+                    let mut pumps = pumps.lock().unwrap();
+                    pumps.push(Self::pump(
+                        downstream.try_clone().unwrap(),
+                        upstream.try_clone().unwrap(),
+                    ));
+                    pumps.push(Self::pump(upstream, downstream));
+                }
+            })
+        };
+
+        Self {
+            port,
+            online,
+            stopping,
+            streams,
+            pumps,
+            acceptor: Some(acceptor),
         }
-    });
+    }
+
+    fn pump(mut from: TcpStream, mut to: TcpStream) -> JoinHandle<()> {
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut from, &mut to);
+            let _ = to.shutdown(Shutdown::Both);
+            let _ = from.shutdown(Shutdown::Both);
+        })
+    }
+
+    fn url(&self) -> String {
+        format!("ws://127.0.0.1:{}/socket/websocket", self.port)
+    }
+
+    fn go_online(&self) {
+        self.online.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for ServerProxy {
+    fn drop(&mut self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        // Wakes the acceptor so it sees `stopping`.
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(acceptor) = self.acceptor.take() {
+            let _ = acceptor.join();
+        }
+        for stream in self.streams.lock().unwrap().iter() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        for pump in self.pumps.lock().unwrap().drain(..) {
+            let _ = pump.join();
+        }
+    }
 }
 
 #[test]
@@ -164,14 +153,14 @@ fn online_startup_reports_connection_then_sync() {
         return;
     }
     std::fs::create_dir_all("databases").ok();
-    let db_file = temp_db_path("startup_online");
+    let db_path = temp_db_path("startup_online");
     let log = EventLog::default();
 
     unsafe {
-        let engine = create_engine(&format!("sqlite:{}?mode=rwc", db_file), &server_url(), &log);
+        let engine = create_subject(&db_path, &server_url(), &log);
 
-        let synced = pump_events_until(engine, &log, Duration::from_secs(30), |events| {
-            events.contains(&EventType::SyncCompleted)
+        let synced = pump_events_until(engine, Duration::from_secs(30), || {
+            log.count(EventType::SyncCompleted) > 0
         });
         assert!(
             synced,
@@ -181,9 +170,8 @@ fn online_startup_reports_connection_then_sync() {
         assert_connected_then_synced(&log);
         assert!(replicant_is_connected(engine));
 
-        replicant_destroy(engine);
+        destroy_and_remove_db(engine, &db_path);
     }
-    remove_temp_db(&db_file);
 }
 
 #[test]
@@ -194,33 +182,25 @@ fn offline_startup_reports_connection_then_sync_after_reconnect() {
         return;
     }
     std::fs::create_dir_all("databases").ok();
-    let db_file = temp_db_path("startup_reconnect");
-    let port = unused_port();
+    let db_path = temp_db_path("startup_reconnect");
+    let proxy = ServerProxy::start_offline();
     let log = EventLog::default();
 
     unsafe {
-        let engine = create_engine(
-            &format!("sqlite:{}?mode=rwc", db_file),
-            &format!("ws://127.0.0.1:{}/socket/websocket", port),
-            &log,
-        );
+        let engine = create_subject(&db_path, &proxy.url(), &log);
 
-        let connect_failed = pump_events_until(engine, &log, Duration::from_secs(15), |events| {
-            events.contains(&EventType::SyncError)
+        // The start-up connect fails, then the reconnect monitor's first try does.
+        let retried = pump_events_until(engine, Duration::from_secs(15), || {
+            log.count(EventType::SyncError) >= 2
         });
-        assert!(
-            connect_failed,
-            "the connect should fail: {:?}",
-            log.events()
-        );
-        pump_events_until(engine, &log, Duration::from_secs(1), |_| false);
-        assert_eq!(log.position(EventType::ConnectionSucceeded), None);
-        assert_eq!(log.position(EventType::SyncCompleted), None);
+        assert!(retried, "both connects should fail: {:?}", log.events());
+        assert_eq!(log.count(EventType::ConnectionSucceeded), 0);
+        assert_eq!(log.count(EventType::SyncCompleted), 0);
 
-        start_proxy_to_server(port);
+        proxy.go_online();
 
-        let synced = pump_events_until(engine, &log, Duration::from_secs(30), |events| {
-            events.contains(&EventType::SyncCompleted)
+        let synced = pump_events_until(engine, Duration::from_secs(30), || {
+            log.count(EventType::SyncCompleted) > 0
         });
         assert!(
             synced,
@@ -230,7 +210,7 @@ fn offline_startup_reports_connection_then_sync_after_reconnect() {
         assert_connected_then_synced(&log);
         assert!(replicant_is_connected(engine));
 
-        replicant_destroy(engine);
+        destroy_and_remove_db(engine, &db_path);
     }
-    remove_temp_db(&db_file);
+    drop(proxy);
 }
