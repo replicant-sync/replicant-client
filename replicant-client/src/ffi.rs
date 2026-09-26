@@ -473,12 +473,7 @@ pub unsafe extern "C" fn replicant_create(
                 // ConnectionSucceeded or SyncCompleted already uses this client,
                 // and documents written through the offline path meanwhile are
                 // uploaded by its initial sync.
-                if let Err(e) = client.start().await {
-                    event_dispatcher_clone.emit_sync_error(
-                        ReplicantErrorCode::Unknown,
-                        &format!("Initial sync failed: {}", e),
-                    );
-                }
+                client.start().await;
             }
             Err(e) => {
                 // The pool this init opened is already closed:

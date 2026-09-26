@@ -334,10 +334,7 @@ impl Client {
             event_dispatcher,
         )
         .await?;
-        if let Err(e) = client.start().await {
-            client.shutdown().await;
-            return Err(e);
-        }
+        client.start().await;
         Ok(client)
     }
 
@@ -668,102 +665,119 @@ impl Client {
 
     /// Emits ConnectionSucceeded if the start-up connect succeeded, starts the
     /// reconnection monitor, then runs the initial upload-first sync.
-    pub(crate) async fn start(&self) -> SyncResult<()> {
+    ///
+    /// A failure is reported as SyncError and leaves a working client: upload
+    /// protection is off, and the monitor and later upload passes carry on.
+    pub(crate) async fn start(&self) {
         if self.is_connected() {
             self.event_dispatcher
                 .emit_connection_succeeded(&self.server_url);
         }
         self.start_reconnection_loop();
 
-        if self.is_connected.load(Ordering::Relaxed) {
-            // Upload-first strategy with protection
-            self.event_dispatcher.emit_sync_started();
-
-            // Enable protection mode during upload phase
-            self.sync_protection_mode.store(true, Ordering::Relaxed);
-            tracing::info!(
-                "CLIENT {}: Protection mode ENABLED - blocking server overwrites during upload",
-                self.client_id
-            );
-
-            // First: Upload any pending documents that were created/modified offline
-            tracing::info!(
-                "CLIENT {}: Starting upload-first sync - uploading pending changes",
-                self.client_id
-            );
-            self.sync_pending_documents().await?;
-
-            // Wait for upload confirmations with timeout
-            if !self.pending_uploads.lock().await.is_empty() {
-                let upload_count = self.pending_uploads.lock().await.len();
-                tracing::info!(
-                    "CLIENT {}: Waiting for {} upload confirmations",
-                    self.client_id,
-                    upload_count
-                );
-
-                tokio::select! {
-                    _ = self.upload_complete_notifier.notified() => {
-                        tracing::info!("CLIENT {}: All uploads settled", self.client_id);
-                    }
-                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(10)) => {
-                        let remaining = self.pending_uploads.lock().await.len();
-                        if remaining > 0 {
-                            tracing::warn!("CLIENT {}: Upload timeout - {} uploads still pending", self.client_id, remaining);
-
-                            // Enhanced fallback: Retry failed uploads before proceeding
-                            tracing::info!("CLIENT {}: Retrying failed uploads before sync", self.client_id);
-                            if let Err(e) = self.retry_failed_uploads().await {
-                                tracing::error!("CLIENT {}: Retry failed: {}", self.client_id, e);
-                            }
-                        } else {
-                            tracing::info!("CLIENT {}: Upload timeout but all uploads completed", self.client_id);
-                        }
-                    }
-                }
-            } else {
-                tracing::info!("CLIENT {}: No pending uploads to wait for", self.client_id);
-            }
-
-            // Disable protection mode - now safe to receive server sync
-            self.sync_protection_mode.store(false, Ordering::Relaxed);
-            tracing::info!(
-                "CLIENT {}: Protection mode DISABLED - server sync now allowed",
-                self.client_id
-            );
-
-            // Process any deferred messages that were queued during upload phase
-            if let Err(e) = Self::process_deferred_messages(
-                &self.deferred_messages,
-                &self.db,
-                self.client_id,
-                &self.event_dispatcher,
-                &self.pending_uploads,
-                &ResyncSource::socket(&self.ws_client),
-            )
-            .await
-            {
-                tracing::error!(
-                    "CLIENT {}: Error processing deferred messages: {}",
-                    self.client_id,
-                    e
-                );
-            }
-
-            // Second: Download current server state (which now includes our uploaded documents)
-            tracing::info!(
-                "CLIENT {}: Upload phase complete, requesting server state",
-                self.client_id
-            );
-            self.sync_all().await?;
-        } else {
+        if !self.is_connected.load(Ordering::Relaxed) {
             tracing::info!(
                 "CLIENT {}: Starting in offline mode - will sync when connection available",
                 self.client_id
             );
+            return;
         }
 
-        Ok(())
+        // Upload-first strategy with protection
+        self.event_dispatcher.emit_sync_started();
+
+        // Enable protection mode during upload phase
+        self.sync_protection_mode.store(true, Ordering::Relaxed);
+        tracing::info!(
+            "CLIENT {}: Protection mode ENABLED - blocking server overwrites during upload",
+            self.client_id
+        );
+
+        // First: Upload any pending documents that were created/modified offline
+        tracing::info!(
+            "CLIENT {}: Starting upload-first sync - uploading pending changes",
+            self.client_id
+        );
+        if let Err(e) = self.sync_pending_documents().await {
+            self.end_upload_protection().await;
+            self.event_dispatcher.emit_sync_error(
+                ReplicantErrorCode::Unknown,
+                &format!("Initial upload failed: {}", e),
+            );
+            return;
+        }
+
+        // Wait for upload confirmations with timeout
+        if !self.pending_uploads.lock().await.is_empty() {
+            let upload_count = self.pending_uploads.lock().await.len();
+            tracing::info!(
+                "CLIENT {}: Waiting for {} upload confirmations",
+                self.client_id,
+                upload_count
+            );
+
+            tokio::select! {
+                _ = self.upload_complete_notifier.notified() => {
+                    tracing::info!("CLIENT {}: All uploads settled", self.client_id);
+                }
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(10)) => {
+                    let remaining = self.pending_uploads.lock().await.len();
+                    if remaining > 0 {
+                        tracing::warn!("CLIENT {}: Upload timeout - {} uploads still pending", self.client_id, remaining);
+
+                        // Enhanced fallback: Retry failed uploads before proceeding
+                        tracing::info!("CLIENT {}: Retrying failed uploads before sync", self.client_id);
+                        if let Err(e) = self.retry_failed_uploads().await {
+                            tracing::error!("CLIENT {}: Retry failed: {}", self.client_id, e);
+                        }
+                    } else {
+                        tracing::info!("CLIENT {}: Upload timeout but all uploads completed", self.client_id);
+                    }
+                }
+            }
+        } else {
+            tracing::info!("CLIENT {}: No pending uploads to wait for", self.client_id);
+        }
+
+        self.end_upload_protection().await;
+
+        // Second: Download current server state (which now includes our uploaded documents)
+        tracing::info!(
+            "CLIENT {}: Upload phase complete, requesting server state",
+            self.client_id
+        );
+        if let Err(e) = self.sync_all().await {
+            self.event_dispatcher.emit_sync_error(
+                ReplicantErrorCode::ConnectionFailed,
+                &format!("Full sync failed: {}", e),
+            );
+        }
+    }
+
+    /// Ends upload protection and applies the server messages it deferred.
+    async fn end_upload_protection(&self) {
+        self.sync_protection_mode.store(false, Ordering::Relaxed);
+        tracing::info!(
+            "CLIENT {}: Protection mode DISABLED - server sync now allowed",
+            self.client_id
+        );
+
+        if let Err(e) = Self::process_deferred_messages(
+            &self.deferred_messages,
+            &self.db,
+            self.client_id,
+            &self.event_dispatcher,
+            &self.pending_uploads,
+            &ResyncSource::socket(&self.ws_client),
+        )
+        .await
+        {
+            tracing::error!(
+                "CLIENT {}: Error processing deferred messages: {}",
+                self.client_id,
+                e
+            );
+        }
     }
 
     pub async fn create_document(&self, content: serde_json::Value) -> SyncResult<Document> {
@@ -1160,12 +1174,17 @@ impl Client {
 
                         let ws_client = self.ws_client.lock().await;
                         if let Some(client) = ws_client.as_ref() {
-                            client
+                            if let Err(e) = client
                                 .send(ClientMessage::DeleteDocument {
                                     document_id: pending_info.id,
                                 })
-                                .await?;
+                                .await
+                            {
+                                self.pending_uploads.lock().await.remove(&pending_info.id);
+                                return Err(e);
+                            }
                         } else {
+                            self.pending_uploads.lock().await.remove(&pending_info.id);
                             return Err(ClientError::WebSocket("Not connected".to_string()))?;
                         }
 
@@ -1212,12 +1231,17 @@ impl Client {
                                         "CLIENT {}: ✅ Sending UpdateDocument with stored patch",
                                         self.client_id
                                     );
-                                    client
+                                    if let Err(e) = client
                                         .send(ClientMessage::UpdateDocument {
                                             patch: document_patch,
                                         })
-                                        .await?;
+                                        .await
+                                    {
+                                        self.pending_uploads.lock().await.remove(&pending_info.id);
+                                        return Err(e);
+                                    }
                                 } else {
+                                    self.pending_uploads.lock().await.remove(&pending_info.id);
                                     return Err(ClientError::WebSocket(
                                         "Not connected".to_string(),
                                     ))?;
@@ -1243,12 +1267,17 @@ impl Client {
 
                                 let ws_client = self.ws_client.lock().await;
                                 if let Some(client) = ws_client.as_ref() {
-                                    client
+                                    if let Err(e) = client
                                         .send(ClientMessage::CreateDocument {
                                             document: doc.clone(),
                                         })
-                                        .await?;
+                                        .await
+                                    {
+                                        self.pending_uploads.lock().await.remove(&pending_info.id);
+                                        return Err(e);
+                                    }
                                 } else {
+                                    self.pending_uploads.lock().await.remove(&pending_info.id);
                                     return Err(ClientError::WebSocket(
                                         "Not connected".to_string(),
                                     ))?;
@@ -5827,5 +5856,80 @@ mod local_write_origin_tests {
             "this client's own delete must be reported as Local: {:?}",
             emitted
         );
+    }
+}
+
+#[cfg(test)]
+mod start_and_shutdown_tests {
+    use super::*;
+    use crate::events::{EventType, SyncEvent};
+
+    /// A client with credentials whose server refuses every connection.
+    async fn offline_client(dir: &tempfile::TempDir) -> (Client, Arc<EventDispatcher>) {
+        let db_url = format!(
+            "sqlite:{}?mode=rwc",
+            dir.path().join("client.sqlite3").display()
+        );
+        let dispatcher = Arc::new(EventDispatcher::new());
+        let client = Client::open(
+            &db_url,
+            "ws://127.0.0.1:1/socket/websocket",
+            "start-test@example.com",
+            "rpa_test_key",
+            "rps_test_secret",
+            Some(Uuid::new_v4()),
+            Some(dispatcher.clone()),
+        )
+        .await
+        .unwrap();
+        (client, dispatcher)
+    }
+
+    fn record_events(dispatcher: &EventDispatcher) -> Arc<std::sync::Mutex<Vec<EventType>>> {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        dispatcher
+            .register_rust_callback(move |event: SyncEvent| {
+                sink.lock().unwrap().push(event.event_type())
+            })
+            .unwrap();
+        seen
+    }
+
+    #[tokio::test]
+    async fn a_failed_initial_upload_leaves_a_working_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, dispatcher) = offline_client(&dir).await;
+        let seen = record_events(&dispatcher);
+        client
+            .create_document(serde_json::json!({"title": "queued"}))
+            .await
+            .unwrap();
+
+        // Connected but with no socket: the first pending upload fails.
+        client.is_connected.store(true, Ordering::SeqCst);
+        client.start().await;
+        dispatcher.process_events().unwrap();
+
+        assert!(!client.sync_protection_mode.load(Ordering::SeqCst));
+        assert!(
+            client.pending_uploads.lock().await.is_empty(),
+            "a failed upload must not stay in flight"
+        );
+        let events = seen.lock().unwrap().clone();
+        let started = events.iter().position(|e| *e == EventType::SyncStarted);
+        let failed = events.iter().rposition(|e| *e == EventType::SyncError);
+        assert!(
+            started.is_some() && started < failed,
+            "expected SyncStarted then SyncError: {:?}",
+            events
+        );
+        assert!(!events.contains(&EventType::SyncCompleted));
+        client
+            .create_document(serde_json::json!({"title": "after start"}))
+            .await
+            .unwrap();
+
+        client.shutdown().await;
     }
 }
