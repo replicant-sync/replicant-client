@@ -345,8 +345,9 @@ bool replicant_error_is_credential_rejection(int32_t code);
  * Connection and initial sync run in the background. ConnectionSucceeded is
  * emitted only when a connect succeeds (at start-up or on a later reconnect),
  * and SyncCompleted only when the server answers the full sync that follows.
- * An offline start emits neither until the server is reached. A local-only
- * engine (no API key or no `user_id`) never connects, so it emits neither.
+ * An offline start emits neither until the server is reached. An engine with
+ * no API key, or whose database has never adopted an identity (no `user_id`
+ * on this or an earlier run), never connects, so it emits neither.
  *
  * # Safety
  * Caller must ensure all pointers are valid, non-null C strings
