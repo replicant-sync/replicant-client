@@ -36,6 +36,17 @@ const SOCKET_RELEASE_TIMEOUT: Duration = Duration::from_millis(500);
 /// user can see.
 const MAX_REBASE_ATTEMPTS: u32 = 3;
 
+/// Whether `shutdown` has begun. If so, also marks the client disconnected,
+/// since a connect that finished meanwhile may have marked it connected.
+fn shutdown_requested(stopped: &AtomicBool, is_connected: &AtomicBool) -> bool {
+    if stopped.load(Ordering::SeqCst) {
+        is_connected.store(false, Ordering::SeqCst);
+        true
+    } else {
+        false
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PendingUpload {
     operation_type: UploadType,
@@ -290,6 +301,8 @@ pub struct Client {
     // Sync is possible for this instance (credentials + adopted identity).
     // Immutable for the client's lifetime: enrollment recreates the client.
     sync_enabled: bool,
+    /// Set by `shutdown`; the reconnection monitor stops when it sees it.
+    stopped: Arc<AtomicBool>,
 }
 
 impl Client {
@@ -313,7 +326,35 @@ impl Client {
         .await
     }
 
+    /// Opens the database, connects if sync is enabled, then announces the
+    /// connection and runs the initial sync (see [`Client::start`]).
     pub async fn with_event_dispatcher(
+        database_url: &str,
+        server_url: &str,
+        email: &str,
+        api_key: &str,
+        api_secret: &str,
+        canonical_user_id: Option<Uuid>,
+        event_dispatcher: Option<Arc<EventDispatcher>>,
+    ) -> SyncResult<Self> {
+        let client = Self::open(
+            database_url,
+            server_url,
+            email,
+            api_key,
+            api_secret,
+            canonical_user_id,
+            event_dispatcher,
+        )
+        .await?;
+        client.start().await;
+        Ok(client)
+    }
+
+    /// Opens the database and connects if sync is enabled, without emitting
+    /// ConnectionSucceeded, monitoring the connection or syncing. The caller
+    /// must call [`Client::start`] once the client is ready for use.
+    pub(crate) async fn open(
         database_url: &str,
         server_url: &str,
         email: &str,
@@ -458,6 +499,7 @@ impl Client {
             deferred_messages: Arc::new(Mutex::new(Vec::new())),
             upload_retry: UploadRetry::new(reconnect_sync_tx_for_retry),
             sync_enabled,
+            stopped: Arc::new(AtomicBool::new(false)),
         };
 
         // Automatically start background tasks
@@ -492,6 +534,7 @@ impl Client {
     /// thread alive for the life of the process, which is the very failure this
     /// shutdown exists to prevent.
     pub async fn shutdown(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
         self.is_connected.store(false, Ordering::SeqCst);
         self.db.close().await;
 
@@ -540,8 +583,7 @@ impl Client {
         let db_for_reconnect_sync = db.clone();
         let pending_uploads_for_reconnect_sync = pending_uploads.clone();
         let ws_client_for_reconnect_sync = ws_client.clone();
-
-        self.start_reconnection_loop();
+        let event_dispatcher_for_reconnect_sync = event_dispatcher.clone();
 
         // Spawn message handler with upload tracking
         tokio::spawn(async move {
@@ -613,6 +655,7 @@ impl Client {
                         client_id
                     );
                     if let Some(client) = ws_client_for_reconnect_sync.lock().await.as_ref() {
+                        event_dispatcher_for_reconnect_sync.emit_sync_started();
                         if let Err(e) = client.send(ClientMessage::RequestFullSync).await {
                             tracing::error!(
                                 "CLIENT {}: Failed to request full sync after reconnection: {}",
@@ -632,96 +675,125 @@ impl Client {
             tracing::warn!("CLIENT {}: Reconnection sync handler terminated", client_id);
         });
 
-        // Only perform initial sync if connected
-        if self.is_connected.load(Ordering::Relaxed) {
-            // Upload-first strategy with protection
-            self.event_dispatcher.emit_sync_started();
+        Ok(())
+    }
 
-            // Enable protection mode during upload phase
-            self.sync_protection_mode.store(true, Ordering::Relaxed);
-            tracing::info!(
-                "CLIENT {}: Protection mode ENABLED - blocking server overwrites during upload",
-                self.client_id
-            );
+    /// Emits ConnectionSucceeded if the start-up connect succeeded, starts the
+    /// reconnection monitor, then runs the initial upload-first sync.
+    ///
+    /// A failure is reported as SyncError and leaves a working client: upload
+    /// protection is off, and the monitor and later upload passes carry on.
+    pub(crate) async fn start(&self) {
+        let connected = self.is_connected();
+        if connected {
+            self.event_dispatcher
+                .emit_connection_succeeded(&self.server_url);
+        }
+        self.start_reconnection_loop();
 
-            // First: Upload any pending documents that were created/modified offline
-            tracing::info!(
-                "CLIENT {}: Starting upload-first sync - uploading pending changes",
-                self.client_id
-            );
-            self.sync_pending_documents().await?;
-
-            // Wait for upload confirmations with timeout
-            if !self.pending_uploads.lock().await.is_empty() {
-                let upload_count = self.pending_uploads.lock().await.len();
-                tracing::info!(
-                    "CLIENT {}: Waiting for {} upload confirmations",
-                    self.client_id,
-                    upload_count
-                );
-
-                tokio::select! {
-                    _ = self.upload_complete_notifier.notified() => {
-                        tracing::info!("CLIENT {}: All uploads settled", self.client_id);
-                    }
-                    _ = tokio::time::sleep(tokio::time::Duration::from_secs(10)) => {
-                        let remaining = self.pending_uploads.lock().await.len();
-                        if remaining > 0 {
-                            tracing::warn!("CLIENT {}: Upload timeout - {} uploads still pending", self.client_id, remaining);
-
-                            // Enhanced fallback: Retry failed uploads before proceeding
-                            tracing::info!("CLIENT {}: Retrying failed uploads before sync", self.client_id);
-                            if let Err(e) = self.retry_failed_uploads().await {
-                                tracing::error!("CLIENT {}: Retry failed: {}", self.client_id, e);
-                            }
-                        } else {
-                            tracing::info!("CLIENT {}: Upload timeout but all uploads completed", self.client_id);
-                        }
-                    }
-                }
-            } else {
-                tracing::info!("CLIENT {}: No pending uploads to wait for", self.client_id);
-            }
-
-            // Disable protection mode - now safe to receive server sync
-            self.sync_protection_mode.store(false, Ordering::Relaxed);
-            tracing::info!(
-                "CLIENT {}: Protection mode DISABLED - server sync now allowed",
-                self.client_id
-            );
-
-            // Process any deferred messages that were queued during upload phase
-            if let Err(e) = Self::process_deferred_messages(
-                &self.deferred_messages,
-                &self.db,
-                self.client_id,
-                &self.event_dispatcher,
-                &self.pending_uploads,
-                &ResyncSource::socket(&self.ws_client),
-            )
-            .await
-            {
-                tracing::error!(
-                    "CLIENT {}: Error processing deferred messages: {}",
-                    self.client_id,
-                    e
-                );
-            }
-
-            // Second: Download current server state (which now includes our uploaded documents)
-            tracing::info!(
-                "CLIENT {}: Upload phase complete, requesting server state",
-                self.client_id
-            );
-            self.sync_all().await?;
-        } else {
+        if !connected {
             tracing::info!(
                 "CLIENT {}: Starting in offline mode - will sync when connection available",
                 self.client_id
             );
+            return;
         }
 
-        Ok(())
+        // Upload-first strategy with protection
+        self.event_dispatcher.emit_sync_started();
+
+        // Enable protection mode during upload phase
+        self.sync_protection_mode.store(true, Ordering::Relaxed);
+        tracing::info!(
+            "CLIENT {}: Protection mode ENABLED - blocking server overwrites during upload",
+            self.client_id
+        );
+
+        // First: Upload any pending documents that were created/modified offline
+        tracing::info!(
+            "CLIENT {}: Starting upload-first sync - uploading pending changes",
+            self.client_id
+        );
+        if let Err(e) = self.sync_pending_documents().await {
+            self.end_upload_protection().await;
+            self.event_dispatcher.emit_sync_error(
+                ReplicantErrorCode::Unknown,
+                &format!("Initial upload failed: {}", e),
+            );
+            return;
+        }
+
+        // Wait for upload confirmations with timeout
+        if !self.pending_uploads.lock().await.is_empty() {
+            let upload_count = self.pending_uploads.lock().await.len();
+            tracing::info!(
+                "CLIENT {}: Waiting for {} upload confirmations",
+                self.client_id,
+                upload_count
+            );
+
+            tokio::select! {
+                _ = self.upload_complete_notifier.notified() => {
+                    tracing::info!("CLIENT {}: All uploads settled", self.client_id);
+                }
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(10)) => {
+                    let remaining = self.pending_uploads.lock().await.len();
+                    if remaining > 0 {
+                        tracing::warn!("CLIENT {}: Upload timeout - {} uploads still pending", self.client_id, remaining);
+
+                        // Enhanced fallback: Retry failed uploads before proceeding
+                        tracing::info!("CLIENT {}: Retrying failed uploads before sync", self.client_id);
+                        if let Err(e) = self.retry_failed_uploads().await {
+                            tracing::error!("CLIENT {}: Retry failed: {}", self.client_id, e);
+                        }
+                    } else {
+                        tracing::info!("CLIENT {}: Upload timeout but all uploads completed", self.client_id);
+                    }
+                }
+            }
+        } else {
+            tracing::info!("CLIENT {}: No pending uploads to wait for", self.client_id);
+        }
+
+        self.end_upload_protection().await;
+
+        // Second: Download current server state (which now includes our uploaded documents)
+        tracing::info!(
+            "CLIENT {}: Upload phase complete, requesting server state",
+            self.client_id
+        );
+        if let Err(e) = self.sync_all().await {
+            self.event_dispatcher.emit_sync_error(
+                ReplicantErrorCode::ConnectionFailed,
+                &format!("Full sync failed: {}", e),
+            );
+        }
+    }
+
+    /// Ends upload protection and applies the server messages it deferred.
+    async fn end_upload_protection(&self) {
+        self.sync_protection_mode.store(false, Ordering::Relaxed);
+        tracing::info!(
+            "CLIENT {}: Protection mode DISABLED - server sync now allowed",
+            self.client_id
+        );
+
+        if let Err(e) = Self::process_deferred_messages(
+            &self.deferred_messages,
+            &self.db,
+            self.client_id,
+            &self.event_dispatcher,
+            &self.pending_uploads,
+            &ResyncSource::socket(&self.ws_client),
+        )
+        .await
+        {
+            tracing::error!(
+                "CLIENT {}: Error processing deferred messages: {}",
+                self.client_id,
+                e
+            );
+        }
     }
 
     pub async fn create_document(&self, content: serde_json::Value) -> SyncResult<Document> {
@@ -1118,12 +1190,17 @@ impl Client {
 
                         let ws_client = self.ws_client.lock().await;
                         if let Some(client) = ws_client.as_ref() {
-                            client
+                            if let Err(e) = client
                                 .send(ClientMessage::DeleteDocument {
                                     document_id: pending_info.id,
                                 })
-                                .await?;
+                                .await
+                            {
+                                self.pending_uploads.lock().await.remove(&pending_info.id);
+                                return Err(e);
+                            }
                         } else {
+                            self.pending_uploads.lock().await.remove(&pending_info.id);
                             return Err(ClientError::WebSocket("Not connected".to_string()))?;
                         }
 
@@ -1170,12 +1247,17 @@ impl Client {
                                         "CLIENT {}: ✅ Sending UpdateDocument with stored patch",
                                         self.client_id
                                     );
-                                    client
+                                    if let Err(e) = client
                                         .send(ClientMessage::UpdateDocument {
                                             patch: document_patch,
                                         })
-                                        .await?;
+                                        .await
+                                    {
+                                        self.pending_uploads.lock().await.remove(&pending_info.id);
+                                        return Err(e);
+                                    }
                                 } else {
+                                    self.pending_uploads.lock().await.remove(&pending_info.id);
                                     return Err(ClientError::WebSocket(
                                         "Not connected".to_string(),
                                     ))?;
@@ -1201,12 +1283,17 @@ impl Client {
 
                                 let ws_client = self.ws_client.lock().await;
                                 if let Some(client) = ws_client.as_ref() {
-                                    client
+                                    if let Err(e) = client
                                         .send(ClientMessage::CreateDocument {
                                             document: doc.clone(),
                                         })
-                                        .await?;
+                                        .await
+                                    {
+                                        self.pending_uploads.lock().await.remove(&pending_info.id);
+                                        return Err(e);
+                                    }
                                 } else {
+                                    self.pending_uploads.lock().await.remove(&pending_info.id);
                                     return Err(ClientError::WebSocket(
                                         "Not connected".to_string(),
                                     ))?;
@@ -2989,6 +3076,9 @@ impl Client {
 
     /// Start the reconnection loop if not already running
     fn start_reconnection_loop(&self) {
+        if self.stopped.load(Ordering::SeqCst) {
+            return;
+        }
         if !self.sync_enabled {
             tracing::info!(
                 "CLIENT {}: sync disabled (no credentials or identity not adopted) — \
@@ -3014,6 +3104,7 @@ impl Client {
         let last_ping_time = self.last_ping_time.clone();
         let deferred_messages = self.deferred_messages.clone();
         let upload_retry = self.upload_retry.clone();
+        let stopped = self.stopped.clone();
 
         tracing::info!(
             "🔄 CLIENT {}: Starting continuous reconnection monitor (5-second intervals)",
@@ -3025,6 +3116,13 @@ impl Client {
             let mut connection_attempts = 0;
 
             loop {
+                if shutdown_requested(&stopped, &is_connected) {
+                    tracing::info!(
+                        "CLIENT {}: Client shut down, reconnection monitor stopping",
+                        client_id
+                    );
+                    break;
+                }
                 let currently_connected = is_connected.load(Ordering::Relaxed);
 
                 if !currently_connected {
@@ -3050,6 +3148,9 @@ impl Client {
                     .await
                     {
                         Ok((new_client, receiver)) => {
+                            if shutdown_requested(&stopped, &is_connected) {
+                                break;
+                            }
                             tracing::info!(
                                 "✅ CLIENT {}: Reconnection successful after {} attempts!",
                                 client_id,
@@ -3058,15 +3159,30 @@ impl Client {
                             connection_attempts = 0;
 
                             // Update the client
-                            *ws_client.lock().await = Some(new_client);
+                            {
+                                let mut guard = ws_client.lock().await;
+                                if shutdown_requested(&stopped, &is_connected) {
+                                    break;
+                                }
+                                *guard = Some(new_client);
+                            }
                             is_connected.store(true, Ordering::Relaxed);
+                            // Shutdown may have run while the lock was held.
+                            if shutdown_requested(&stopped, &is_connected) {
+                                break;
+                            }
 
                             // Reset ping timer on successful connection
                             *last_ping_time.lock().await = Some(Instant::now());
 
-                            // Emit connection event
+                            if shutdown_requested(&stopped, &is_connected) {
+                                break;
+                            }
                             event_dispatcher.emit_connection_succeeded(&server_url);
 
+                            if shutdown_requested(&stopped, &is_connected) {
+                                break;
+                            }
                             // Start message receiver forwarding with connection monitoring
                             let (tx, mut rx) = mpsc::channel(100);
                             let receiver_is_connected = is_connected.clone();
@@ -3167,6 +3283,9 @@ impl Client {
                                 client_id
                             );
 
+                            if shutdown_requested(&stopped, &is_connected) {
+                                break;
+                            }
                             if let Err(e) = reconnect_sync_tx.try_send(()) {
                                 tracing::error!(
                                     "CLIENT {}: Failed to trigger reconnection sync: {}",
@@ -5785,5 +5904,112 @@ mod local_write_origin_tests {
             "this client's own delete must be reported as Local: {:?}",
             emitted
         );
+    }
+}
+
+#[cfg(test)]
+mod start_and_shutdown_tests {
+    use super::*;
+    use crate::events::{EventType, SyncEvent};
+
+    /// A client with credentials whose server refuses every connection.
+    async fn offline_client(dir: &tempfile::TempDir) -> (Client, Arc<EventDispatcher>) {
+        let db_url = format!(
+            "sqlite:{}?mode=rwc",
+            dir.path().join("client.sqlite3").display()
+        );
+        let dispatcher = Arc::new(EventDispatcher::new());
+        let client = Client::open(
+            &db_url,
+            "ws://127.0.0.1:1/socket/websocket",
+            "start-test@example.com",
+            "rpa_test_key",
+            "rps_test_secret",
+            Some(Uuid::new_v4()),
+            Some(dispatcher.clone()),
+        )
+        .await
+        .unwrap();
+        (client, dispatcher)
+    }
+
+    fn record_events(dispatcher: &EventDispatcher) -> Arc<std::sync::Mutex<Vec<EventType>>> {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        dispatcher
+            .register_rust_callback(move |event: SyncEvent| {
+                sink.lock().unwrap().push(event.event_type())
+            })
+            .unwrap();
+        seen
+    }
+
+    #[tokio::test]
+    async fn a_failed_initial_upload_leaves_a_working_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, dispatcher) = offline_client(&dir).await;
+        let seen = record_events(&dispatcher);
+        client
+            .create_document(serde_json::json!({"title": "queued"}))
+            .await
+            .unwrap();
+
+        // Connected but with no socket: the first pending upload fails.
+        client.is_connected.store(true, Ordering::SeqCst);
+        client.start().await;
+        dispatcher.process_events().unwrap();
+
+        assert!(!client.sync_protection_mode.load(Ordering::SeqCst));
+        assert!(
+            client.pending_uploads.lock().await.is_empty(),
+            "a failed upload must not stay in flight"
+        );
+        let events = seen.lock().unwrap().clone();
+        let started = events.iter().position(|e| *e == EventType::SyncStarted);
+        let failed = events.iter().rposition(|e| *e == EventType::SyncError);
+        assert!(
+            started.is_some() && started < failed,
+            "expected SyncStarted then SyncError: {:?}",
+            events
+        );
+        assert!(!events.contains(&EventType::SyncCompleted));
+        client
+            .create_document(serde_json::json!({"title": "after start"}))
+            .await
+            .unwrap();
+
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_the_reconnection_monitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, dispatcher) = offline_client(&dir).await;
+        let seen = record_events(&dispatcher);
+        let attempts = |seen: &std::sync::Mutex<Vec<EventType>>| {
+            dispatcher.process_events().unwrap();
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|e| **e == EventType::ConnectionAttempted)
+                .count()
+        };
+
+        client.start().await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while attempts(&seen) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the monitor never tried to connect"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        client.shutdown().await;
+        let at_shutdown = attempts(&seen);
+        // The monitor would try again within its 5 s interval if still running.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(attempts(&seen), at_shutdown);
+        assert!(!client.is_connected());
     }
 }

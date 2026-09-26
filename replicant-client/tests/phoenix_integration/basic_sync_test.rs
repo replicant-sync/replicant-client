@@ -525,3 +525,58 @@ async fn test_envelope_attribution_end_to_end() {
         "attribution must not ride in content"
     );
 }
+
+/// An edit made straight after a create, before the server has acknowledged
+/// the create, must reach the server, and the create's acknowledgement must
+/// not discard it.
+#[tokio::test]
+#[serial]
+async fn an_edit_right_after_a_create_reaches_the_server() {
+    if skip_if_no_server() {
+        return;
+    }
+
+    std::fs::create_dir_all("databases").ok();
+    let db_file = temp_db_path("create_then_edit");
+    let db_url = format!("sqlite:{}?mode=rwc", db_file);
+
+    let driver = TestClient::connect(TEST_EMAIL).await.unwrap();
+    let subject = connect_subject(&db_url).await;
+    let doc_id = Uuid::new_v4();
+    let edited = json!({"title": "edited", "body": "second write"});
+
+    subject
+        .create_document_with_id(doc_id, json!({"title": "draft"}))
+        .await
+        .unwrap();
+    subject
+        .update_document(doc_id, edited.clone())
+        .await
+        .unwrap();
+
+    let mut server_content = None;
+    for _ in 0..100 {
+        server_content = driver
+            .get_document(doc_id)
+            .await
+            .ok()
+            .and_then(|doc| doc.get("content").cloned());
+        if server_content.as_ref() == Some(&edited) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        server_content.as_ref(),
+        Some(&edited),
+        "the server must end up with the edit"
+    );
+    assert!(
+        wait_for_local_synced(&db_url, doc_id).await,
+        "the document should settle as synced"
+    );
+    assert_eq!(subject.count_pending_sync().await.unwrap(), 0);
+
+    subject.shutdown().await;
+    remove_temp_db(&db_file);
+}

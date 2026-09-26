@@ -7,16 +7,21 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use replicant_client::events::{EventOrigin, EventType};
 use replicant_client::ffi::{
-    replicant_count_documents, replicant_count_pending_sync, replicant_create,
-    replicant_create_document, replicant_destroy, replicant_get_all_documents,
-    replicant_get_document, replicant_get_user_id, replicant_is_connected,
-    replicant_process_events, replicant_register_connection_callback,
+    replicant_count_documents, replicant_count_pending_sync, replicant_create_document,
+    replicant_destroy, replicant_get_all_documents, replicant_get_document, replicant_get_user_id,
+    replicant_is_connected, replicant_process_events, replicant_register_connection_callback,
     replicant_register_document_callback, replicant_register_error_callback,
     replicant_register_sync_callback, replicant_string_free, replicant_update_document, Replicant,
     SyncResult,
+};
+
+mod ffi_events;
+use ffi_events::{
+    create_engine, destroy_and_remove_db, pump_events_until, register_event_log, EventLog,
 };
 
 #[cfg(debug_assertions)]
@@ -185,32 +190,35 @@ extern "C" fn connection_capture_callback(
 
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Creates a test engine with a unique file-based database per test invocation.
-unsafe fn create_test_engine() -> *mut Replicant {
-    // Generate a unique database file for each test to avoid conflicts when running in parallel
+/// A unique database path for one engine in this test process.
+fn unique_db_path() -> String {
     let unique_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-    let test_db_path = format!(
+    format!(
         "/tmp/sync_client_test_{}_{}.db",
         std::process::id(),
         unique_id
-    );
-    // Clean up any existing database file
-    let _ = std::fs::remove_file(&test_db_path);
-
-    let db_url = CString::new(format!("sqlite:{}?mode=rwc", test_db_path)).unwrap();
-    let server_url = CString::new("ws://localhost:8080/ws").unwrap();
-    let email = CString::new("test-user@example.com").unwrap();
-    let api_key = CString::new("rpa_test_api_key_example_12345").unwrap();
-    let api_secret = CString::new("rps_test_api_secret_example_67890").unwrap();
-
-    replicant_create(
-        db_url.as_ptr(),
-        server_url.as_ptr(),
-        email.as_ptr(),
-        api_key.as_ptr(),
-        api_secret.as_ptr(),
-        std::ptr::null(),
     )
+}
+
+/// Creates an engine on a fresh database; see `ffi_events::create_engine`.
+unsafe fn create_test_engine_with(
+    db_path: &str,
+    server_url: &str,
+    user_id: Option<&str>,
+) -> *mut Replicant {
+    create_engine(
+        db_path,
+        server_url,
+        "test-user@example.com",
+        "rpa_test_api_key_example_12345",
+        "rps_test_api_secret_example_67890",
+        user_id,
+    )
+}
+
+/// Creates a local-only engine (no identity, so it never connects).
+unsafe fn create_test_engine() -> *mut Replicant {
+    create_test_engine_with(&unique_db_path(), "ws://localhost:8080/ws", None)
 }
 
 #[test]
@@ -489,8 +497,9 @@ fn test_ffi_all_event_types() {
         assert_eq!(conn_capture.call_count.load(Ordering::SeqCst), 2);
 
         replicant_emit_test_event(engine, 9); // ConnectionSucceeded
-        replicant_process_events(engine, ptr::null_mut());
-        assert_eq!(conn_capture.call_count.load(Ordering::SeqCst), 3);
+        assert!(pump_events_until(engine, Duration::from_secs(1), || {
+            conn_capture.call_count.load(Ordering::SeqCst) == 3
+        }));
 
         replicant_destroy(engine);
     }
@@ -983,5 +992,71 @@ fn test_ffi_update_and_get_document() {
 
         replicant_string_free(out_content);
         replicant_destroy(engine);
+    }
+}
+
+#[test]
+fn test_ffi_offline_startup_reports_no_connection_or_sync() {
+    unsafe {
+        // Nothing listens on port 1, so every connect is refused at once.
+        let db_path = unique_db_path();
+        let user_id = uuid::Uuid::new_v4().to_string();
+        let engine = create_test_engine_with(
+            &db_path,
+            "ws://127.0.0.1:1/socket/websocket",
+            Some(&user_id),
+        );
+        assert!(!engine.is_null(), "Failed to create sync engine");
+
+        let log = EventLog::default();
+        register_event_log(engine, &log);
+
+        // The start-up connect fails, then the reconnect monitor's first try does.
+        let retried = pump_events_until(engine, Duration::from_secs(10), || {
+            log.count(EventType::SyncError) >= 2
+        });
+        assert!(retried, "both connects should fail: {:?}", log.events());
+        pump_events_until(engine, Duration::from_millis(200), || false);
+
+        assert_eq!(
+            log.position(EventType::ConnectionSucceeded),
+            None,
+            "{:?}",
+            log.events()
+        );
+        assert_eq!(
+            log.position(EventType::SyncCompleted),
+            None,
+            "{:?}",
+            log.events()
+        );
+        assert!(!replicant_is_connected(engine));
+
+        destroy_and_remove_db(engine, &db_path);
+    }
+}
+
+#[test]
+fn test_ffi_local_only_startup_reports_no_connection_or_sync() {
+    unsafe {
+        let db_path = unique_db_path();
+        let engine = create_test_engine_with(&db_path, "ws://localhost:8080/ws", None);
+        assert!(!engine.is_null(), "Failed to create sync engine");
+
+        let log = EventLog::default();
+        register_event_log(engine, &log);
+
+        // A local-only start has no event marking its end, so watch a short window.
+        pump_events_until(engine, Duration::from_millis(500), || false);
+
+        assert_eq!(
+            log.count(EventType::ConnectionSucceeded),
+            0,
+            "{:?}",
+            log.events()
+        );
+        assert_eq!(log.count(EventType::SyncCompleted), 0, "{:?}", log.events());
+
+        destroy_and_remove_db(engine, &db_path);
     }
 }

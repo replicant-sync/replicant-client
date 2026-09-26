@@ -150,9 +150,6 @@ impl WebSocketClient {
         })?;
 
         is_connected.store(true, Ordering::Relaxed);
-        if let Some(ref d) = event_dispatcher {
-            d.emit_connection_succeeded(&ws_url);
-        }
 
         let (tx, rx) = mpsc::channel::<ServerMessage>(100);
         Self::setup_broadcast_handlers(&channel, tx.clone(), is_connected.clone());
