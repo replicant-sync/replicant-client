@@ -1,8 +1,9 @@
 //! Start-up connection and sync events, observed through the FFI.
 //!
-//! `replicant_create` reports ConnectionSucceeded only for a real connect, and
-//! SyncCompleted only once the server has answered the full sync, whether the
-//! server is reachable at start-up or only later.
+//! `replicant_create` reports one ConnectionSucceeded per real connect, once
+//! the engine uses that connection, then SyncStarted and SyncCompleted for the
+//! full sync that follows, whether the server is reachable at start-up or only
+//! later.
 //!
 //! Gated behind `RUN_INTEGRATION_TESTS`; needs `SYNC_SERVER_URL`,
 //! `REPLICANT_API_KEY`, `REPLICANT_API_SECRET` and `REPLICANT_TEST_USER_ID`.
@@ -15,12 +16,16 @@ use crate::ffi_events::{
     create_engine, destroy_and_remove_db, pump_events_until, register_event_log, EventLog,
 };
 use replicant_client::events::EventType;
-use replicant_client::ffi::{replicant_is_connected, Replicant};
+use replicant_client::ffi::{
+    replicant_count_pending_sync, replicant_create_document, replicant_is_connected,
+    replicant_process_events, Replicant, SyncResult,
+};
+use std::ffi::{c_char, CString};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use url::Url;
 
 unsafe fn create_subject(db_path: &str, server_url: &str, log: &EventLog) -> *mut Replicant {
@@ -38,14 +43,54 @@ unsafe fn create_subject(db_path: &str, server_url: &str, log: &EventLog) -> *mu
     engine
 }
 
-fn assert_connected_then_synced(log: &EventLog) {
-    let connected = log.position(EventType::ConnectionSucceeded);
-    let synced = log.position(EventType::SyncCompleted);
+/// Asserts one ConnectionSucceeded, SyncStarted and SyncCompleted, in that order.
+fn assert_one_connect_then_sync(log: &EventLog) {
+    let order = [
+        EventType::ConnectionSucceeded,
+        EventType::SyncStarted,
+        EventType::SyncCompleted,
+    ];
+    for event_type in order {
+        assert_eq!(
+            log.count(event_type),
+            1,
+            "expected one {:?}: {:?}",
+            event_type,
+            log.events()
+        );
+    }
+    let positions: Vec<_> = order.iter().map(|e| log.position(*e)).collect();
     assert!(
-        connected.is_some() && synced.is_some() && connected < synced,
-        "expected ConnectionSucceeded before SyncCompleted: {:?}",
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "expected {:?} in order: {:?}",
+        order,
         log.events()
     );
+}
+
+/// Pumps without pausing until ConnectionSucceeded is delivered, and returns
+/// whether the engine reported itself connected at that moment.
+unsafe fn connected_when_announced(engine: *mut Replicant, log: &EventLog) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while log.count(EventType::ConnectionSucceeded) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no ConnectionSucceeded: {:?}",
+            log.events()
+        );
+        replicant_process_events(engine, std::ptr::null_mut());
+        std::thread::yield_now();
+    }
+    replicant_is_connected(engine)
+}
+
+unsafe fn pending_count(engine: *mut Replicant) -> u64 {
+    let mut count = 0;
+    assert_eq!(
+        replicant_count_pending_sync(engine, &mut count),
+        SyncResult::Success
+    );
+    count
 }
 
 /// A TCP forwarder to the sync server. While offline it accepts and at once
@@ -159,6 +204,7 @@ fn online_startup_reports_connection_then_sync() {
     unsafe {
         let engine = create_subject(&db_path, &server_url(), &log);
 
+        assert!(connected_when_announced(engine, &log));
         let synced = pump_events_until(engine, Duration::from_secs(30), || {
             log.count(EventType::SyncCompleted) > 0
         });
@@ -167,8 +213,19 @@ fn online_startup_reports_connection_then_sync() {
             "no SyncCompleted from the server: {:?}",
             log.events()
         );
-        assert_connected_then_synced(&log);
-        assert!(replicant_is_connected(engine));
+        assert_one_connect_then_sync(&log);
+
+        // A new document uploads instead of queueing as pending.
+        let content = CString::new(r#"{"title":"startup online"}"#).unwrap();
+        let mut id = [0 as c_char; 37];
+        assert_eq!(
+            replicant_create_document(engine, content.as_ptr(), id.as_mut_ptr()),
+            SyncResult::Success
+        );
+        let uploaded = pump_events_until(engine, Duration::from_secs(10), || {
+            pending_count(engine) == 0
+        });
+        assert!(uploaded, "the document stayed pending");
 
         destroy_and_remove_db(engine, &db_path);
     }
@@ -199,6 +256,7 @@ fn offline_startup_reports_connection_then_sync_after_reconnect() {
 
         proxy.go_online();
 
+        assert!(connected_when_announced(engine, &log));
         let synced = pump_events_until(engine, Duration::from_secs(30), || {
             log.count(EventType::SyncCompleted) > 0
         });
@@ -207,15 +265,7 @@ fn offline_startup_reports_connection_then_sync_after_reconnect() {
             "no SyncCompleted after reconnect: {:?}",
             log.events()
         );
-        assert_connected_then_synced(&log);
-        assert!(replicant_is_connected(engine));
-        let started = log.position(EventType::SyncStarted);
-        let completed = log.position(EventType::SyncCompleted);
-        assert!(
-            started.is_some() && started < completed,
-            "expected SyncStarted before SyncCompleted: {:?}",
-            log.events()
-        );
+        assert_one_connect_then_sync(&log);
 
         destroy_and_remove_db(engine, &db_path);
     }

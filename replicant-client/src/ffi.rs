@@ -23,7 +23,7 @@ use crate::{Client as CoreClient, ClientDatabase};
 
 /// Opaque handle to a Replicant client instance
 pub struct Replicant {
-    engine: Arc<std::sync::Mutex<Option<CoreClient>>>,
+    engine: Arc<std::sync::Mutex<Option<Arc<CoreClient>>>>,
     database: Arc<ClientDatabase>,
     runtime: Runtime,
     pub(crate) event_dispatcher: Arc<EventDispatcher>,
@@ -301,8 +301,9 @@ pub struct Document {
 ///
 /// # Events
 /// Connection and initial sync run in the background. ConnectionSucceeded is
-/// emitted only when a connect succeeds (at start-up or on a later reconnect),
-/// and SyncCompleted only when the server answers the full sync that follows.
+/// emitted once per successful connect (at start-up or on a later reconnect),
+/// after the engine uses that connection. SyncStarted and SyncCompleted then
+/// bracket the full sync that follows; SyncCompleted means the server answered.
 /// An offline start emits neither until the server is reached. An engine with
 /// no API key, or whose database has never adopted an identity (no `user_id`
 /// on this or an earlier run), never connects, so it emits neither.
@@ -431,7 +432,7 @@ pub unsafe extern "C" fn replicant_create(
     let api_key = api_key.to_string();
     let api_secret = api_secret.to_string();
     let init_task = runtime.spawn(async move {
-        match CoreClient::with_event_dispatcher(
+        match CoreClient::open(
             &database_url,
             &server_url,
             &email,
@@ -443,6 +444,7 @@ pub unsafe extern "C" fn replicant_create(
         .await
         {
             Ok(client) => {
+                let client = Arc::new(client);
                 // Never panic here: the client is already built, and unwinding
                 // out of this task would drop it — and its pool — un-closed,
                 // leaving a sqlx worker thread per connection running in this
@@ -455,7 +457,7 @@ pub unsafe extern "C" fn replicant_create(
                 match engine_slot.lock() {
                     Ok(mut slot) => {
                         debug_assert!(slot.is_none(), "engine slot was already occupied");
-                        *slot = Some(client);
+                        *slot = Some(client.clone());
                     }
                     Err(poisoned) => {
                         tracing::warn!(
@@ -464,16 +466,23 @@ pub unsafe extern "C" fn replicant_create(
                         );
                         let mut slot = poisoned.into_inner();
                         debug_assert!(slot.is_none(), "engine slot was already occupied");
-                        *slot = Some(client);
+                        *slot = Some(client.clone());
                     }
                 }
-                // No connection or sync events here: an Ok init may still be
-                // offline. ConnectionSucceeded comes from a real connect and
-                // SyncCompleted from the server's reply to the full sync.
+                // Started only once it is in the slot, so a consumer reacting to
+                // ConnectionSucceeded or SyncCompleted already uses this client,
+                // and documents written through the offline path meanwhile are
+                // uploaded by its initial sync.
+                if let Err(e) = client.start().await {
+                    event_dispatcher_clone.emit_sync_error(
+                        ReplicantErrorCode::Unknown,
+                        &format!("Initial sync failed: {}", e),
+                    );
+                }
             }
             Err(e) => {
                 // The pool this init opened is already closed:
-                // `with_event_dispatcher` closes it on every failure path, which
+                // `open` closes it on every failure path, which
                 // is what joins its sqlite worker threads. Nothing is left to
                 // clean up here, and the slot stays `None`.
                 event_dispatcher_clone.emit_sync_error(

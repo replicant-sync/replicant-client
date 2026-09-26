@@ -313,7 +313,38 @@ impl Client {
         .await
     }
 
+    /// Opens the database, connects if sync is enabled, then announces the
+    /// connection and runs the initial sync (see [`Client::start`]).
     pub async fn with_event_dispatcher(
+        database_url: &str,
+        server_url: &str,
+        email: &str,
+        api_key: &str,
+        api_secret: &str,
+        canonical_user_id: Option<Uuid>,
+        event_dispatcher: Option<Arc<EventDispatcher>>,
+    ) -> SyncResult<Self> {
+        let client = Self::open(
+            database_url,
+            server_url,
+            email,
+            api_key,
+            api_secret,
+            canonical_user_id,
+            event_dispatcher,
+        )
+        .await?;
+        if let Err(e) = client.start().await {
+            client.shutdown().await;
+            return Err(e);
+        }
+        Ok(client)
+    }
+
+    /// Opens the database and connects if sync is enabled, without emitting
+    /// ConnectionSucceeded, monitoring the connection or syncing. The caller
+    /// must call [`Client::start`] once the client is ready for use.
+    pub(crate) async fn open(
         database_url: &str,
         server_url: &str,
         email: &str,
@@ -542,8 +573,6 @@ impl Client {
         let ws_client_for_reconnect_sync = ws_client.clone();
         let event_dispatcher_for_reconnect_sync = event_dispatcher.clone();
 
-        self.start_reconnection_loop();
-
         // Spawn message handler with upload tracking
         tokio::spawn(async move {
             let mut rx = rx;
@@ -634,7 +663,18 @@ impl Client {
             tracing::warn!("CLIENT {}: Reconnection sync handler terminated", client_id);
         });
 
-        // Only perform initial sync if connected
+        Ok(())
+    }
+
+    /// Emits ConnectionSucceeded if the start-up connect succeeded, starts the
+    /// reconnection monitor, then runs the initial upload-first sync.
+    pub(crate) async fn start(&self) -> SyncResult<()> {
+        if self.is_connected() {
+            self.event_dispatcher
+                .emit_connection_succeeded(&self.server_url);
+        }
+        self.start_reconnection_loop();
+
         if self.is_connected.load(Ordering::Relaxed) {
             // Upload-first strategy with protection
             self.event_dispatcher.emit_sync_started();
