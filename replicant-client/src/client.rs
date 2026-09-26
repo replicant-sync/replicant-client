@@ -290,6 +290,8 @@ pub struct Client {
     // Sync is possible for this instance (credentials + adopted identity).
     // Immutable for the client's lifetime: enrollment recreates the client.
     sync_enabled: bool,
+    /// Set by `shutdown`; the reconnection monitor stops when it sees it.
+    stopped: Arc<AtomicBool>,
 }
 
 impl Client {
@@ -486,6 +488,7 @@ impl Client {
             deferred_messages: Arc::new(Mutex::new(Vec::new())),
             upload_retry: UploadRetry::new(reconnect_sync_tx_for_retry),
             sync_enabled,
+            stopped: Arc::new(AtomicBool::new(false)),
         };
 
         // Automatically start background tasks
@@ -520,6 +523,7 @@ impl Client {
     /// thread alive for the life of the process, which is the very failure this
     /// shutdown exists to prevent.
     pub async fn shutdown(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
         self.is_connected.store(false, Ordering::SeqCst);
         self.db.close().await;
 
@@ -3060,6 +3064,9 @@ impl Client {
 
     /// Start the reconnection loop if not already running
     fn start_reconnection_loop(&self) {
+        if self.stopped.load(Ordering::SeqCst) {
+            return;
+        }
         if !self.sync_enabled {
             tracing::info!(
                 "CLIENT {}: sync disabled (no credentials or identity not adopted) — \
@@ -3085,6 +3092,7 @@ impl Client {
         let last_ping_time = self.last_ping_time.clone();
         let deferred_messages = self.deferred_messages.clone();
         let upload_retry = self.upload_retry.clone();
+        let stopped = self.stopped.clone();
 
         tracing::info!(
             "🔄 CLIENT {}: Starting continuous reconnection monitor (5-second intervals)",
@@ -3096,6 +3104,13 @@ impl Client {
             let mut connection_attempts = 0;
 
             loop {
+                if stopped.load(Ordering::SeqCst) {
+                    tracing::info!(
+                        "CLIENT {}: Client shut down, reconnection monitor stopping",
+                        client_id
+                    );
+                    break;
+                }
                 let currently_connected = is_connected.load(Ordering::Relaxed);
 
                 if !currently_connected {
@@ -3129,7 +3144,17 @@ impl Client {
                             connection_attempts = 0;
 
                             // Update the client
-                            *ws_client.lock().await = Some(new_client);
+                            {
+                                let mut guard = ws_client.lock().await;
+                                if stopped.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                *guard = Some(new_client);
+                            }
+                            // Shutdown may have run while the lock was held.
+                            if stopped.load(Ordering::SeqCst) {
+                                break;
+                            }
                             is_connected.store(true, Ordering::Relaxed);
 
                             // Reset ping timer on successful connection
@@ -5931,5 +5956,36 @@ mod start_and_shutdown_tests {
             .unwrap();
 
         client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_the_reconnection_monitor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, dispatcher) = offline_client(&dir).await;
+        let seen = record_events(&dispatcher);
+        let attempts = |seen: &std::sync::Mutex<Vec<EventType>>| {
+            dispatcher.process_events().unwrap();
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|e| **e == EventType::ConnectionAttempted)
+                .count()
+        };
+
+        client.start().await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while attempts(&seen) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the monitor never tried to connect"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        client.shutdown().await;
+        let at_shutdown = attempts(&seen);
+        // The monitor would try again within its 5 s interval if still running.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(attempts(&seen), at_shutdown);
     }
 }
