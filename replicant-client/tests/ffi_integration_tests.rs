@@ -985,3 +985,170 @@ fn test_ffi_update_and_get_document() {
         replicant_destroy(engine);
     }
 }
+
+/// Every sync, connection and error event an engine delivers, in order.
+#[derive(Default)]
+struct EventLog(Mutex<Vec<EventType>>);
+
+impl EventLog {
+    fn events(&self) -> Vec<EventType> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+extern "C" fn log_sync_event(event_type: EventType, _count: u64, context: *mut c_void) {
+    let log = unsafe { &*(context as *const EventLog) };
+    log.0.lock().unwrap().push(event_type);
+}
+
+extern "C" fn log_connection_event(
+    event_type: EventType,
+    _connected: bool,
+    _attempt: u32,
+    context: *mut c_void,
+) {
+    let log = unsafe { &*(context as *const EventLog) };
+    log.0.lock().unwrap().push(event_type);
+}
+
+extern "C" fn log_error_event(
+    event_type: EventType,
+    _code: i32,
+    _message: *const c_char,
+    context: *mut c_void,
+) {
+    let log = unsafe { &*(context as *const EventLog) };
+    log.0.lock().unwrap().push(event_type);
+}
+
+unsafe fn register_event_log(engine: *mut Replicant, log: &EventLog) {
+    let context = log as *const EventLog as *mut c_void;
+    assert_eq!(
+        replicant_register_sync_callback(engine, log_sync_event, context),
+        SyncResult::Success
+    );
+    assert_eq!(
+        replicant_register_connection_callback(engine, log_connection_event, context),
+        SyncResult::Success
+    );
+    assert_eq!(
+        replicant_register_error_callback(engine, log_error_event, context),
+        SyncResult::Success
+    );
+}
+
+/// Pumps events until `done` holds or `timeout` passes; returns whether `done` held.
+unsafe fn pump_events_until(
+    engine: *mut Replicant,
+    log: &EventLog,
+    timeout: std::time::Duration,
+    done: impl Fn(&[EventType]) -> bool,
+) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        replicant_process_events(engine, ptr::null_mut());
+        if done(&log.events()) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Creates an engine that has credentials and an adopted identity, so it
+/// tries to sync with `server_url`.
+unsafe fn create_credentialed_engine(server_url: &str) -> *mut Replicant {
+    let unique_id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let test_db_path = format!(
+        "/tmp/sync_client_test_{}_{}.db",
+        std::process::id(),
+        unique_id
+    );
+    let _ = std::fs::remove_file(&test_db_path);
+
+    let db_url = CString::new(format!("sqlite:{}?mode=rwc", test_db_path)).unwrap();
+    let server_url = CString::new(server_url).unwrap();
+    let email = CString::new("test-user@example.com").unwrap();
+    let api_key = CString::new("rpa_test_api_key_example_12345").unwrap();
+    let api_secret = CString::new("rps_test_api_secret_example_67890").unwrap();
+    let user_id = CString::new(uuid::Uuid::new_v4().to_string()).unwrap();
+
+    replicant_create(
+        db_url.as_ptr(),
+        server_url.as_ptr(),
+        email.as_ptr(),
+        api_key.as_ptr(),
+        api_secret.as_ptr(),
+        user_id.as_ptr(),
+    )
+}
+
+#[test]
+fn test_ffi_offline_startup_reports_no_connection_or_sync() {
+    unsafe {
+        // Port 1 refuses immediately: the client has credentials but no server.
+        let engine = create_credentialed_engine("ws://127.0.0.1:1/socket/websocket");
+        assert!(!engine.is_null(), "Failed to create sync engine");
+
+        let log = EventLog::default();
+        register_event_log(engine, &log);
+
+        let connect_failed =
+            pump_events_until(engine, &log, std::time::Duration::from_secs(15), |events| {
+                events.contains(&EventType::SyncError)
+            });
+        assert!(
+            connect_failed,
+            "the connect should fail: {:?}",
+            log.events()
+        );
+
+        // Give any event init would emit after the failed connect time to arrive.
+        pump_events_until(engine, &log, std::time::Duration::from_secs(1), |_| false);
+
+        let events = log.events();
+        assert!(
+            !events.contains(&EventType::ConnectionSucceeded),
+            "an offline start must not report a connection: {:?}",
+            events
+        );
+        assert!(
+            !events.contains(&EventType::SyncCompleted),
+            "an offline start must not report a completed sync: {:?}",
+            events
+        );
+        assert!(!replicant_is_connected(engine));
+
+        replicant_destroy(engine);
+    }
+}
+
+#[test]
+fn test_ffi_local_only_startup_reports_no_connection_or_sync() {
+    unsafe {
+        // No canonical user id: sync is disabled and no server is contacted.
+        let engine = create_test_engine();
+        assert!(!engine.is_null(), "Failed to create sync engine");
+
+        let log = EventLog::default();
+        register_event_log(engine, &log);
+
+        pump_events_until(engine, &log, std::time::Duration::from_secs(2), |_| false);
+
+        let events = log.events();
+        assert!(
+            !events.contains(&EventType::ConnectionSucceeded),
+            "a local-only start must not report a connection: {:?}",
+            events
+        );
+        assert!(
+            !events.contains(&EventType::SyncCompleted),
+            "a local-only start must not report a completed sync: {:?}",
+            events
+        );
+
+        replicant_destroy(engine);
+    }
+}
