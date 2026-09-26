@@ -673,13 +673,14 @@ impl Client {
     /// A failure is reported as SyncError and leaves a working client: upload
     /// protection is off, and the monitor and later upload passes carry on.
     pub(crate) async fn start(&self) {
-        if self.is_connected() {
+        let connected = self.is_connected();
+        if connected {
             self.event_dispatcher
                 .emit_connection_succeeded(&self.server_url);
         }
         self.start_reconnection_loop();
 
-        if !self.is_connected.load(Ordering::Relaxed) {
+        if !connected {
             tracing::info!(
                 "CLIENT {}: Starting in offline mode - will sync when connection available",
                 self.client_id
