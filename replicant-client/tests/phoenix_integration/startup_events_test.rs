@@ -209,6 +209,13 @@ fn offline_startup_reports_connection_then_sync_after_reconnect() {
         );
         assert_connected_then_synced(&log);
         assert!(replicant_is_connected(engine));
+        let started = log.position(EventType::SyncStarted);
+        let completed = log.position(EventType::SyncCompleted);
+        assert!(
+            started.is_some() && started < completed,
+            "expected SyncStarted before SyncCompleted: {:?}",
+            log.events()
+        );
 
         destroy_and_remove_db(engine, &db_path);
     }

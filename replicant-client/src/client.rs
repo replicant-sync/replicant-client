@@ -540,6 +540,7 @@ impl Client {
         let db_for_reconnect_sync = db.clone();
         let pending_uploads_for_reconnect_sync = pending_uploads.clone();
         let ws_client_for_reconnect_sync = ws_client.clone();
+        let event_dispatcher_for_reconnect_sync = event_dispatcher.clone();
 
         self.start_reconnection_loop();
 
@@ -613,6 +614,7 @@ impl Client {
                         client_id
                     );
                     if let Some(client) = ws_client_for_reconnect_sync.lock().await.as_ref() {
+                        event_dispatcher_for_reconnect_sync.emit_sync_started();
                         if let Err(e) = client.send(ClientMessage::RequestFullSync).await {
                             tracing::error!(
                                 "CLIENT {}: Failed to request full sync after reconnection: {}",
