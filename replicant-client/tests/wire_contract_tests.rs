@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use replicant_client::engine::types::{Change, ChangeKind, DocEnvelope, Scope, Seq};
+use replicant_client::engine::types::{Change, ChangeKind, DocEnvelope, Scope, Seq, UploadKind};
 use replicant_core::patches::calculate_checksum;
 use serde::Deserialize;
 use serde_json::Value;
@@ -47,6 +47,59 @@ struct WireJoinReply {
     protocol_version: u32,
 }
 
+/// Mirrors `machine::Request::Join`: the `phx_join` payload.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Join {
+    email: String,
+    api_key: String,
+    signature: String,
+    timestamp: i64,
+}
+
+/// Mirrors `machine::Request::GetChangesSince`, which is not a serde type.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetChangesSince {
+    scope: Scope,
+    cursor: Seq,
+    limit: u32,
+}
+
+/// Mirrors `machine::Request::GetSnapshot`, which is not a serde type.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetSnapshot {
+    scope: Scope,
+    page_token: Option<String>,
+}
+
+/// Mirrors `machine::Request::Upload` (`types::Upload`), which is not a serde type.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Upload {
+    upload_id: Uuid,
+    doc_id: Uuid,
+    kind: String,
+    base_hash: Option<String>,
+    payload: Value,
+}
+
+/// Mirrors `machine::Request::GetDocument`, which is not a serde type.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GetDocument {
+    doc_id: Uuid,
+}
+
+/// The websocket connect query params.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SocketConnectParams {
+    protocol_version: String,
+    client_id: Uuid,
+}
+
 #[derive(Debug, Deserialize)]
 struct ReplyEnvelope {
     status: String,
@@ -62,26 +115,35 @@ const EXPECTED_FRAME_NAMES: &[&str] = &[
     "change_push_delete",
     "changes_reply",
     "changes_reply_populated",
+    "changes_request",
     "cursor_too_old_reply",
     "deleted_reply",
     "document_reply",
+    "document_request",
     "exists_reply",
     "float_document_reply",
     "float_upload_reply",
     "hash_mismatch_reply",
     "join_error_reply",
     "join_reply",
+    "join_request",
     "publish_reply",
     "publish_request",
     "publish_update_reply",
     "publish_update_request",
+    "snapshot_page_request",
     "snapshot_reply",
+    "snapshot_request",
+    "socket_connect_params",
     "socket_refusal",
     "subscription_forbidden_reply",
     "too_large_reply",
     "unpublish_reply",
     "unpublish_request",
+    "upload_create_request",
+    "upload_delete_request",
     "upload_reply",
+    "upload_update_request",
     "validation_reply",
 ];
 
@@ -307,6 +369,103 @@ fn client_push_requests_carry_their_expected_ids() {
         .get("publication_id")
         .and_then(Value::as_str)
         .is_some());
+}
+
+fn upload_kind(kind: &str) -> UploadKind {
+    match kind {
+        "create" => UploadKind::Create,
+        "update" => UploadKind::Update,
+        "delete" => UploadKind::Delete,
+        other => panic!("unknown upload kind {other}"),
+    }
+}
+
+fn upload_request(frames: &serde_json::Map<String, Value>, name: &str) -> (Value, Upload) {
+    let payload = frame_payload(frames, name, "upload");
+    let upload: Upload = serde_json::from_value(payload.clone())
+        .unwrap_or_else(|e| panic!("{name} must match Request::Upload: {e}"));
+    assert_eq!(upload.upload_id, Uuid::nil(), "{name}");
+    assert_eq!(upload.doc_id, Uuid::nil(), "{name}");
+    (payload, upload)
+}
+
+#[test]
+fn socket_connect_and_join_requests_carry_the_contract_fields() {
+    let frames = load_frames();
+
+    let connect: SocketConnectParams =
+        serde_json::from_value(frames["socket_connect_params"].clone())
+            .expect("socket_connect_params must match the connect query params");
+    assert_eq!(connect.protocol_version, "2");
+    assert_eq!(connect.client_id, Uuid::nil());
+
+    let join = frame_payload(&frames, "join_request", "phx_join");
+    let join: Join = serde_json::from_value(join).expect("join_request must match Request::Join");
+    assert!(join.email.contains('@'));
+    assert!(!join.api_key.is_empty());
+    assert_eq!(join.signature.len(), 64);
+    assert!(join.timestamp > 0);
+}
+
+#[test]
+fn feed_and_document_requests_match_their_request_variants() {
+    let frames = load_frames();
+
+    let changes: GetChangesSince = serde_json::from_value(frame_payload(
+        &frames,
+        "changes_request",
+        "get_changes_since",
+    ))
+    .expect("changes_request must match Request::GetChangesSince");
+    assert_eq!(changes.scope, "own");
+    assert!(changes.cursor >= 0 && changes.limit > 0);
+
+    let first_page = frame_payload(&frames, "snapshot_request", "get_snapshot");
+    assert!(first_page.get("page_token").is_none());
+    let first_page: GetSnapshot = serde_json::from_value(first_page)
+        .expect("snapshot_request must match Request::GetSnapshot");
+    assert_eq!(first_page.scope, "own");
+    assert_eq!(first_page.page_token, None);
+
+    let next_page: GetSnapshot = serde_json::from_value(frame_payload(
+        &frames,
+        "snapshot_page_request",
+        "get_snapshot",
+    ))
+    .expect("snapshot_page_request must match Request::GetSnapshot");
+    let token = next_page
+        .page_token
+        .expect("snapshot_page_request must carry a page_token");
+    let (seq, id) = token
+        .split_once(':')
+        .expect("page_token is <snapshot_seq>:<doc_id>");
+    assert!(seq.parse::<Seq>().is_ok());
+    assert!(Uuid::parse_str(id).is_ok());
+
+    let document: GetDocument =
+        serde_json::from_value(frame_payload(&frames, "document_request", "get_document"))
+            .expect("document_request must match Request::GetDocument");
+    assert_eq!(document.doc_id, Uuid::nil());
+}
+
+#[test]
+fn upload_requests_match_request_upload_per_kind() {
+    let frames = load_frames();
+
+    let (raw, create) = upload_request(&frames, "upload_create_request");
+    assert_eq!(upload_kind(&create.kind), UploadKind::Create);
+    assert!(raw.get("base_hash").is_none());
+    assert!(create.payload.is_object());
+
+    let (_raw, update) = upload_request(&frames, "upload_update_request");
+    assert_eq!(upload_kind(&update.kind), UploadKind::Update);
+    assert!(update.base_hash.is_some());
+    assert!(update.payload.is_array());
+
+    let (raw, delete) = upload_request(&frames, "upload_delete_request");
+    assert_eq!(upload_kind(&delete.kind), UploadKind::Delete);
+    assert!(raw.get("base_hash").is_none());
+    assert!(delete.payload.is_null());
 }
 
 /// Never compare a client-computed hash to a server hash: the server hash is authoritative.
