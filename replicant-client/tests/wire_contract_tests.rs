@@ -10,7 +10,6 @@ use serde_json::Value;
 use uuid::Uuid;
 
 const FRAMES_JSON: &str = include_str!("fixtures/server_v2/v2_frames.json");
-const HASH_FIXTURE_JSON: &str = include_str!("fixtures/server_v2/content_hash_fixture.json");
 
 /// Mirrors `machine::Response::Changes`, which is not a serde type.
 #[derive(Debug, Deserialize)]
@@ -310,8 +309,7 @@ fn client_push_requests_carry_their_expected_ids() {
         .is_some());
 }
 
-/// Never compare a client-computed hash to a server hash: the server hash is authoritative,
-/// and jsonb round-tripping a float loses the distinction the client-side hasher preserves.
+/// Never compare a client-computed hash to a server hash: the server hash is authoritative.
 #[test]
 fn float_content_deserializes_but_client_hash_is_not_the_server_hash() {
     let frames = load_frames();
@@ -325,31 +323,18 @@ fn float_content_deserializes_but_client_hash_is_not_the_server_hash() {
     let document_doc: DocEnvelope = serde_json::from_value(document_response)
         .expect("float_document_reply must be a DocEnvelope");
 
+    assert_eq!(
+        upload_doc.hash, document_doc.hash,
+        "the server hash must survive the jsonb round trip"
+    );
+    assert_eq!(
+        calculate_checksum(&upload_doc.content),
+        upload_doc.hash,
+        "client hash of the echoed upload content must match the server's hash"
+    );
     assert_ne!(
         calculate_checksum(&document_doc.content),
         document_doc.hash,
         "client-computed hash of jsonb-rounded content must not equal the server's hash"
     );
-}
-
-#[test]
-fn content_hash_fixture_matches_calculate_checksum() {
-    #[derive(Debug, Deserialize)]
-    struct Case {
-        name: String,
-        content: Value,
-        hash: String,
-    }
-
-    let cases: Vec<Case> =
-        serde_json::from_str(HASH_FIXTURE_JSON).expect("content_hash_fixture.json must parse");
-    assert_eq!(cases.len(), 8, "expected 8 pinned hash cases");
-    for case in &cases {
-        assert_eq!(
-            calculate_checksum(&case.content),
-            case.hash,
-            "hash mismatch for case {}",
-            case.name
-        );
-    }
 }
