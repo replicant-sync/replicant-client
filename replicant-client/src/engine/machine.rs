@@ -197,6 +197,7 @@ pub enum Lifecycle {
 pub enum Effect {
     OpenSocket,
     CloseSocket,
+    /// Answered with `Input::CredentialsChanged`.
     CheckCredentials,
     Send {
         req: u64,
@@ -207,33 +208,41 @@ pub enum Effect {
         after: Duration,
     },
     Cancel(TimerId),
+    /// Answered with `Input::Cursors`.
     LoadCursors,
+    /// Answered with `Input::Applied` echoing `tag`.
     ApplyChanges {
         scope: Scope,
         changes: Vec<Change>,
         new_cursor: Seq,
         tag: ApplyTag,
     },
+    /// Answered with `Input::Applied` echoing `tag`.
     ApplySnapshotPage {
         scope: Scope,
         docs: Vec<DocEnvelope>,
         tag: ApplyTag,
     },
+    /// Answered with `Input::Applied { tag: ApplyTag::SnapshotFinish, .. }`.
     FinishSnapshot {
         scope: Scope,
         seen: Vec<Uuid>,
         snapshot_seq: Seq,
     },
+    /// Answered with `Input::PendingDocs`.
     LoadPending,
+    /// Answered with `Input::UploadBuilt`.
     BuildUpload {
         doc_id: Uuid,
     },
+    /// Answered with `Input::Settled`.
     SettleUpload {
         doc_id: Uuid,
         inflight: InFlight,
         reply: Result<DocEnvelope, ServerError>,
         mismatch_attempts: u32,
     },
+    /// Answered with `Input::ServerCopyApplied`.
     ApplyServerCopy {
         doc_id: Uuid,
         doc: Option<DocEnvelope>,
@@ -365,7 +374,9 @@ impl Core {
     pub fn step(&mut self, input: Input) -> Vec<Effect> {
         let mut fx = Vec::new();
         let before = self.state();
-        if !matches!(self.conn, Conn::Idle) || matches!(input, Input::Start { .. }) {
+        if !matches!(self.conn, Conn::Idle)
+            || matches!(input, Input::Start { .. } | Input::Shutdown)
+        {
             self.handle(input, &mut fx);
         }
         let after = self.state();
