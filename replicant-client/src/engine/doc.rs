@@ -170,6 +170,22 @@ pub fn with_settle_invariant(snap: &DocSnapshot, mut ops: Vec<DocOp>, me: Uuid) 
     ops
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum Rebased {
+    Clean(Value),
+    Conflict,
+}
+
+/// Replays the local change (`old_base` → `local`) onto `new_base`.
+pub fn rebase(old_base: &Value, new_base: &Value, local: &Value) -> Rebased {
+    let local_patch = json_patch::diff(old_base, local);
+    let mut out = new_base.clone();
+    match json_patch::patch(&mut out, &local_patch) {
+        Ok(()) => Rebased::Clean(out),
+        Err(_) => Rebased::Conflict,
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod fixtures {
     use super::*;
@@ -340,5 +356,33 @@ mod snapshot_tests {
         };
         let ops = with_settle_invariant(&s, vec![], ME);
         assert_eq!(ops, vec![DocOp::InsertMarker(RowKind::Create)]);
+    }
+}
+
+#[cfg(test)]
+mod rebase_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn independent_edits_merge() {
+        let r = rebase(
+            &json!({"a": 1}),
+            &json!({"a": 1, "b": 2}),
+            &json!({"a": 1, "c": 3}),
+        );
+        assert_eq!(r, Rebased::Clean(json!({"a": 1, "b": 2, "c": 3})));
+    }
+
+    #[test]
+    fn no_local_change_takes_new_base() {
+        let r = rebase(&json!({"a": 1}), &json!({"a": 2}), &json!({"a": 1}));
+        assert_eq!(r, Rebased::Clean(json!({"a": 2})));
+    }
+
+    #[test]
+    fn edit_under_removed_parent_conflicts() {
+        let r = rebase(&json!({"a": {"x": 1}}), &json!({}), &json!({"a": {"x": 2}}));
+        assert_eq!(r, Rebased::Conflict);
     }
 }
