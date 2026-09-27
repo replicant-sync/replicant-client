@@ -629,19 +629,313 @@ impl Core {
         self.request_pump(fx);
     }
 
-    // Filled in by Task 11.
-    fn start_catch_up(&mut self, _scope: &str, _fx: &mut Vec<Effect>) {}
+    fn session(&mut self) -> Option<&mut Session> {
+        match &mut self.conn {
+            Conn::Connected(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    fn start_catch_up(&mut self, scope: &str, fx: &mut Vec<Effect>) {
+        let req = self.alloc_req();
+        let Some(s) = self.session() else { return };
+        let cursor = *s.cursors.get(scope).unwrap_or(&0);
+        if cursor == 0 {
+            s.scopes
+                .insert(scope.to_string(), ScopeSync::SnapshotRequesting { req });
+            s.snapshot_seen.insert(scope.to_string(), (Vec::new(), 0));
+            s.requests.insert(
+                req,
+                Pending::Snapshot {
+                    scope: scope.to_string(),
+                },
+            );
+            fx.push(Effect::Send {
+                req,
+                request: Request::GetSnapshot {
+                    scope: scope.to_string(),
+                    page_token: None,
+                },
+            });
+        } else {
+            s.scopes
+                .insert(scope.to_string(), ScopeSync::Requesting { req });
+            s.requests.insert(
+                req,
+                Pending::Changes {
+                    scope: scope.to_string(),
+                },
+            );
+            fx.push(Effect::Send {
+                req,
+                request: Request::GetChangesSince {
+                    scope: scope.to_string(),
+                    cursor,
+                    limit: PAGE_LIMIT,
+                },
+            });
+        }
+        fx.push(Effect::Schedule {
+            timer: TimerId::Request(req),
+            after: REQUEST_TIMEOUT,
+        });
+    }
+
+    fn request_snapshot_page(
+        &mut self,
+        scope: &str,
+        page_token: Option<String>,
+        fx: &mut Vec<Effect>,
+    ) {
+        let req = self.alloc_req();
+        let Some(s) = self.session() else { return };
+        s.scopes
+            .insert(scope.to_string(), ScopeSync::SnapshotRequesting { req });
+        s.requests.insert(
+            req,
+            Pending::Snapshot {
+                scope: scope.to_string(),
+            },
+        );
+        fx.push(Effect::Send {
+            req,
+            request: Request::GetSnapshot {
+                scope: scope.to_string(),
+                page_token,
+            },
+        });
+        fx.push(Effect::Schedule {
+            timer: TimerId::Request(req),
+            after: REQUEST_TIMEOUT,
+        });
+    }
+
+    fn fail_catch_up(&mut self, scope: &str, fx: &mut Vec<Effect>) {
+        let Some(s) = self.session() else { return };
+        s.catch_up_failures += 1;
+        if s.catch_up_failures >= MAX_CATCH_UP_FAILURES {
+            self.lose_connection(fx);
+            return;
+        }
+        let delay = catch_up_retry_delay(s.catch_up_failures);
+        s.scopes.insert(scope.to_string(), ScopeSync::RetryWait);
+        fx.push(Effect::Schedule {
+            timer: TimerId::CatchUpRetry(scope.to_string()),
+            after: delay,
+        });
+    }
+
     fn on_session_reply(
         &mut self,
-        _req: u64,
-        _p: Pending,
-        _r: Result<Response, ServerError>,
-        _fx: &mut Vec<Effect>,
+        req: u64,
+        pending: Pending,
+        result: Result<Response, ServerError>,
+        fx: &mut Vec<Effect>,
     ) {
+        match pending {
+            Pending::Changes { scope } => match result {
+                Ok(Response::Changes {
+                    changes,
+                    next_cursor,
+                    has_more,
+                }) => {
+                    let Some(s) = self.session() else { return };
+                    s.cursors.insert(scope.clone(), next_cursor);
+                    s.scopes
+                        .insert(scope.clone(), ScopeSync::Applying { req, has_more });
+                    fx.push(Effect::ApplyChanges {
+                        scope,
+                        changes,
+                        new_cursor: next_cursor,
+                        tag: ApplyTag::Page(req),
+                    });
+                }
+                Err(e) if e.code == "cursor_too_old" => {
+                    if let Some(s) = self.session() {
+                        s.snapshot_seen.insert(scope.clone(), (Vec::new(), 0));
+                    }
+                    self.request_snapshot_page(&scope, None, fx);
+                }
+                _ => self.fail_catch_up(&scope, fx),
+            },
+            Pending::Snapshot { scope } => match result {
+                Ok(Response::SnapshotPage {
+                    docs,
+                    snapshot_seq,
+                    next_page_token,
+                }) => {
+                    let Some(s) = self.session() else { return };
+                    let entry = s
+                        .snapshot_seen
+                        .entry(scope.clone())
+                        .or_insert((Vec::new(), 0));
+                    entry.0.extend(docs.iter().map(|d| d.doc_id));
+                    if entry.1 == 0 {
+                        entry.1 = snapshot_seq; // fixed by the server before page 1
+                    }
+                    s.scopes.insert(
+                        scope.clone(),
+                        ScopeSync::SnapshotApplying {
+                            req,
+                            next_page: next_page_token,
+                        },
+                    );
+                    fx.push(Effect::ApplySnapshotPage {
+                        scope,
+                        docs,
+                        tag: ApplyTag::SnapshotPage(req),
+                    });
+                }
+                _ => self.fail_catch_up(&scope, fx),
+            },
+            // Filled in by Task 12.
+            Pending::Upload { .. } | Pending::Document { .. } => {}
+            Pending::Heartbeat => {}
+        }
     }
-    fn on_session_timer(&mut self, _t: TimerId, _fx: &mut Vec<Effect>) {}
-    fn on_session_input(&mut self, _i: Input, _fx: &mut Vec<Effect>) {}
+
+    fn on_session_timer(&mut self, timer: TimerId, fx: &mut Vec<Effect>) {
+        match timer {
+            TimerId::CatchUpRetry(scope) => {
+                let waiting = self
+                    .session()
+                    .is_some_and(|s| s.scopes.get(&scope) == Some(&ScopeSync::RetryWait));
+                if waiting {
+                    self.start_catch_up(&scope, fx);
+                }
+            }
+            TimerId::Request(req) => {
+                let pending = self.session().and_then(|s| s.requests.remove(&req));
+                match pending {
+                    Some(Pending::Changes { scope }) | Some(Pending::Snapshot { scope }) => {
+                        self.fail_catch_up(&scope, fx)
+                    }
+                    Some(other) => self.on_request_timeout(other, fx),
+                    None => {}
+                }
+            }
+            other => self.on_upload_timer(other, fx),
+        }
+    }
+
+    fn on_session_input(&mut self, input: Input, fx: &mut Vec<Effect>) {
+        if !matches!(self.conn, Conn::Connected(_)) {
+            return;
+        }
+        match input {
+            Input::Push(change) => self.on_push(change, fx),
+            Input::Applied { scope, tag } => self.on_applied(scope, tag, fx),
+            other => self.on_upload_input(other, fx),
+        }
+    }
+
+    fn on_push(&mut self, change: Change, fx: &mut Vec<Effect>) {
+        let Some(s) = self.session() else { return };
+        let scope = change.scope.clone();
+        match s.scopes.get(&scope) {
+            Some(ScopeSync::Live) => {}
+            Some(_) => {
+                s.buffered.entry(scope).or_default().push(change);
+                return;
+            }
+            None => return,
+        }
+        let cursor = *s.cursors.get(&scope).unwrap_or(&0);
+        if change.seq <= cursor {
+            return;
+        }
+        if change.prev_seq <= cursor {
+            s.cursors.insert(scope.clone(), change.seq);
+            let new_cursor = change.seq;
+            fx.push(Effect::ApplyChanges {
+                scope,
+                changes: vec![change],
+                new_cursor,
+                tag: ApplyTag::Push,
+            });
+        } else {
+            self.start_catch_up(&scope, fx);
+        }
+    }
+
+    fn on_applied(&mut self, scope: Scope, tag: ApplyTag, fx: &mut Vec<Effect>) {
+        let Some(s) = self.session() else { return };
+        let state = s.scopes.get(&scope).cloned();
+        match (state, tag) {
+            (Some(ScopeSync::Applying { req, has_more }), ApplyTag::Page(t)) if req == t => {
+                if has_more {
+                    self.start_catch_up(&scope, fx);
+                } else {
+                    self.finish_scope(&scope, fx);
+                }
+            }
+            (Some(ScopeSync::SnapshotApplying { req, next_page }), ApplyTag::SnapshotPage(t))
+                if req == t =>
+            {
+                match next_page {
+                    Some(token) => self.request_snapshot_page(&scope, Some(token), fx),
+                    None => {
+                        let (seen, snapshot_seq) =
+                            s.snapshot_seen.remove(&scope).unwrap_or_default();
+                        s.scopes
+                            .insert(scope.clone(), ScopeSync::SnapshotFinishing { snapshot_seq });
+                        fx.push(Effect::FinishSnapshot {
+                            scope,
+                            seen,
+                            snapshot_seq,
+                        });
+                    }
+                }
+            }
+            (Some(ScopeSync::SnapshotFinishing { snapshot_seq }), ApplyTag::SnapshotFinish) => {
+                s.cursors.insert(scope.clone(), snapshot_seq);
+                self.start_catch_up(&scope, fx);
+            }
+            _ => {} // push applies and stale tags
+        }
+        self.request_pump(fx);
+    }
+
+    fn finish_scope(&mut self, scope: &str, fx: &mut Vec<Effect>) {
+        let Some(s) = self.session() else { return };
+        s.scopes.insert(scope.to_string(), ScopeSync::Live);
+        let mut buffered = s.buffered.remove(scope).unwrap_or_default();
+        buffered.sort_by_key(|c| c.seq);
+        for change in buffered {
+            self.on_push(change, fx);
+            let still_live = self
+                .session()
+                .is_some_and(|s| s.scopes.get(scope) == Some(&ScopeSync::Live));
+            if !still_live {
+                break; // a gap restarted catch-up; it will cover the rest
+            }
+        }
+        self.check_all_live(fx);
+    }
+
+    fn check_all_live(&mut self, fx: &mut Vec<Effect>) {
+        let names = self.scope_names.clone();
+        let Some(s) = self.session() else { return };
+        if s.phase != Some(Phase::CatchingUp) {
+            return;
+        }
+        if names
+            .iter()
+            .all(|n| s.scopes.get(n) == Some(&ScopeSync::Live))
+        {
+            s.phase = Some(Phase::Live);
+            s.catch_up_failures = 0;
+            if !s.synced_once {
+                s.synced_once = true;
+                fx.push(Effect::Emit(Lifecycle::SyncCompleted));
+            }
+        }
+    }
+
     // Filled in by Task 12.
+    fn on_request_timeout(&mut self, _p: Pending, _fx: &mut Vec<Effect>) {}
+    fn on_upload_timer(&mut self, _t: TimerId, _fx: &mut Vec<Effect>) {}
+    fn on_upload_input(&mut self, _i: Input, _fx: &mut Vec<Effect>) {}
     fn request_pump(&mut self, _fx: &mut Vec<Effect>) {}
 }
 
@@ -1023,5 +1317,369 @@ mod connection_tests {
                 has_credentials: true
             })
             .is_empty());
+    }
+}
+
+#[cfg(test)]
+mod catch_up_tests {
+    use super::harness::*;
+    use super::*;
+    use crate::engine::types::{ChangeKind, DocEnvelope};
+    use serde_json::json;
+
+    fn connected(c: &mut Core) {
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (req, _) = sends(&c.step(Input::SocketOpened)).pop().unwrap();
+        c.step(Input::Reply {
+            req,
+            result: Ok(Response::Joined),
+        });
+    }
+
+    fn change(scope: &str, seq: i64, prev_seq: i64) -> Change {
+        Change {
+            scope: scope.into(),
+            seq,
+            prev_seq,
+            doc_id: Uuid::from_u128(seq as u128),
+            kind: ChangeKind::Upsert,
+            doc: Some(DocEnvelope {
+                doc_id: Uuid::from_u128(seq as u128),
+                owner_id: None,
+                author_id: None,
+                read_only: false,
+                source_doc_id: None,
+                derived_from: None,
+                title: None,
+                content: json!({}),
+                hash: "h".into(),
+                seq,
+            }),
+            client_id: None,
+            upload_id: None,
+        }
+    }
+
+    fn changes_req(fx: &[Effect], scope: &str) -> u64 {
+        sends(fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetChangesSince { scope: s, .. } if s == scope))
+            .map(|(req, _)| req)
+            .expect("changes request")
+    }
+
+    /// Connect with both scopes at a non-zero cursor and complete catch-up with empty pages.
+    fn live(c: &mut Core) {
+        connected(c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        for scope in ["own", "collection:curated"] {
+            let req = changes_req(&fx, scope);
+            c.step(Input::Reply {
+                req,
+                result: Ok(Response::Changes {
+                    changes: vec![],
+                    next_cursor: 5,
+                    has_more: false,
+                }),
+            });
+            c.step(Input::Applied {
+                scope: scope.into(),
+                tag: ApplyTag::Page(req),
+            });
+        }
+        assert_eq!(c.state().sync, SyncView::Live);
+    }
+
+    #[test]
+    fn cursors_start_catch_up_with_changes_since_and_sync_started() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 9),
+        ]));
+        assert_eq!(emitted(&fx), vec![Lifecycle::SyncStarted]);
+        let reqs = sends(&fx);
+        assert!(reqs.iter().any(|(_, r)| *r
+            == Request::GetChangesSince {
+                scope: "own".into(),
+                cursor: 5,
+                limit: 500
+            }));
+        assert!(reqs.iter().any(|(_, r)| *r
+            == Request::GetChangesSince {
+                scope: "collection:curated".into(),
+                cursor: 9,
+                limit: 500
+            }));
+    }
+
+    #[test]
+    fn zero_cursor_starts_snapshot() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![]));
+        assert!(sends(&fx).iter().any(|(_, r)| *r
+            == Request::GetSnapshot {
+                scope: "own".into(),
+                page_token: None
+            }));
+    }
+
+    #[test]
+    fn sync_completed_once_after_all_scopes_caught_up() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        let own = changes_req(&fx, "own");
+        let cur = changes_req(&fx, "collection:curated");
+        c.step(Input::Reply {
+            req: own,
+            result: Ok(Response::Changes {
+                changes: vec![],
+                next_cursor: 5,
+                has_more: false,
+            }),
+        });
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::Page(own),
+        });
+        assert!(emitted(&fx).is_empty());
+        c.step(Input::Reply {
+            req: cur,
+            result: Ok(Response::Changes {
+                changes: vec![],
+                next_cursor: 5,
+                has_more: false,
+            }),
+        });
+        let fx = c.step(Input::Applied {
+            scope: "collection:curated".into(),
+            tag: ApplyTag::Page(cur),
+        });
+        assert_eq!(emitted(&fx), vec![Lifecycle::SyncCompleted]);
+    }
+
+    #[test]
+    fn has_more_requests_next_page_from_next_cursor() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        let own = changes_req(&fx, "own");
+        let fx = c.step(Input::Reply {
+            req: own,
+            result: Ok(Response::Changes {
+                changes: vec![change("own", 6, 5)],
+                next_cursor: 6,
+                has_more: true,
+            }),
+        });
+        assert!(fx.iter().any(|e| matches!(e, Effect::ApplyChanges { new_cursor: 6, tag: ApplyTag::Page(r), .. } if *r == own)));
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::Page(own),
+        });
+        assert!(sends(&fx).iter().any(|(_, r)| *r
+            == Request::GetChangesSince {
+                scope: "own".into(),
+                cursor: 6,
+                limit: 500
+            }));
+    }
+
+    #[test]
+    fn cursor_too_old_switches_to_snapshot_then_catches_up_from_snapshot_seq() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        let own = changes_req(&fx, "own");
+        let fx = c.step(Input::Reply {
+            req: own,
+            result: Err(ServerError::new("cursor_too_old")),
+        });
+        let (snap_req, _) = sends(&fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetSnapshot { .. }))
+            .unwrap();
+        c.step(Input::Reply {
+            req: snap_req,
+            result: Ok(Response::SnapshotPage {
+                docs: vec![],
+                snapshot_seq: 40,
+                next_page_token: None,
+            }),
+        });
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::SnapshotPage(snap_req),
+        });
+        assert!(fx.contains(&Effect::FinishSnapshot {
+            scope: "own".into(),
+            seen: vec![],
+            snapshot_seq: 40
+        }));
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::SnapshotFinish,
+        });
+        assert!(sends(&fx).iter().any(|(_, r)| *r
+            == Request::GetChangesSince {
+                scope: "own".into(),
+                cursor: 40,
+                limit: 500
+            }));
+    }
+
+    #[test]
+    fn catch_up_failure_retries_then_drops_connection_after_three() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        let mut req = changes_req(&fx, "own");
+        for n in 1..=2u64 {
+            let fx = c.step(Input::Reply {
+                req,
+                result: Err(ServerError::new("internal")),
+            });
+            assert!(fx.contains(&Effect::Schedule {
+                timer: TimerId::CatchUpRetry("own".into()),
+                after: Duration::from_secs(1 << (n - 1))
+            }));
+            req = changes_req(
+                &c.step(Input::Timer(TimerId::CatchUpRetry("own".into()))),
+                "own",
+            );
+        }
+        let fx = c.step(Input::Reply {
+            req,
+            result: Err(ServerError::new("internal")),
+        });
+        assert_eq!(emitted(&fx), vec![Lifecycle::ConnectionLost]);
+    }
+
+    #[test]
+    fn live_push_applies_in_order_and_skips_seen() {
+        let mut c = core();
+        live(&mut c);
+        let fx = c.step(Input::Push(change("own", 6, 5)));
+        assert!(fx.iter().any(|e| matches!(
+            e,
+            Effect::ApplyChanges {
+                new_cursor: 6,
+                tag: ApplyTag::Push,
+                ..
+            }
+        )));
+        assert!(c
+            .step(Input::Push(change("own", 6, 5)))
+            .iter()
+            .all(|e| !matches!(e, Effect::ApplyChanges { .. })));
+    }
+
+    #[test]
+    fn push_with_prev_seq_below_cursor_applies() {
+        // After a snapshot the cursor is a global position; the next push's prev_seq is lower.
+        let mut c = core();
+        live(&mut c);
+        let fx = c.step(Input::Push(change("own", 9, 2)));
+        assert!(fx
+            .iter()
+            .any(|e| matches!(e, Effect::ApplyChanges { new_cursor: 9, .. })));
+    }
+
+    #[test]
+    fn push_gap_starts_catch_up_without_new_sync_events() {
+        let mut c = core();
+        live(&mut c);
+        let fx = c.step(Input::Push(change("own", 12, 11)));
+        assert!(sends(&fx).iter().any(|(_, r)| *r
+            == Request::GetChangesSince {
+                scope: "own".into(),
+                cursor: 5,
+                limit: 500
+            }));
+        assert!(emitted(&fx).is_empty());
+    }
+
+    #[test]
+    fn push_during_catch_up_is_buffered_and_applied() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        let own = changes_req(&fx, "own");
+        let fx = c.step(Input::Push(change("own", 8, 7)));
+        assert!(!fx.iter().any(|e| matches!(e, Effect::ApplyChanges { .. })));
+        c.step(Input::Reply {
+            req: own,
+            result: Ok(Response::Changes {
+                changes: vec![],
+                next_cursor: 7,
+                has_more: false,
+            }),
+        });
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::Page(own),
+        });
+        assert!(fx.iter().any(|e| matches!(
+            e,
+            Effect::ApplyChanges {
+                new_cursor: 8,
+                tag: ApplyTag::Push,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn late_push_applied_does_not_advance_catch_up() {
+        let mut c = core();
+        live(&mut c);
+        c.step(Input::Push(change("own", 6, 5)));
+        c.step(Input::Push(change("own", 12, 11))); // gap → catch-up requesting
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::Push,
+        });
+        assert!(sends(&fx).is_empty());
+    }
+
+    #[test]
+    fn reconnect_emits_new_sync_pair() {
+        let mut c = core();
+        live(&mut c);
+        c.step(Input::SocketClosed);
+        c.step(Input::Timer(TimerId::Reconnect));
+        let (req, _) = sends(&c.step(Input::SocketOpened)).pop().unwrap();
+        c.step(Input::Reply {
+            req,
+            result: Ok(Response::Joined),
+        });
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        assert_eq!(emitted(&fx), vec![Lifecycle::SyncStarted]);
     }
 }
