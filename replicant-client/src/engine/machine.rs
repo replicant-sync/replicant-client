@@ -314,11 +314,18 @@ struct Session {
     building: HashSet<Uuid>,
     backing_off: HashSet<Uuid>,
     fetching: HashSet<Uuid>,
+    settling: HashSet<Uuid>,
     doc_failures: HashMap<Uuid, u32>,
     mismatch_attempts: HashMap<Uuid, u32>,
     catch_up_failures: HashMap<Scope, u32>,
     pump_scheduled: bool,
     pump_deferred: bool,
+}
+
+impl Session {
+    fn slots_used(&self) -> usize {
+        self.in_flight.len() + self.building.len() + self.fetching.len() + self.settling.len()
+    }
 }
 
 #[derive(Debug)]
@@ -857,10 +864,15 @@ impl Core {
                 Ok(_) => self.fail_catch_up(&scope, None, fx),
             },
             Pending::Upload { doc_id } => {
+                if let Some(reason) = result.as_ref().err().and_then(Self::halt_reason_for) {
+                    self.catch_up_fatal(reason, fx);
+                    return;
+                }
                 let Some(s) = self.session() else { return };
                 let Some(inflight) = s.in_flight.remove(&doc_id) else {
                     return;
                 };
+                s.settling.insert(doc_id);
                 let mismatch_attempts = *s.mismatch_attempts.get(&doc_id).unwrap_or(&0);
                 let reply = match result {
                     Ok(Response::Uploaded(doc)) => Ok(doc),
@@ -876,9 +888,11 @@ impl Core {
                 self.refill(fx);
             }
             Pending::Document { doc_id } => {
-                if let Some(s) = self.session() {
-                    s.fetching.remove(&doc_id);
+                if let Some(reason) = result.as_ref().err().and_then(Self::halt_reason_for) {
+                    self.catch_up_fatal(reason, fx);
+                    return;
                 }
+                // The doc stays in `fetching` until `ServerCopyApplied` unless we back off.
                 match result {
                     Ok(Response::Document(doc)) => fx.push(Effect::ApplyServerCopy {
                         doc_id,
@@ -891,7 +905,13 @@ impl Core {
                     Err(e) if e.code == "not_found" => {
                         fx.push(Effect::ApplyServerCopy { doc_id, doc: None })
                     }
-                    _ => self.back_off_doc(doc_id, None, fx),
+                    other => {
+                        if let Some(s) = self.session() {
+                            s.fetching.remove(&doc_id);
+                        }
+                        let after_ms = other.err().and_then(|e| e.retry_after_ms);
+                        self.back_off_doc(doc_id, after_ms, fx);
+                    }
                 }
                 self.refill(fx);
             }
@@ -1061,11 +1081,12 @@ impl Core {
         let busy = s.in_flight.contains_key(&doc_id)
             || s.building.contains(&doc_id)
             || s.backing_off.contains(&doc_id)
-            || s.fetching.contains(&doc_id);
+            || s.fetching.contains(&doc_id)
+            || s.settling.contains(&doc_id);
         if busy {
             return;
         }
-        if s.in_flight.len() + s.building.len() + s.fetching.len() >= MAX_IN_FLIGHT {
+        if s.slots_used() >= MAX_IN_FLIGHT {
             s.pump_deferred = true;
             return;
         }
@@ -1077,9 +1098,7 @@ impl Core {
     /// being at capacity.
     fn refill(&mut self, fx: &mut Vec<Effect>) {
         let Some(s) = self.session() else { return };
-        if s.pump_deferred
-            && s.in_flight.len() + s.building.len() + s.fetching.len() < MAX_IN_FLIGHT
-        {
+        if s.pump_deferred && s.slots_used() < MAX_IN_FLIGHT {
             s.pump_deferred = false;
             fx.push(Effect::LoadPending);
         }
@@ -1097,6 +1116,13 @@ impl Core {
             timer: TimerId::DocRetry(doc_id),
             after: delay,
         });
+    }
+
+    fn forget_failures(&mut self, doc_id: Uuid) {
+        if let Some(s) = self.session() {
+            s.mismatch_attempts.remove(&doc_id);
+            s.doc_failures.remove(&doc_id);
+        }
     }
 
     fn send_get_document(&mut self, doc_id: Uuid, fx: &mut Vec<Effect>) {
@@ -1143,21 +1169,23 @@ impl Core {
                         });
                     }
                     BuildOutcome::NeedsServerCopy => self.send_get_document(doc_id, fx),
-                    BuildOutcome::SettledLocally { rows_remain: true } => {
-                        self.try_build(doc_id, fx)
+                    BuildOutcome::SettledLocally { rows_remain } => {
+                        self.forget_failures(doc_id);
+                        if rows_remain {
+                            self.try_build(doc_id, fx);
+                        }
                     }
-                    BuildOutcome::SettledLocally { rows_remain: false } | BuildOutcome::Nothing => {
-                    }
+                    BuildOutcome::Nothing => self.forget_failures(doc_id),
                 }
                 self.refill(fx);
             }
             Input::Settled { doc_id, outcome } => {
+                if let Some(s) = self.session() {
+                    s.settling.remove(&doc_id);
+                }
                 match outcome {
                     SettleOutcome::Done { rows_remain } => {
-                        if let Some(s) = self.session() {
-                            s.mismatch_attempts.remove(&doc_id);
-                            s.doc_failures.remove(&doc_id);
-                        }
+                        self.forget_failures(doc_id);
                         if rows_remain {
                             self.try_build(doc_id, fx);
                         }
@@ -1188,6 +1216,9 @@ impl Core {
                 self.refill(fx);
             }
             Input::ServerCopyApplied { doc_id } => {
+                if let Some(s) = self.session() {
+                    s.fetching.remove(&doc_id);
+                }
                 self.try_build(doc_id, fx);
                 self.refill(fx);
             }
@@ -2538,6 +2569,202 @@ mod upload_orchestration_tests {
         }));
         let fx = c.step(Input::Timer(TimerId::Request(req)));
         assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::DocRetry(doc(1)),
+            after: Duration::from_secs(1)
+        }));
+    }
+
+    fn builds(fx: &[Effect]) -> bool {
+        fx.iter().any(|e| matches!(e, Effect::BuildUpload { .. }))
+    }
+
+    #[test]
+    fn doc_is_not_rebuilt_between_upload_reply_and_settled() {
+        let mut c = core();
+        connected(&mut c);
+        c.step(Input::PendingDocs(vec![doc(1)]));
+        let req = upload_req(&c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: prepared(doc(1)),
+        }));
+        c.step(Input::Reply {
+            req,
+            result: Ok(Response::Uploaded(envelope(doc(1), 9))),
+        });
+        assert!(!builds(&c.step(Input::PendingDocs(vec![doc(1)]))));
+        c.step(Input::Settled {
+            doc_id: doc(1),
+            outcome: SettleOutcome::Done { rows_remain: false },
+        });
+        assert!(builds(&c.step(Input::PendingDocs(vec![doc(1)]))));
+    }
+
+    #[test]
+    fn settling_docs_count_toward_in_flight_limit() {
+        let mut c = core();
+        connected(&mut c);
+        c.step(Input::PendingDocs((0..8).map(doc).collect()));
+        for n in 0..8 {
+            let req = upload_req(&c.step(Input::UploadBuilt {
+                doc_id: doc(n),
+                outcome: prepared(doc(n)),
+            }));
+            c.step(Input::Reply {
+                req,
+                result: Ok(Response::Uploaded(envelope(doc(n), 9))),
+            });
+        }
+        assert!(!builds(&c.step(Input::PendingDocs(vec![doc(9)]))));
+        let fx = c.step(Input::Settled {
+            doc_id: doc(0),
+            outcome: SettleOutcome::Done { rows_remain: false },
+        });
+        assert!(fx.contains(&Effect::LoadPending));
+    }
+
+    #[test]
+    fn doc_is_not_rebuilt_between_document_reply_and_server_copy_applied() {
+        let mut c = core();
+        connected(&mut c);
+        c.step(Input::PendingDocs(vec![doc(1)]));
+        let (req, _) = sends(&c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: BuildOutcome::NeedsServerCopy,
+        }))
+        .pop()
+        .unwrap();
+        c.step(Input::Reply {
+            req,
+            result: Ok(Response::Document(envelope(doc(1), 3))),
+        });
+        assert!(!builds(&c.step(Input::PendingDocs(vec![doc(1)]))));
+        assert!(builds(&c.step(Input::ServerCopyApplied { doc_id: doc(1) })));
+    }
+
+    #[test]
+    fn fatal_upload_reply_halts() {
+        let mut c = core();
+        connected(&mut c);
+        c.step(Input::PendingDocs(vec![doc(1)]));
+        let req = upload_req(&c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: prepared(doc(1)),
+        }));
+        let fx = c.step(Input::Reply {
+            req,
+            result: Err(ServerError {
+                is_fatal: true,
+                ..ServerError::new("auth_invalid")
+            }),
+        });
+        assert!(emitted(&fx).contains(&Lifecycle::ConnectionLost));
+        assert!(!fx.iter().any(|e| matches!(e, Effect::SettleUpload { .. })));
+        assert_eq!(
+            c.state().connection,
+            ConnectionView::Halted(HaltReason::AuthInvalid)
+        );
+    }
+
+    #[test]
+    fn fatal_get_document_reply_halts() {
+        let mut c = core();
+        connected(&mut c);
+        c.step(Input::PendingDocs(vec![doc(1)]));
+        let (req, _) = sends(&c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: BuildOutcome::NeedsServerCopy,
+        }))
+        .pop()
+        .unwrap();
+        let fx = c.step(Input::Reply {
+            req,
+            result: Err(ServerError {
+                is_fatal: true,
+                ..ServerError::new("update_required")
+            }),
+        });
+        assert!(emitted(&fx).contains(&Lifecycle::ConnectionLost));
+        assert_eq!(
+            c.state().connection,
+            ConnectionView::Halted(HaltReason::UpdateRequired)
+        );
+    }
+
+    #[test]
+    fn get_document_honours_retry_after() {
+        let mut c = core();
+        connected(&mut c);
+        c.step(Input::PendingDocs(vec![doc(1)]));
+        let (req, _) = sends(&c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: BuildOutcome::NeedsServerCopy,
+        }))
+        .pop()
+        .unwrap();
+        let fx = c.step(Input::Reply {
+            req,
+            result: Err(ServerError {
+                retry_after_ms: Some(9000),
+                ..ServerError::new("rate_limited")
+            }),
+        });
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::DocRetry(doc(1)),
+            after: Duration::from_secs(9)
+        }));
+    }
+
+    #[test]
+    fn local_settle_resets_mismatch_attempts() {
+        let mut c = core();
+        connected(&mut c);
+        c.step(Input::Settled {
+            doc_id: doc(1),
+            outcome: SettleOutcome::Retry {
+                after_ms: None,
+                mismatch: true,
+            },
+        });
+        c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: BuildOutcome::SettledLocally { rows_remain: false },
+        });
+        c.step(Input::PendingDocs(vec![doc(1)]));
+        let req = upload_req(&c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: prepared(doc(1)),
+        }));
+        let fx = c.step(Input::Reply {
+            req,
+            result: Err(ServerError::new("hash_mismatch")),
+        });
+        assert!(fx.iter().any(|e| matches!(
+            e,
+            Effect::SettleUpload {
+                mismatch_attempts: 0,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn nothing_to_upload_resets_doc_failures() {
+        let mut c = core();
+        connected(&mut c);
+        let retry = || Input::Settled {
+            doc_id: doc(1),
+            outcome: SettleOutcome::Retry {
+                after_ms: None,
+                mismatch: false,
+            },
+        };
+        c.step(retry());
+        c.step(Input::Timer(TimerId::DocRetry(doc(1))));
+        c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: BuildOutcome::Nothing,
+        });
+        assert!(c.step(retry()).contains(&Effect::Schedule {
             timer: TimerId::DocRetry(doc(1)),
             after: Duration::from_secs(1)
         }));
