@@ -313,10 +313,12 @@ struct Session {
     in_flight: HashMap<Uuid, InFlight>,
     building: HashSet<Uuid>,
     backing_off: HashSet<Uuid>,
+    fetching: HashSet<Uuid>,
     doc_failures: HashMap<Uuid, u32>,
     mismatch_attempts: HashMap<Uuid, u32>,
     catch_up_failures: HashMap<Scope, u32>,
     pump_scheduled: bool,
+    pump_deferred: bool,
 }
 
 #[derive(Debug)]
@@ -871,21 +873,28 @@ impl Core {
                     reply,
                     mismatch_attempts,
                 });
+                self.refill(fx);
             }
-            Pending::Document { doc_id } => match result {
-                Ok(Response::Document(doc)) => fx.push(Effect::ApplyServerCopy {
-                    doc_id,
-                    doc: Some(doc),
-                }),
-                Err(e) if e.code == "deleted" => fx.push(Effect::ApplyServerDeleted {
-                    doc_id,
-                    seq: e.current_seq.unwrap_or(0),
-                }),
-                Err(e) if e.code == "not_found" => {
-                    fx.push(Effect::ApplyServerCopy { doc_id, doc: None })
+            Pending::Document { doc_id } => {
+                if let Some(s) = self.session() {
+                    s.fetching.remove(&doc_id);
                 }
-                _ => self.back_off_doc(doc_id, None, fx),
-            },
+                match result {
+                    Ok(Response::Document(doc)) => fx.push(Effect::ApplyServerCopy {
+                        doc_id,
+                        doc: Some(doc),
+                    }),
+                    Err(e) if e.code == "deleted" => fx.push(Effect::ApplyServerDeleted {
+                        doc_id,
+                        seq: e.current_seq.unwrap_or(0),
+                    }),
+                    Err(e) if e.code == "not_found" => {
+                        fx.push(Effect::ApplyServerCopy { doc_id, doc: None })
+                    }
+                    _ => self.back_off_doc(doc_id, None, fx),
+                }
+                self.refill(fx);
+            }
             Pending::Heartbeat => {}
         }
     }
@@ -1051,12 +1060,29 @@ impl Core {
         let Some(s) = self.session() else { return };
         let busy = s.in_flight.contains_key(&doc_id)
             || s.building.contains(&doc_id)
-            || s.backing_off.contains(&doc_id);
-        if busy || s.in_flight.len() + s.building.len() >= MAX_IN_FLIGHT {
+            || s.backing_off.contains(&doc_id)
+            || s.fetching.contains(&doc_id);
+        if busy {
+            return;
+        }
+        if s.in_flight.len() + s.building.len() + s.fetching.len() >= MAX_IN_FLIGHT {
+            s.pump_deferred = true;
             return;
         }
         s.building.insert(doc_id);
         fx.push(Effect::BuildUpload { doc_id });
+    }
+
+    /// Reissues `LoadPending` once a slot frees after `try_build` refused a doc purely for
+    /// being at capacity.
+    fn refill(&mut self, fx: &mut Vec<Effect>) {
+        let Some(s) = self.session() else { return };
+        if s.pump_deferred
+            && s.in_flight.len() + s.building.len() + s.fetching.len() < MAX_IN_FLIGHT
+        {
+            s.pump_deferred = false;
+            fx.push(Effect::LoadPending);
+        }
     }
 
     fn back_off_doc(&mut self, doc_id: Uuid, after_ms: Option<u64>, fx: &mut Vec<Effect>) {
@@ -1076,6 +1102,7 @@ impl Core {
     fn send_get_document(&mut self, doc_id: Uuid, fx: &mut Vec<Effect>) {
         let req = self.alloc_req();
         let Some(s) = self.session() else { return };
+        s.fetching.insert(doc_id);
         s.requests.insert(req, Pending::Document { doc_id });
         fx.push(Effect::Send {
             req,
@@ -1096,8 +1123,9 @@ impl Core {
                 }
             }
             Input::UploadBuilt { doc_id, outcome } => {
-                if let Some(s) = self.session() {
-                    s.building.remove(&doc_id);
+                let was_building = self.session().is_some_and(|s| s.building.remove(&doc_id));
+                if !was_building {
+                    return;
                 }
                 match outcome {
                     BuildOutcome::Send { upload, inflight } => {
@@ -1121,41 +1149,48 @@ impl Core {
                     BuildOutcome::SettledLocally { rows_remain: false } | BuildOutcome::Nothing => {
                     }
                 }
+                self.refill(fx);
             }
-            Input::Settled { doc_id, outcome } => match outcome {
-                SettleOutcome::Done { rows_remain } => {
-                    if let Some(s) = self.session() {
-                        s.mismatch_attempts.remove(&doc_id);
-                        s.doc_failures.remove(&doc_id);
+            Input::Settled { doc_id, outcome } => {
+                match outcome {
+                    SettleOutcome::Done { rows_remain } => {
+                        if let Some(s) = self.session() {
+                            s.mismatch_attempts.remove(&doc_id);
+                            s.doc_failures.remove(&doc_id);
+                        }
+                        if rows_remain {
+                            self.try_build(doc_id, fx);
+                        }
                     }
-                    if rows_remain {
-                        self.try_build(doc_id, fx);
+                    SettleOutcome::FetchServerCopy => {
+                        if let Some(s) = self.session() {
+                            *s.mismatch_attempts.entry(doc_id).or_insert(0) += 1;
+                        }
+                        self.send_get_document(doc_id, fx);
                     }
+                    SettleOutcome::Retry {
+                        after_ms,
+                        mismatch: true,
+                    } => {
+                        if let Some(s) = self.session() {
+                            *s.mismatch_attempts.entry(doc_id).or_insert(0) += 1;
+                        }
+                        match after_ms {
+                            Some(ms) => self.back_off_doc(doc_id, Some(ms), fx),
+                            None => self.try_build(doc_id, fx),
+                        }
+                    }
+                    SettleOutcome::Retry {
+                        after_ms,
+                        mismatch: false,
+                    } => self.back_off_doc(doc_id, after_ms, fx),
                 }
-                SettleOutcome::FetchServerCopy => {
-                    if let Some(s) = self.session() {
-                        *s.mismatch_attempts.entry(doc_id).or_insert(0) += 1;
-                    }
-                    self.send_get_document(doc_id, fx);
-                }
-                SettleOutcome::Retry {
-                    after_ms,
-                    mismatch: true,
-                } => {
-                    if let Some(s) = self.session() {
-                        *s.mismatch_attempts.entry(doc_id).or_insert(0) += 1;
-                    }
-                    match after_ms {
-                        Some(ms) => self.back_off_doc(doc_id, Some(ms), fx),
-                        None => self.try_build(doc_id, fx),
-                    }
-                }
-                SettleOutcome::Retry {
-                    after_ms,
-                    mismatch: false,
-                } => self.back_off_doc(doc_id, after_ms, fx),
-            },
-            Input::ServerCopyApplied { doc_id } => self.try_build(doc_id, fx),
+                self.refill(fx);
+            }
+            Input::ServerCopyApplied { doc_id } => {
+                self.try_build(doc_id, fx);
+                self.refill(fx);
+            }
             _ => {}
         }
     }
@@ -1195,9 +1230,15 @@ impl Core {
                 }
                 self.back_off_doc(doc_id, None, fx);
             }
-            Pending::Document { doc_id } => self.back_off_doc(doc_id, None, fx),
+            Pending::Document { doc_id } => {
+                if let Some(s) = self.session() {
+                    s.fetching.remove(&doc_id);
+                }
+                self.back_off_doc(doc_id, None, fx);
+            }
             _ => {}
         }
+        self.refill(fx);
     }
 }
 
@@ -2268,6 +2309,54 @@ mod upload_orchestration_tests {
     }
 
     #[test]
+    fn refused_docs_are_refilled_when_a_slot_frees() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::PendingDocs((0..12).map(doc).collect()));
+        let builds = fx
+            .iter()
+            .filter(|e| matches!(e, Effect::BuildUpload { .. }))
+            .count();
+        assert_eq!(builds, MAX_IN_FLIGHT);
+        let fx = c.step(Input::UploadBuilt {
+            doc_id: doc(0),
+            outcome: BuildOutcome::Nothing,
+        });
+        assert!(fx.contains(&Effect::LoadPending));
+    }
+
+    #[test]
+    fn doc_is_not_rebuilt_while_fetching_server_copy() {
+        let mut c = core();
+        connected(&mut c);
+        c.step(Input::PendingDocs(vec![doc(1)]));
+        let fx = c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: BuildOutcome::NeedsServerCopy,
+        });
+        let (req, _) = sends(&fx).pop().unwrap();
+        let fx = c.step(Input::PendingDocs(vec![doc(1)]));
+        assert!(!fx.iter().any(|e| matches!(e, Effect::BuildUpload { .. })));
+        c.step(Input::Reply {
+            req,
+            result: Ok(Response::Document(envelope(doc(1), 3))),
+        });
+        let fx = c.step(Input::ServerCopyApplied { doc_id: doc(1) });
+        assert!(fx.contains(&Effect::BuildUpload { doc_id: doc(1) }));
+    }
+
+    #[test]
+    fn stale_upload_built_is_ignored() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: prepared(doc(1)),
+        });
+        assert!(sends(&fx).is_empty());
+    }
+
+    #[test]
     fn settled_with_rows_remaining_builds_again() {
         let mut c = core();
         connected(&mut c);
@@ -2356,10 +2445,16 @@ mod upload_orchestration_tests {
                 mismatch: true,
             },
         });
-        c.step(Input::Settled {
+        let fx = c.step(Input::Settled {
             doc_id: doc(1),
             outcome: SettleOutcome::FetchServerCopy,
         });
+        let (get_req, _) = sends(&fx).pop().unwrap();
+        c.step(Input::Reply {
+            req: get_req,
+            result: Ok(Response::Document(envelope(doc(1), 3))),
+        });
+        c.step(Input::ServerCopyApplied { doc_id: doc(1) });
         c.step(Input::PendingDocs(vec![doc(1)]));
         let req = upload_req(&c.step(Input::UploadBuilt {
             doc_id: doc(1),
