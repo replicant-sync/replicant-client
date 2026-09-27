@@ -149,8 +149,13 @@ pub enum Input {
     },
     OutboxChanged,
     Shutdown,
-    SocketOpened,
-    SocketClosed,
+    /// `gen` echoes the `OpenSocket` it answers; events from older sockets are ignored.
+    SocketOpened {
+        gen: u64,
+    },
+    SocketClosed {
+        gen: u64,
+    },
     Reply {
         req: u64,
         result: Result<Response, ServerError>,
@@ -193,8 +198,12 @@ pub enum Lifecycle {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
-    OpenSocket,
-    CloseSocket,
+    OpenSocket {
+        gen: u64,
+    },
+    CloseSocket {
+        gen: u64,
+    },
     /// Answered with `Input::CredentialsChanged`.
     CheckCredentials,
     Send {
@@ -345,6 +354,7 @@ pub struct Core {
     attempt: u32,
     jitter: Jitter,
     next_req: u64,
+    socket_gen: u64,
 }
 
 impl Core {
@@ -356,6 +366,7 @@ impl Core {
             attempt: 0,
             jitter: Jitter::new(seed),
             next_req: 1,
+            socket_gen: 0,
         }
     }
 
@@ -405,7 +416,7 @@ impl Core {
         }
         match input {
             Input::Shutdown => {
-                fx.push(Effect::CloseSocket);
+                self.close_socket(fx);
                 self.conn = Conn::Stopped;
             }
             Input::Start { has_credentials } => {
@@ -442,7 +453,9 @@ impl Core {
                     }
                 }
             }
-            Input::SocketOpened => {
+            Input::SocketOpened { gen } | Input::SocketClosed { gen } if gen != self.socket_gen => {
+            }
+            Input::SocketOpened { .. } => {
                 if let Conn::Connecting { join_req: None } = self.conn {
                     let req = self.alloc_req();
                     self.conn = Conn::Connecting {
@@ -454,7 +467,7 @@ impl Core {
                     });
                 }
             }
-            Input::SocketClosed => match self.conn {
+            Input::SocketClosed { .. } => match self.conn {
                 Conn::Connecting { .. } => self.fail_connect(None, fx),
                 Conn::Connected(_) => self.lose_connection(fx),
                 _ => {}
@@ -468,11 +481,20 @@ impl Core {
 
     fn connect_now(&mut self, fx: &mut Vec<Effect>) {
         self.conn = Conn::Connecting { join_req: None };
+        self.socket_gen += 1;
         fx.push(Effect::Emit(Lifecycle::ConnectionAttempted));
-        fx.push(Effect::OpenSocket);
+        fx.push(Effect::OpenSocket {
+            gen: self.socket_gen,
+        });
         fx.push(Effect::Schedule {
             timer: TimerId::ConnectTimeout,
             after: CONNECT_TIMEOUT,
+        });
+    }
+
+    fn close_socket(&self, fx: &mut Vec<Effect>) {
+        fx.push(Effect::CloseSocket {
+            gen: self.socket_gen,
         });
     }
 
@@ -492,7 +514,7 @@ impl Core {
 
     fn lose_connection(&mut self, fx: &mut Vec<Effect>) {
         fx.push(Effect::Emit(Lifecycle::ConnectionLost));
-        fx.push(Effect::CloseSocket);
+        self.close_socket(fx);
         fx.push(Effect::Cancel(TimerId::Heartbeat));
         fx.push(Effect::Cancel(TimerId::StableReset));
         let delay = connect_delay(self.attempt, self.jitter.next_unit());
@@ -563,11 +585,11 @@ impl Core {
                     Err(e) => match Self::halt_reason_for(&e) {
                         Some(reason) => {
                             fx.push(Effect::Cancel(TimerId::ConnectTimeout));
-                            fx.push(Effect::CloseSocket);
+                            self.close_socket(fx);
                             self.halt(reason, fx);
                         }
                         None => {
-                            fx.push(Effect::CloseSocket);
+                            self.close_socket(fx);
                             self.fail_connect(e.retry_after_ms, fx);
                         }
                     },
@@ -591,7 +613,7 @@ impl Core {
         match (&mut self.conn, timer) {
             (Conn::Disconnected, TimerId::Reconnect) => self.connect_now(fx),
             (Conn::Connecting { .. }, TimerId::ConnectTimeout) => {
-                fx.push(Effect::CloseSocket);
+                self.close_socket(fx);
                 self.fail_connect(None, fx);
             }
             (Conn::Halted(_), TimerId::HaltRetry) => fx.push(Effect::CheckCredentials),
@@ -763,7 +785,7 @@ impl Core {
     /// instead of scheduling a reconnect.
     fn catch_up_fatal(&mut self, reason: HaltReason, fx: &mut Vec<Effect>) {
         fx.push(Effect::Emit(Lifecycle::ConnectionLost));
-        fx.push(Effect::CloseSocket);
+        self.close_socket(fx);
         fx.push(Effect::Cancel(TimerId::Heartbeat));
         fx.push(Effect::Cancel(TimerId::StableReset));
         self.halt(reason, fx);
@@ -1283,6 +1305,23 @@ pub(crate) mod harness {
         Core::new(ME, vec!["own".into(), "collection:curated".into()], 7)
     }
 
+    /// The driver's answer for the socket the core most recently opened.
+    pub fn opened(c: &Core) -> Input {
+        Input::SocketOpened { gen: c.socket_gen }
+    }
+
+    pub fn closed(c: &Core) -> Input {
+        Input::SocketClosed { gen: c.socket_gen }
+    }
+
+    pub fn opens(fx: &[Effect]) -> bool {
+        fx.iter().any(|e| matches!(e, Effect::OpenSocket { .. }))
+    }
+
+    pub fn closes(fx: &[Effect]) -> bool {
+        fx.iter().any(|e| matches!(e, Effect::CloseSocket { .. }))
+    }
+
     pub fn sends(fx: &[Effect]) -> Vec<(u64, Request)> {
         fx.iter()
             .filter_map(|e| match e {
@@ -1323,7 +1362,7 @@ mod skeleton_tests {
     fn inputs_before_start_are_ignored() {
         let mut c = core();
         assert!(c.step(Input::OutboxChanged).is_empty());
-        assert!(c.step(Input::SocketClosed).is_empty());
+        assert!(c.step(closed(&c)).is_empty());
     }
 }
 
@@ -1333,13 +1372,31 @@ mod connection_tests {
     use super::*;
 
     fn open_and_join(c: &mut Core) -> Vec<Effect> {
-        let fx = c.step(Input::SocketOpened);
+        let fx = c.step(opened(&c));
         let (req, request) = sends(&fx).pop().expect("join sent");
         assert_eq!(request, Request::Join);
         c.step(Input::Reply {
             req,
             result: Ok(Response::Joined),
         })
+    }
+
+    #[test]
+    fn stale_socket_closed_is_ignored() {
+        let mut c = core();
+        let fx = c.step(Input::Start {
+            has_credentials: true,
+        });
+        assert!(fx.contains(&Effect::OpenSocket { gen: 1 }));
+        let fx = c.step(Input::Timer(TimerId::ConnectTimeout));
+        assert!(fx.contains(&Effect::CloseSocket { gen: 1 }));
+        let fx = c.step(Input::Timer(TimerId::Reconnect));
+        assert!(fx.contains(&Effect::OpenSocket { gen: 2 }));
+        assert!(c.step(Input::SocketClosed { gen: 1 }).is_empty());
+        assert!(c.step(Input::SocketOpened { gen: 1 }).is_empty());
+        assert_eq!(c.state().connection, ConnectionView::Connecting);
+        let fx = c.step(Input::SocketOpened { gen: 2 });
+        assert_eq!(sends(&fx).pop().map(|(_, r)| r), Some(Request::Join));
     }
 
     #[test]
@@ -1367,7 +1424,7 @@ mod connection_tests {
         let fx = c.step(Input::Start {
             has_credentials: true,
         });
-        assert!(fx.contains(&Effect::OpenSocket));
+        assert!(opens(&fx));
         assert_eq!(emitted(&fx), vec![Lifecycle::ConnectionAttempted]);
         assert_eq!(c.state().connection, ConnectionView::Connecting);
     }
@@ -1397,7 +1454,7 @@ mod connection_tests {
         c.step(Input::Start {
             has_credentials: true,
         });
-        let fx = c.step(Input::SocketOpened);
+        let fx = c.step(opened(&c));
         let (req, _) = sends(&fx).pop().unwrap();
         let fx = c.step(Input::Reply {
             req,
@@ -1406,7 +1463,7 @@ mod connection_tests {
         assert_eq!(c.state().connection, ConnectionView::Disconnected);
         assert!(fx.iter().any(|e| matches!(e, Effect::Schedule { timer: TimerId::Reconnect, after } if *after < Duration::from_secs(1))));
         let fx = c.step(Input::Timer(TimerId::Reconnect));
-        assert!(fx.contains(&Effect::OpenSocket));
+        assert!(opens(&fx));
     }
 
     #[test]
@@ -1415,7 +1472,7 @@ mod connection_tests {
         c.step(Input::Start {
             has_credentials: true,
         });
-        let (req, _) = sends(&c.step(Input::SocketOpened)).pop().unwrap();
+        let (req, _) = sends(&c.step(opened(&c))).pop().unwrap();
         let err = ServerError {
             retry_after_ms: Some(12_000),
             ..ServerError::new("rate_limited")
@@ -1436,7 +1493,7 @@ mod connection_tests {
         c.step(Input::Start {
             has_credentials: true,
         });
-        let (req, _) = sends(&c.step(Input::SocketOpened)).pop().unwrap();
+        let (req, _) = sends(&c.step(opened(&c))).pop().unwrap();
         let err = ServerError {
             is_fatal: true,
             ..ServerError::new("update_required")
@@ -1456,7 +1513,7 @@ mod connection_tests {
                 ..
             }
         )));
-        assert!(fx.contains(&Effect::CloseSocket));
+        assert!(closes(&fx));
     }
 
     #[test]
@@ -1465,7 +1522,7 @@ mod connection_tests {
         c.step(Input::Start {
             has_credentials: true,
         });
-        let (req, _) = sends(&c.step(Input::SocketOpened)).pop().unwrap();
+        let (req, _) = sends(&c.step(opened(&c))).pop().unwrap();
         c.step(Input::Reply {
             req,
             result: Err(ServerError {
@@ -1478,7 +1535,7 @@ mod connection_tests {
         let fx = c.step(Input::CredentialsChanged {
             has_credentials: true,
         });
-        assert!(fx.contains(&Effect::OpenSocket));
+        assert!(opens(&fx));
     }
 
     #[test]
@@ -1487,7 +1544,7 @@ mod connection_tests {
         c.step(Input::Start {
             has_credentials: true,
         });
-        let (req, _) = sends(&c.step(Input::SocketOpened)).pop().unwrap();
+        let (req, _) = sends(&c.step(opened(&c))).pop().unwrap();
         c.step(Input::Reply {
             req,
             result: Err(ServerError {
@@ -1508,7 +1565,7 @@ mod connection_tests {
             has_credentials: true,
         });
         let fx = c.step(Input::Timer(TimerId::ConnectTimeout));
-        assert!(fx.contains(&Effect::CloseSocket));
+        assert!(closes(&fx));
         assert_eq!(c.state().connection, ConnectionView::Disconnected);
     }
 
@@ -1519,9 +1576,9 @@ mod connection_tests {
             has_credentials: true,
         });
         open_and_join(&mut c);
-        let fx = c.step(Input::SocketClosed);
+        let fx = c.step(closed(&c));
         assert_eq!(emitted(&fx), vec![Lifecycle::ConnectionLost]);
-        assert!(emitted(&c.step(Input::SocketClosed)).is_empty());
+        assert!(emitted(&c.step(closed(&c))).is_empty());
     }
 
     #[test]
@@ -1565,7 +1622,7 @@ mod connection_tests {
         let (old_req, _) = sends(&c.step(Input::Timer(TimerId::Heartbeat)))
             .pop()
             .unwrap();
-        c.step(Input::SocketClosed);
+        c.step(closed(&c));
         c.step(Input::Reconnect);
         open_and_join(&mut c);
         let fx = c.step(Input::Timer(TimerId::HeartbeatTimeout(old_req)));
@@ -1579,9 +1636,9 @@ mod connection_tests {
         c.step(Input::Start {
             has_credentials: true,
         });
-        assert!(!c.step(Input::Reconnect).contains(&Effect::OpenSocket));
+        assert!(!opens(&c.step(Input::Reconnect)));
         open_and_join(&mut c);
-        assert!(!c.step(Input::Reconnect).contains(&Effect::OpenSocket));
+        assert!(!opens(&c.step(Input::Reconnect)));
     }
 
     #[test]
@@ -1596,7 +1653,7 @@ mod connection_tests {
         }
         open_and_join(&mut c);
         c.step(Input::Timer(TimerId::StableReset));
-        let fx = c.step(Input::SocketClosed);
+        let fx = c.step(closed(&c));
         assert!(fx.iter().any(|e| matches!(e, Effect::Schedule { timer: TimerId::Reconnect, after } if *after < Duration::from_secs(1))));
     }
 
@@ -1610,7 +1667,7 @@ mod connection_tests {
             c.step(Input::Timer(TimerId::ConnectTimeout));
             c.step(Input::Timer(TimerId::Reconnect));
         }
-        let (req, _) = sends(&c.step(Input::SocketOpened)).pop().unwrap();
+        let (req, _) = sends(&c.step(opened(&c))).pop().unwrap();
         c.step(Input::Reply {
             req,
             result: Err(ServerError {
@@ -1635,7 +1692,7 @@ mod connection_tests {
         });
         open_and_join(&mut c);
         let fx = c.step(Input::Shutdown);
-        assert!(fx.contains(&Effect::CloseSocket));
+        assert!(closes(&fx));
         assert_eq!(c.state().connection, ConnectionView::Stopped);
         assert!(c.step(Input::Reconnect).is_empty());
         assert!(c.step(Input::Timer(TimerId::Heartbeat)).is_empty());
@@ -1665,7 +1722,7 @@ mod catch_up_tests {
         c.step(Input::Start {
             has_credentials: true,
         });
-        let (req, _) = sends(&c.step(Input::SocketOpened)).pop().unwrap();
+        let (req, _) = sends(&c.step(opened(&c))).pop().unwrap();
         c.step(Input::Reply {
             req,
             result: Ok(Response::Joined),
@@ -2003,9 +2060,9 @@ mod catch_up_tests {
     fn reconnect_emits_new_sync_pair() {
         let mut c = core();
         live(&mut c);
-        c.step(Input::SocketClosed);
+        c.step(closed(&c));
         c.step(Input::Timer(TimerId::Reconnect));
-        let (req, _) = sends(&c.step(Input::SocketOpened)).pop().unwrap();
+        let (req, _) = sends(&c.step(opened(&c))).pop().unwrap();
         c.step(Input::Reply {
             req,
             result: Ok(Response::Joined),
@@ -2209,7 +2266,7 @@ mod upload_orchestration_tests {
         c.step(Input::Start {
             has_credentials: true,
         });
-        let (req, _) = sends(&c.step(Input::SocketOpened)).pop().unwrap();
+        let (req, _) = sends(&c.step(opened(&c))).pop().unwrap();
         c.step(Input::Reply {
             req,
             result: Ok(Response::Joined),
@@ -2779,7 +2836,7 @@ mod upload_orchestration_tests {
             doc_id: doc(1),
             outcome: prepared(doc(1)),
         }));
-        c.step(Input::SocketClosed);
+        c.step(closed(&c));
         assert!(c
             .step(Input::Reply {
                 req,
@@ -2788,7 +2845,7 @@ mod upload_orchestration_tests {
             .iter()
             .all(|e| !matches!(e, Effect::SettleUpload { .. })));
         c.step(Input::Timer(TimerId::Reconnect));
-        let (jreq, _) = sends(&c.step(Input::SocketOpened)).pop().unwrap();
+        let (jreq, _) = sends(&c.step(opened(&c))).pop().unwrap();
         c.step(Input::Reply {
             req: jreq,
             result: Ok(Response::Joined),

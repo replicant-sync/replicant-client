@@ -8,7 +8,8 @@ fn pick<T: Clone>(rng: &mut Jitter, items: &[T]) -> T {
 }
 
 /// Generates a plausible next input, answering outstanding requests with random outcomes.
-fn next_input(rng: &mut Jitter, outstanding: &mut Vec<(u64, Request)>) -> Input {
+/// `socket_gen` is the generation of the last `OpenSocket`; closes are sometimes stale.
+fn next_input(rng: &mut Jitter, outstanding: &mut Vec<(u64, Request)>, socket_gen: u64) -> Input {
     let roll = rng.next_unit();
     if roll < 0.45 && !outstanding.is_empty() {
         let i = (rng.next_unit() * outstanding.len() as f64) as usize;
@@ -53,11 +54,16 @@ fn next_input(rng: &mut Jitter, outstanding: &mut Vec<(u64, Request)>) -> Input 
         };
         return Input::Reply { req, result };
     }
+    let closed_gen = if rng.next_unit() < 0.5 {
+        socket_gen
+    } else {
+        socket_gen.saturating_sub(1)
+    };
     pick(
         rng,
         &[
-            Input::SocketOpened,
-            Input::SocketClosed,
+            Input::SocketOpened { gen: socket_gen },
+            Input::SocketClosed { gen: closed_gen },
             Input::Reconnect,
             Input::OutboxChanged,
             Input::Timer(TimerId::Reconnect),
@@ -91,6 +97,7 @@ struct Harness {
     seed: u64,
     outstanding: Vec<(u64, Request)>,
     socket_open: bool,
+    socket_gen: u64,
     events: Vec<Lifecycle>,
 }
 
@@ -99,20 +106,29 @@ impl Harness {
     fn feed(&mut self, input: Input) {
         let mut queue = std::collections::VecDeque::from([input]);
         while let Some(input) = queue.pop_front() {
-            if matches!(input, Input::SocketClosed) {
+            if input
+                == (Input::SocketClosed {
+                    gen: self.socket_gen,
+                })
+            {
                 self.socket_open = false;
             }
             for e in self.core.step(input) {
                 match e {
-                    Effect::OpenSocket => {
+                    Effect::OpenSocket { gen } => {
                         assert!(
                             !self.socket_open,
                             "seed {}: second OpenSocket without close",
                             self.seed
                         );
+                        assert!(gen > self.socket_gen, "seed {}: gen reused", self.seed);
                         self.socket_open = true;
+                        self.socket_gen = gen;
                     }
-                    Effect::CloseSocket => self.socket_open = false,
+                    Effect::CloseSocket { gen } => {
+                        assert_eq!(gen, self.socket_gen, "seed {}: close gen", self.seed);
+                        self.socket_open = false;
+                    }
                     Effect::Send { req, request } => self.outstanding.push((req, request)),
                     Effect::Emit(l) => self.events.push(l),
                     Effect::ApplyChanges { scope, tag, .. }
@@ -149,13 +165,14 @@ fn random_sequences_preserve_connection_and_ordering_invariants() {
             seed,
             outstanding: Vec::new(),
             socket_open: false,
+            socket_gen: 0,
             events: Vec::new(),
         };
         h.feed(Input::Start {
             has_credentials: true,
         });
         for _ in 0..200 {
-            let input = next_input(&mut rng, &mut h.outstanding);
+            let input = next_input(&mut rng, &mut h.outstanding, h.socket_gen);
             h.feed(input);
         }
         assert_ordering(seed, &h.events);
@@ -170,7 +187,7 @@ fn random_sequences_preserve_connection_and_ordering_invariants() {
         h.feed(Input::Shutdown);
         for input in [
             Input::Reconnect,
-            Input::SocketOpened,
+            Input::SocketOpened { gen: h.socket_gen },
             Input::Timer(TimerId::Reconnect),
             Input::Timer(TimerId::HaltRetry),
             Input::Timer(TimerId::Heartbeat),
