@@ -6,10 +6,8 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-#[allow(unused_imports)]
 use super::backoff::{catch_up_retry_delay, connect_delay, doc_retry_delay, Jitter};
 use super::doc::InFlight;
-#[allow(unused_imports)]
 use super::types::{Change, DocEnvelope, Scope, Seq, ServerError, Upload};
 
 pub const MAX_IN_FLIGHT: usize = 8;
@@ -856,8 +854,38 @@ impl Core {
                 Err(e) => self.fail_catch_up(&scope, Some(&e), fx),
                 Ok(_) => self.fail_catch_up(&scope, None, fx),
             },
-            // Filled in by Task 12.
-            Pending::Upload { .. } | Pending::Document { .. } => {}
+            Pending::Upload { doc_id } => {
+                let Some(s) = self.session() else { return };
+                let Some(inflight) = s.in_flight.remove(&doc_id) else {
+                    return;
+                };
+                let mismatch_attempts = *s.mismatch_attempts.get(&doc_id).unwrap_or(&0);
+                let reply = match result {
+                    Ok(Response::Uploaded(doc)) => Ok(doc),
+                    Ok(other) => Err(ServerError::new(&format!("unexpected_response:{other:?}"))),
+                    Err(e) => Err(e),
+                };
+                fx.push(Effect::SettleUpload {
+                    doc_id,
+                    inflight,
+                    reply,
+                    mismatch_attempts,
+                });
+            }
+            Pending::Document { doc_id } => match result {
+                Ok(Response::Document(doc)) => fx.push(Effect::ApplyServerCopy {
+                    doc_id,
+                    doc: Some(doc),
+                }),
+                Err(e) if e.code == "deleted" => fx.push(Effect::ApplyServerDeleted {
+                    doc_id,
+                    seq: e.current_seq.unwrap_or(0),
+                }),
+                Err(e) if e.code == "not_found" => {
+                    fx.push(Effect::ApplyServerCopy { doc_id, doc: None })
+                }
+                _ => self.back_off_doc(doc_id, None, fx),
+            },
             Pending::Heartbeat => {}
         }
     }
@@ -1003,11 +1031,174 @@ impl Core {
         }
     }
 
-    // Filled in by Task 12.
-    fn on_request_timeout(&mut self, _p: Pending, _fx: &mut Vec<Effect>) {}
-    fn on_upload_timer(&mut self, _t: TimerId, _fx: &mut Vec<Effect>) {}
-    fn on_upload_input(&mut self, _i: Input, _fx: &mut Vec<Effect>) {}
-    fn request_pump(&mut self, _fx: &mut Vec<Effect>) {}
+    fn request_pump(&mut self, fx: &mut Vec<Effect>) {
+        let Some(s) = self.session() else { return };
+        fx.push(Effect::Cancel(TimerId::Pump));
+        fx.push(Effect::Schedule {
+            timer: TimerId::Pump,
+            after: QUIET,
+        });
+        if !s.pump_scheduled {
+            s.pump_scheduled = true;
+            fx.push(Effect::Schedule {
+                timer: TimerId::PumpCap,
+                after: QUIET_CAP,
+            });
+        }
+    }
+
+    fn try_build(&mut self, doc_id: Uuid, fx: &mut Vec<Effect>) {
+        let Some(s) = self.session() else { return };
+        let busy = s.in_flight.contains_key(&doc_id)
+            || s.building.contains(&doc_id)
+            || s.backing_off.contains(&doc_id);
+        if busy || s.in_flight.len() + s.building.len() >= MAX_IN_FLIGHT {
+            return;
+        }
+        s.building.insert(doc_id);
+        fx.push(Effect::BuildUpload { doc_id });
+    }
+
+    fn back_off_doc(&mut self, doc_id: Uuid, after_ms: Option<u64>, fx: &mut Vec<Effect>) {
+        let Some(s) = self.session() else { return };
+        let failures = s.doc_failures.entry(doc_id).or_insert(0);
+        *failures += 1;
+        let delay = after_ms
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| doc_retry_delay(*failures));
+        s.backing_off.insert(doc_id);
+        fx.push(Effect::Schedule {
+            timer: TimerId::DocRetry(doc_id),
+            after: delay,
+        });
+    }
+
+    fn send_get_document(&mut self, doc_id: Uuid, fx: &mut Vec<Effect>) {
+        let req = self.alloc_req();
+        let Some(s) = self.session() else { return };
+        s.requests.insert(req, Pending::Document { doc_id });
+        fx.push(Effect::Send {
+            req,
+            request: Request::GetDocument { doc_id },
+        });
+        fx.push(Effect::Schedule {
+            timer: TimerId::Request(req),
+            after: REQUEST_TIMEOUT,
+        });
+    }
+
+    fn on_upload_input(&mut self, input: Input, fx: &mut Vec<Effect>) {
+        match input {
+            Input::OutboxChanged => self.request_pump(fx),
+            Input::PendingDocs(docs) => {
+                for d in docs {
+                    self.try_build(d, fx);
+                }
+            }
+            Input::UploadBuilt { doc_id, outcome } => {
+                if let Some(s) = self.session() {
+                    s.building.remove(&doc_id);
+                }
+                match outcome {
+                    BuildOutcome::Send { upload, inflight } => {
+                        let req = self.alloc_req();
+                        let Some(s) = self.session() else { return };
+                        s.in_flight.insert(doc_id, inflight);
+                        s.requests.insert(req, Pending::Upload { doc_id });
+                        fx.push(Effect::Send {
+                            req,
+                            request: Request::Upload(upload),
+                        });
+                        fx.push(Effect::Schedule {
+                            timer: TimerId::Request(req),
+                            after: REQUEST_TIMEOUT,
+                        });
+                    }
+                    BuildOutcome::NeedsServerCopy => self.send_get_document(doc_id, fx),
+                    BuildOutcome::SettledLocally { rows_remain: true } => {
+                        self.try_build(doc_id, fx)
+                    }
+                    BuildOutcome::SettledLocally { rows_remain: false } | BuildOutcome::Nothing => {
+                    }
+                }
+            }
+            Input::Settled { doc_id, outcome } => match outcome {
+                SettleOutcome::Done { rows_remain } => {
+                    if let Some(s) = self.session() {
+                        s.mismatch_attempts.remove(&doc_id);
+                        s.doc_failures.remove(&doc_id);
+                    }
+                    if rows_remain {
+                        self.try_build(doc_id, fx);
+                    }
+                }
+                SettleOutcome::FetchServerCopy => {
+                    if let Some(s) = self.session() {
+                        *s.mismatch_attempts.entry(doc_id).or_insert(0) += 1;
+                    }
+                    self.send_get_document(doc_id, fx);
+                }
+                SettleOutcome::Retry {
+                    after_ms,
+                    mismatch: true,
+                } => {
+                    if let Some(s) = self.session() {
+                        *s.mismatch_attempts.entry(doc_id).or_insert(0) += 1;
+                    }
+                    match after_ms {
+                        Some(ms) => self.back_off_doc(doc_id, Some(ms), fx),
+                        None => self.try_build(doc_id, fx),
+                    }
+                }
+                SettleOutcome::Retry {
+                    after_ms,
+                    mismatch: false,
+                } => self.back_off_doc(doc_id, after_ms, fx),
+            },
+            Input::ServerCopyApplied { doc_id } => self.try_build(doc_id, fx),
+            _ => {}
+        }
+    }
+
+    fn on_upload_timer(&mut self, timer: TimerId, fx: &mut Vec<Effect>) {
+        match timer {
+            TimerId::Pump | TimerId::PumpCap => {
+                let Some(s) = self.session() else { return };
+                if !s.pump_scheduled {
+                    return;
+                }
+                s.pump_scheduled = false;
+                fx.push(Effect::Cancel(if timer == TimerId::Pump {
+                    TimerId::PumpCap
+                } else {
+                    TimerId::Pump
+                }));
+                fx.push(Effect::LoadPending);
+            }
+            TimerId::DocRetry(doc_id) => {
+                let was_waiting = self
+                    .session()
+                    .is_some_and(|s| s.backing_off.remove(&doc_id));
+                if was_waiting {
+                    self.try_build(doc_id, fx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_request_timeout(&mut self, pending: Pending, fx: &mut Vec<Effect>) {
+        match pending {
+            Pending::Upload { doc_id } => {
+                if let Some(s) = self.session() {
+                    s.in_flight.remove(&doc_id);
+                }
+                self.back_off_doc(doc_id, None, fx);
+            }
+            Pending::Document { doc_id } => self.back_off_doc(doc_id, None, fx),
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1927,5 +2118,369 @@ mod catch_up_tests {
         assert_eq!(emitted(&fx), vec![Lifecycle::SyncCompleted]);
         let fx = c.step(Input::Push(change("collection:curated", 6, 5)));
         assert!(!fx.iter().any(|e| matches!(e, Effect::ApplyChanges { .. })));
+    }
+}
+
+#[cfg(test)]
+mod upload_orchestration_tests {
+    use super::harness::*;
+    use super::*;
+    use crate::engine::doc::InFlight;
+    use crate::engine::types::{DocEnvelope, UploadKind};
+    use serde_json::json;
+
+    fn doc(n: u128) -> Uuid {
+        Uuid::from_u128(0x1000 + n)
+    }
+
+    fn connected(c: &mut Core) {
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (req, _) = sends(&c.step(Input::SocketOpened)).pop().unwrap();
+        c.step(Input::Reply {
+            req,
+            result: Ok(Response::Joined),
+        });
+    }
+
+    fn prepared(d: Uuid) -> BuildOutcome {
+        let upload_id = Uuid::from_u128(0x77);
+        BuildOutcome::Send {
+            upload: Upload {
+                upload_id,
+                doc_id: d,
+                kind: UploadKind::Update,
+                base_hash: Some("h".into()),
+                payload: json!([]),
+            },
+            inflight: InFlight {
+                upload_id,
+                covered: vec![upload_id],
+                kind: UploadKind::Update,
+                base_hash: Some("h".into()),
+                sent_content: json!({}),
+            },
+        }
+    }
+
+    fn envelope(d: Uuid, seq: i64) -> DocEnvelope {
+        DocEnvelope {
+            doc_id: d,
+            owner_id: Some(ME),
+            author_id: None,
+            read_only: false,
+            source_doc_id: None,
+            derived_from: None,
+            title: None,
+            content: json!({}),
+            hash: "h2".into(),
+            seq,
+        }
+    }
+
+    fn upload_req(fx: &[Effect]) -> u64 {
+        sends(fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::Upload(_)))
+            .map(|(q, _)| q)
+            .expect("upload sent")
+    }
+
+    #[test]
+    fn outbox_change_debounces_then_loads_pending() {
+        let mut c = core();
+        connected(&mut c);
+        c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        let fx = c.step(Input::OutboxChanged);
+        assert!(fx.contains(&Effect::Cancel(TimerId::Pump)));
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::Pump,
+            after: Duration::from_millis(200)
+        }));
+        let fx = c.step(Input::Timer(TimerId::Pump));
+        assert!(fx.contains(&Effect::LoadPending));
+        assert!(fx.contains(&Effect::Cancel(TimerId::PumpCap)));
+    }
+
+    #[test]
+    fn outbox_change_while_disconnected_does_nothing() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        assert!(!c.step(Input::OutboxChanged).iter().any(|e| matches!(
+            e,
+            Effect::Schedule {
+                timer: TimerId::Pump,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn pending_docs_build_at_most_eight() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::PendingDocs((0..12).map(doc).collect()));
+        let builds = fx
+            .iter()
+            .filter(|e| matches!(e, Effect::BuildUpload { .. }))
+            .count();
+        assert_eq!(builds, MAX_IN_FLIGHT);
+    }
+
+    #[test]
+    fn built_upload_is_sent_with_timeout_and_settled_on_reply() {
+        let mut c = core();
+        connected(&mut c);
+        c.step(Input::PendingDocs(vec![doc(1)]));
+        let fx = c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: prepared(doc(1)),
+        });
+        let req = upload_req(&fx);
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::Request(req),
+            after: Duration::from_secs(30)
+        }));
+        let fx = c.step(Input::Reply {
+            req,
+            result: Ok(Response::Uploaded(envelope(doc(1), 9))),
+        });
+        assert!(fx.iter().any(|e| matches!(e, Effect::SettleUpload { doc_id, reply: Ok(_), mismatch_attempts: 0, .. } if *doc_id == doc(1))));
+    }
+
+    #[test]
+    fn document_already_in_flight_is_not_rebuilt() {
+        let mut c = core();
+        connected(&mut c);
+        c.step(Input::PendingDocs(vec![doc(1)]));
+        c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: prepared(doc(1)),
+        });
+        let fx = c.step(Input::PendingDocs(vec![doc(1)]));
+        assert!(!fx.iter().any(|e| matches!(e, Effect::BuildUpload { .. })));
+    }
+
+    #[test]
+    fn settled_with_rows_remaining_builds_again() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Settled {
+            doc_id: doc(1),
+            outcome: SettleOutcome::Done { rows_remain: true },
+        });
+        assert!(fx.contains(&Effect::BuildUpload { doc_id: doc(1) }));
+    }
+
+    #[test]
+    fn needs_server_copy_fetches_then_rebuilds() {
+        let mut c = core();
+        connected(&mut c);
+        c.step(Input::PendingDocs(vec![doc(1)]));
+        let fx = c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: BuildOutcome::NeedsServerCopy,
+        });
+        let (req, request) = sends(&fx).pop().unwrap();
+        assert_eq!(request, Request::GetDocument { doc_id: doc(1) });
+        let fx = c.step(Input::Reply {
+            req,
+            result: Ok(Response::Document(envelope(doc(1), 3))),
+        });
+        assert!(fx
+            .iter()
+            .any(|e| matches!(e, Effect::ApplyServerCopy { doc: Some(_), .. })));
+        let fx = c.step(Input::ServerCopyApplied { doc_id: doc(1) });
+        assert!(fx.contains(&Effect::BuildUpload { doc_id: doc(1) }));
+    }
+
+    #[test]
+    fn get_document_not_found_applies_missing() {
+        let mut c = core();
+        connected(&mut c);
+        c.step(Input::PendingDocs(vec![doc(1)]));
+        let (req, _) = sends(&c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: BuildOutcome::NeedsServerCopy,
+        }))
+        .pop()
+        .unwrap();
+        let fx = c.step(Input::Reply {
+            req,
+            result: Err(ServerError::new("not_found")),
+        });
+        assert!(fx.contains(&Effect::ApplyServerCopy {
+            doc_id: doc(1),
+            doc: None
+        }));
+    }
+
+    #[test]
+    fn get_document_deleted_applies_server_deleted() {
+        let mut c = core();
+        connected(&mut c);
+        c.step(Input::PendingDocs(vec![doc(1)]));
+        let (req, _) = sends(&c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: BuildOutcome::NeedsServerCopy,
+        }))
+        .pop()
+        .unwrap();
+        let fx = c.step(Input::Reply {
+            req,
+            result: Err(ServerError {
+                current_seq: Some(12),
+                ..ServerError::new("deleted")
+            }),
+        });
+        assert!(fx.contains(&Effect::ApplyServerDeleted {
+            doc_id: doc(1),
+            seq: 12
+        }));
+    }
+
+    #[test]
+    fn mismatch_attempts_accumulate_and_reset() {
+        let mut c = core();
+        connected(&mut c);
+        c.step(Input::Settled {
+            doc_id: doc(1),
+            outcome: SettleOutcome::Retry {
+                after_ms: None,
+                mismatch: true,
+            },
+        });
+        c.step(Input::Settled {
+            doc_id: doc(1),
+            outcome: SettleOutcome::FetchServerCopy,
+        });
+        c.step(Input::PendingDocs(vec![doc(1)]));
+        let req = upload_req(&c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: prepared(doc(1)),
+        }));
+        let fx = c.step(Input::Reply {
+            req,
+            result: Err(ServerError::new("hash_mismatch")),
+        });
+        assert!(fx.iter().any(|e| matches!(
+            e,
+            Effect::SettleUpload {
+                mismatch_attempts: 2,
+                ..
+            }
+        )));
+        c.step(Input::Settled {
+            doc_id: doc(1),
+            outcome: SettleOutcome::Done { rows_remain: false },
+        });
+        c.step(Input::PendingDocs(vec![doc(1)]));
+        let req = upload_req(&c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: prepared(doc(1)),
+        }));
+        let fx = c.step(Input::Reply {
+            req,
+            result: Ok(Response::Uploaded(envelope(doc(1), 4))),
+        });
+        assert!(fx.iter().any(|e| matches!(
+            e,
+            Effect::SettleUpload {
+                mismatch_attempts: 0,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn transient_retry_backs_off_per_document() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Settled {
+            doc_id: doc(1),
+            outcome: SettleOutcome::Retry {
+                after_ms: None,
+                mismatch: false,
+            },
+        });
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::DocRetry(doc(1)),
+            after: Duration::from_secs(1)
+        }));
+        assert!(!c
+            .step(Input::PendingDocs(vec![doc(1)]))
+            .iter()
+            .any(|e| matches!(e, Effect::BuildUpload { .. })));
+        let fx = c.step(Input::Timer(TimerId::DocRetry(doc(1))));
+        assert!(fx.contains(&Effect::BuildUpload { doc_id: doc(1) }));
+        let fx = c.step(Input::Settled {
+            doc_id: doc(1),
+            outcome: SettleOutcome::Retry {
+                after_ms: None,
+                mismatch: false,
+            },
+        });
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::DocRetry(doc(1)),
+            after: Duration::from_secs(2)
+        }));
+    }
+
+    #[test]
+    fn upload_timeout_releases_document_with_backoff() {
+        let mut c = core();
+        connected(&mut c);
+        c.step(Input::PendingDocs(vec![doc(1)]));
+        let req = upload_req(&c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: prepared(doc(1)),
+        }));
+        let fx = c.step(Input::Timer(TimerId::Request(req)));
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::DocRetry(doc(1)),
+            after: Duration::from_secs(1)
+        }));
+    }
+
+    #[test]
+    fn disconnect_forgets_in_flight_and_reconnect_pumps() {
+        let mut c = core();
+        connected(&mut c);
+        c.step(Input::PendingDocs(vec![doc(1)]));
+        let req = upload_req(&c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: prepared(doc(1)),
+        }));
+        c.step(Input::SocketClosed);
+        assert!(c
+            .step(Input::Reply {
+                req,
+                result: Ok(Response::Uploaded(envelope(doc(1), 9)))
+            })
+            .iter()
+            .all(|e| !matches!(e, Effect::SettleUpload { .. })));
+        c.step(Input::Timer(TimerId::Reconnect));
+        let (jreq, _) = sends(&c.step(Input::SocketOpened)).pop().unwrap();
+        c.step(Input::Reply {
+            req: jreq,
+            result: Ok(Response::Joined),
+        });
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        assert!(fx.iter().any(|e| matches!(
+            e,
+            Effect::Schedule {
+                timer: TimerId::Pump,
+                ..
+            }
+        )));
     }
 }
