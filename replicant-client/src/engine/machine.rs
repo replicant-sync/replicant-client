@@ -1379,7 +1379,7 @@ mod connection_tests {
     use super::*;
 
     fn open_and_join(c: &mut Core) -> Vec<Effect> {
-        let fx = c.step(opened(&c));
+        let fx = c.step(opened(c));
         let (req, request) = sends(&fx).pop().expect("join sent");
         assert_eq!(request, Request::Join);
         c.step(Input::Reply {
@@ -1729,7 +1729,7 @@ mod catch_up_tests {
         c.step(Input::Start {
             has_credentials: true,
         });
-        let (req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        let (req, _) = sends(&c.step(opened(c))).pop().unwrap();
         c.step(Input::Reply {
             req,
             result: Ok(Response::Joined),
@@ -2314,7 +2314,7 @@ mod upload_orchestration_tests {
         c.step(Input::Start {
             has_credentials: true,
         });
-        let (req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        let (req, _) = sends(&c.step(opened(c))).pop().unwrap();
         c.step(Input::Reply {
             req,
             result: Ok(Response::Joined),
