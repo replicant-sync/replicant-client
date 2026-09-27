@@ -267,8 +267,15 @@ pub fn apply_change(snap: &DocSnapshot, change: &Change, me: Uuid) -> Vec<DocOp>
 
     match change.kind {
         ChangeKind::Upsert => {
-            if let Some(doc) = &change.doc {
-                ops.extend(apply_upsert(snap, doc, change.seq));
+            let is_member = snap
+                .project(&ops)
+                .memberships
+                .iter()
+                .any(|m| m.scope == change.scope && m.member);
+            if is_member {
+                if let Some(doc) = &change.doc {
+                    ops.extend(apply_upsert(snap, doc, change.seq));
+                }
             }
         }
         ChangeKind::Delete => ops.extend(apply_delete(snap, change, me)),
@@ -289,12 +296,15 @@ pub fn apply_server_copy(snap: &DocSnapshot, doc: &DocEnvelope, _me: Uuid) -> Ve
     apply_upsert(snap, doc, doc.seq)
 }
 
-/// `get_document` said the document does not exist on the server: pending rows become a create.
+/// `get_document` said the document does not exist on the server: not_found means the server
+/// never had it, so pending rows become a create — unless the pending row is itself a delete,
+/// in which case the server's view and the local intent already agree.
 pub fn apply_server_missing(snap: &DocSnapshot) -> Vec<DocOp> {
-    if snap.rows.is_empty() {
-        return Vec::new();
+    match snap.rows.last() {
+        None => Vec::new(),
+        Some(r) if r.kind == RowKind::Delete => vec![DocOp::DropAllRows, DocOp::HardDelete],
+        Some(_) => vec![DocOp::DropAllRows, DocOp::InsertMarker(RowKind::Create)],
     }
-    vec![DocOp::DropAllRows, DocOp::InsertMarker(RowKind::Create)]
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -666,6 +676,28 @@ mod apply_change_tests {
     }
 
     #[test]
+    fn lagging_upsert_after_leave_does_not_recreate() {
+        let mut s = synced(sample(), 3);
+        s.memberships = vec![Membership {
+            scope: "collection:curated".into(),
+            member: true,
+            seq: 3,
+        }];
+        let leave_ops = apply_change(
+            &s,
+            &kind_change("collection:curated", ChangeKind::Leave, 4),
+            ME,
+        );
+        let after_leave = s.project(&leave_ops);
+        let after = after_leave.project(&apply_change(
+            &after_leave,
+            &upsert("collection:curated", sample(), 3),
+            ME,
+        ));
+        assert!(!after.exists);
+    }
+
+    #[test]
     fn leave_keeps_document_still_member_elsewhere() {
         let mut s = synced(sample(), 3);
         s.memberships.push(Membership {
@@ -715,6 +747,17 @@ mod apply_change_tests {
         let after = s.project(&apply_server_missing(&s));
         assert_eq!(after.rows.len(), 1);
         assert_eq!(after.rows[0].kind, RowKind::Create);
+    }
+
+    #[test]
+    fn server_missing_with_pending_delete_just_drops() {
+        let mut s = synced(json!({"mine": 1}), 0);
+        s.soft_deleted = true;
+        s.shadow = None;
+        s.rows = vec![row(5, RowKind::Update), row(6, RowKind::Delete)];
+        let after = s.project(&apply_server_missing(&s));
+        assert!(!after.exists);
+        assert!(after.rows.is_empty());
     }
 }
 
