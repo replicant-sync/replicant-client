@@ -2,7 +2,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::hash::content_hash;
-use super::types::{Scope, Seq};
+use super::types::{Change, ChangeKind, DocEnvelope, Scope, Seq};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Shadow {
@@ -168,6 +168,133 @@ pub fn with_settle_invariant(snap: &DocSnapshot, mut ops: Vec<DocOp>, me: Uuid) 
         Some(_) => {}
     }
     ops
+}
+
+pub(crate) fn conflict_ops(snap: &DocSnapshot) -> Vec<DocOp> {
+    let mut ops = vec![DocOp::Recover {
+        content: snap.content.clone(),
+        reason: RecoverReason::Conflict,
+    }];
+    if let Some(sh) = &snap.shadow {
+        ops.push(DocOp::SetContent(sh.content.clone()));
+    }
+    ops.push(DocOp::DropAllRows);
+    ops.push(DocOp::Emit(DocEvent::ConflictDetected));
+    ops
+}
+
+fn membership_seq(snap: &DocSnapshot, scope: &str) -> Seq {
+    snap.memberships
+        .iter()
+        .find(|m| m.scope == scope)
+        .map_or(0, |m| m.seq)
+}
+
+/// Non-echo upsert: content guard already passed.
+fn apply_upsert(snap: &DocSnapshot, doc: &DocEnvelope, seq: Seq) -> Vec<DocOp> {
+    let new_shadow = Shadow {
+        content: doc.content.clone(),
+        hash: doc.hash.clone(),
+        seq,
+    };
+    let mut ops = vec![DocOp::SetMeta {
+        owner_id: doc.owner_id,
+        read_only: doc.read_only,
+    }];
+    let pending = snap.exists && !snap.rows.is_empty();
+
+    if pending && doc.read_only {
+        ops.push(DocOp::Recover {
+            content: snap.content.clone(),
+            reason: RecoverReason::BecamePublication,
+        });
+        ops.push(DocOp::DropAllRows);
+        ops.push(DocOp::SetShadow(new_shadow));
+        ops.push(DocOp::SetContent(doc.content.clone()));
+        ops.push(DocOp::Emit(DocEvent::SyncError {
+            code: "became_publication".into(),
+        }));
+        return ops;
+    }
+    if !pending {
+        ops.push(DocOp::SetShadow(new_shadow));
+        ops.push(DocOp::SetContent(doc.content.clone()));
+        return ops;
+    }
+    let content = match &snap.shadow {
+        // Migration only: no known base, keep local content; pending = diff(new shadow, content).
+        None => snap.content.clone(),
+        Some(old) => match rebase(&old.content, &doc.content, &snap.content) {
+            Rebased::Clean(v) => v,
+            Rebased::Conflict => {
+                let with_new_shadow = snap.project(&[DocOp::SetShadow(new_shadow.clone())]);
+                ops.push(DocOp::SetShadow(new_shadow));
+                ops.extend(conflict_ops(&with_new_shadow));
+                return ops;
+            }
+        },
+    };
+    ops.push(DocOp::SetShadow(new_shadow));
+    ops.push(DocOp::SetContent(content));
+    ops
+}
+
+pub fn apply_change(snap: &DocSnapshot, change: &Change, me: Uuid) -> Vec<DocOp> {
+    let mut ops = Vec::new();
+    let membership_applies = change.seq > membership_seq(snap, &change.scope);
+    if membership_applies {
+        ops.push(DocOp::SetMembership(Membership {
+            scope: change.scope.clone(),
+            member: change.kind == ChangeKind::Upsert,
+            seq: change.seq,
+        }));
+    }
+
+    if change.kind == ChangeKind::Leave {
+        if membership_applies {
+            let after = snap.project(&ops);
+            if after.exists && after.rows.is_empty() && !after.memberships.iter().any(|m| m.member)
+            {
+                ops.push(DocOp::HardDelete);
+            }
+        }
+        return ops;
+    }
+
+    if change.seq <= snap.server_seq() {
+        return ops;
+    }
+
+    match change.kind {
+        ChangeKind::Upsert => {
+            if let Some(doc) = &change.doc {
+                ops.extend(apply_upsert(snap, doc, change.seq));
+            }
+        }
+        ChangeKind::Delete => ops.extend(apply_delete(snap, change, me)),
+        ChangeKind::Leave => unreachable!(),
+    }
+    ops
+}
+
+/// Placeholder until Task 6; deletes are covered there.
+fn apply_delete(_snap: &DocSnapshot, _change: &Change, _me: Uuid) -> Vec<DocOp> {
+    Vec::new()
+}
+
+pub fn apply_server_copy(snap: &DocSnapshot, doc: &DocEnvelope, _me: Uuid) -> Vec<DocOp> {
+    if doc.seq <= snap.server_seq() {
+        return Vec::new();
+    }
+    apply_upsert(snap, doc, doc.seq)
+}
+
+/// `get_document` said the document does not exist on the server: pending rows become a create.
+pub fn apply_server_missing(snap: &DocSnapshot) -> Vec<DocOp> {
+    if snap.rows.is_empty() {
+        return Vec::new();
+    }
+    vec![DocOp::DropAllRows, DocOp::InsertMarker(RowKind::Create)]
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -356,6 +483,238 @@ mod snapshot_tests {
         };
         let ops = with_settle_invariant(&s, vec![], ME);
         assert_eq!(ops, vec![DocOp::InsertMarker(RowKind::Create)]);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod change_fixtures {
+    use super::fixtures::*;
+    use crate::engine::types::{Change, ChangeKind, DocEnvelope};
+    use serde_json::Value;
+    use uuid::Uuid;
+
+    pub fn env(content: Value, seq: i64) -> DocEnvelope {
+        DocEnvelope {
+            doc_id: DOC,
+            owner_id: Some(ME),
+            author_id: None,
+            read_only: false,
+            source_doc_id: None,
+            derived_from: None,
+            title: None,
+            hash: crate::engine::hash::content_hash(&content),
+            content,
+            seq,
+        }
+    }
+
+    pub fn upsert(scope: &str, content: Value, seq: i64) -> Change {
+        Change {
+            scope: scope.into(),
+            seq,
+            prev_seq: seq - 1,
+            doc_id: DOC,
+            kind: ChangeKind::Upsert,
+            doc: Some(env(content, seq)),
+            client_id: None,
+            upload_id: None,
+        }
+    }
+
+    pub fn kind_change(scope: &str, kind: ChangeKind, seq: i64) -> Change {
+        Change {
+            doc: None,
+            kind,
+            ..upsert(scope, Value::Null, seq)
+        }
+    }
+
+    pub fn with_upload(mut c: Change, upload_id: Uuid) -> Change {
+        c.upload_id = Some(upload_id);
+        c
+    }
+}
+
+#[cfg(test)]
+mod apply_change_tests {
+    use super::change_fixtures::*;
+    use super::fixtures::*;
+    use super::*;
+    use crate::engine::types::ChangeKind;
+    use serde_json::json;
+
+    #[test]
+    fn stale_change_is_skipped_for_content() {
+        let s = synced(sample(), 10);
+        let ops = apply_change(&s, &upsert("own", json!({"old": true}), 8), ME);
+        assert!(!ops
+            .iter()
+            .any(|o| matches!(o, DocOp::SetContent(_) | DocOp::SetShadow(_))));
+    }
+
+    #[test]
+    fn upsert_without_rows_replaces_content_and_shadow() {
+        let s = synced(sample(), 1);
+        let new = json!({"title": "B"});
+        let after = s.project(&apply_change(&s, &upsert("own", new.clone(), 2), ME));
+        assert_eq!(after.content, new);
+        assert_eq!(after.shadow.unwrap().seq, 2);
+    }
+
+    #[test]
+    fn upsert_creates_missing_document() {
+        let after = empty().project(&apply_change(
+            &empty(),
+            &upsert("collection:curated", sample(), 3),
+            ME,
+        ));
+        assert!(after.exists);
+        assert_eq!(after.content, sample());
+        assert!(after
+            .memberships
+            .iter()
+            .any(|m| m.scope == "collection:curated" && m.member));
+    }
+
+    #[test]
+    fn upsert_with_pending_rows_rebases_local_edits() {
+        let mut s = synced(json!({"a": 1}), 1);
+        s.content = json!({"a": 1, "mine": true});
+        s.rows = vec![row(5, RowKind::Update)];
+        let after = s.project(&apply_change(
+            &s,
+            &upsert("own", json!({"a": 1, "theirs": true}), 2),
+            ME,
+        ));
+        assert_eq!(after.content, json!({"a": 1, "mine": true, "theirs": true}));
+        assert_eq!(
+            after.shadow.unwrap().content,
+            json!({"a": 1, "theirs": true})
+        );
+        assert_eq!(after.rows.len(), 1);
+    }
+
+    #[test]
+    fn rebase_conflict_recovers_local_and_takes_server() {
+        let mut s = synced(json!({"a": {"x": 1}}), 1);
+        s.content = json!({"a": {"x": 2}});
+        s.rows = vec![row(5, RowKind::Update)];
+        let ops = apply_change(&s, &upsert("own", json!({}), 2), ME);
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"a": {"x": 2}}),
+            reason: RecoverReason::Conflict
+        }));
+        assert!(ops.contains(&DocOp::Emit(DocEvent::ConflictDetected)));
+        let after = s.project(&ops);
+        assert_eq!(after.content, json!({}));
+        assert!(after.rows.is_empty());
+    }
+
+    #[test]
+    fn null_shadow_keeps_local_content() {
+        let mut s = synced(json!({"mine": 1}), 0);
+        s.shadow = None;
+        s.rows = vec![row(5, RowKind::Update)];
+        let after = s.project(&apply_change(
+            &s,
+            &upsert("own", json!({"server": 1}), 4),
+            ME,
+        ));
+        assert_eq!(after.content, json!({"mine": 1}));
+        assert_eq!(after.shadow.unwrap().content, json!({"server": 1}));
+    }
+
+    #[test]
+    fn membership_guard_is_independent_of_content_guard() {
+        // Doc already at server_seq 20; lagging scope Y delivers upsert@15.
+        let s = synced(sample(), 20);
+        let ops = apply_change(&s, &upsert("collection:y", sample(), 15), ME);
+        assert!(ops.contains(&DocOp::SetMembership(Membership {
+            scope: "collection:y".into(),
+            member: true,
+            seq: 15
+        })));
+        assert!(!ops.iter().any(|o| matches!(o, DocOp::SetContent(_))));
+    }
+
+    #[test]
+    fn older_upsert_cannot_undo_newer_leave_in_same_scope() {
+        let mut s = synced(sample(), 10);
+        s.memberships.push(Membership {
+            scope: "collection:y".into(),
+            member: false,
+            seq: 20,
+        });
+        let ops = apply_change(&s, &upsert("collection:y", sample(), 15), ME);
+        assert!(!ops.iter().any(|o| matches!(o, DocOp::SetMembership(_))));
+    }
+
+    #[test]
+    fn leave_removes_membership_and_deletes_when_member_nowhere() {
+        let mut s = synced(sample(), 3);
+        s.memberships = vec![Membership {
+            scope: "collection:curated".into(),
+            member: true,
+            seq: 3,
+        }];
+        let after = s.project(&apply_change(
+            &s,
+            &kind_change("collection:curated", ChangeKind::Leave, 4),
+            ME,
+        ));
+        assert!(!after.exists);
+    }
+
+    #[test]
+    fn leave_keeps_document_still_member_elsewhere() {
+        let mut s = synced(sample(), 3);
+        s.memberships.push(Membership {
+            scope: "collection:x".into(),
+            member: true,
+            seq: 3,
+        });
+        let after = s.project(&apply_change(
+            &s,
+            &kind_change("collection:x", ChangeKind::Leave, 4),
+            ME,
+        ));
+        assert!(after.exists);
+    }
+
+    #[test]
+    fn upsert_marking_read_only_with_pending_rows_recovers_edits() {
+        let mut s = synced(json!({"a": 1}), 1);
+        s.content = json!({"a": 2});
+        s.rows = vec![row(5, RowKind::Update)];
+        let mut c = upsert("collection:curated", json!({"a": 1}), 2);
+        c.doc.as_mut().unwrap().read_only = true;
+        let ops = apply_change(&s, &c, ME);
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"a": 2}),
+            reason: RecoverReason::BecamePublication
+        }));
+        assert!(ops.contains(&DocOp::Emit(DocEvent::SyncError {
+            code: "became_publication".into()
+        })));
+        assert!(s.project(&ops).rows.is_empty());
+    }
+
+    #[test]
+    fn server_copy_applies_with_content_guard() {
+        let s = synced(sample(), 5);
+        assert!(apply_server_copy(&s, &env(json!({"x": 1}), 4), ME).is_empty());
+        let after = s.project(&apply_server_copy(&s, &env(json!({"x": 1}), 6), ME));
+        assert_eq!(after.content, json!({"x": 1}));
+    }
+
+    #[test]
+    fn server_missing_turns_pending_rows_into_a_create() {
+        let mut s = synced(json!({"mine": 1}), 0);
+        s.shadow = None;
+        s.rows = vec![row(5, RowKind::Update)];
+        let after = s.project(&apply_server_missing(&s));
+        assert_eq!(after.rows.len(), 1);
+        assert_eq!(after.rows[0].kind, RowKind::Create);
     }
 }
 
