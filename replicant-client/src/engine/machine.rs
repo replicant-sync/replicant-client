@@ -386,7 +386,262 @@ impl Core {
         fx
     }
 
-    fn handle(&mut self, _input: Input, _fx: &mut Vec<Effect>) {}
+    fn handle(&mut self, input: Input, fx: &mut Vec<Effect>) {
+        if matches!(self.conn, Conn::Stopped) {
+            return;
+        }
+        match input {
+            Input::Shutdown => {
+                fx.push(Effect::CloseSocket);
+                self.conn = Conn::Stopped;
+            }
+            Input::Start { has_credentials } => {
+                if matches!(self.conn, Conn::Idle) {
+                    if has_credentials {
+                        self.connect_now(fx);
+                    } else {
+                        self.halt(HaltReason::NotEnrolled, fx);
+                    }
+                }
+            }
+            Input::Reconnect => match self.conn {
+                Conn::Disconnected => {
+                    fx.push(Effect::Cancel(TimerId::Reconnect));
+                    self.attempt = 0;
+                    self.connect_now(fx);
+                }
+                Conn::Halted(_) => {
+                    fx.push(Effect::Cancel(TimerId::HaltRetry));
+                    self.connect_now(fx);
+                }
+                _ => {}
+            },
+            Input::CredentialsChanged { has_credentials } => {
+                if let Conn::Halted(reason) = &self.conn {
+                    if has_credentials {
+                        self.connect_now(fx);
+                    } else if matches!(reason, HaltReason::NotEnrolled | HaltReason::AuthInvalid) {
+                        fx.push(Effect::Schedule {
+                            timer: TimerId::HaltRetry,
+                            after: HALT_RETRY,
+                        });
+                    }
+                }
+            }
+            Input::SocketOpened => {
+                if let Conn::Connecting { join_req: None } = self.conn {
+                    let req = self.alloc_req();
+                    self.conn = Conn::Connecting {
+                        join_req: Some(req),
+                    };
+                    fx.push(Effect::Send {
+                        req,
+                        request: Request::Join,
+                    });
+                }
+            }
+            Input::SocketClosed => match self.conn {
+                Conn::Connecting { .. } => self.fail_connect(None, fx),
+                Conn::Connected(_) => self.lose_connection(fx),
+                _ => {}
+            },
+            Input::Reply { req, result } => self.on_reply(req, result, fx),
+            Input::Timer(timer) => self.on_timer(timer, fx),
+            Input::Cursors(list) => self.on_cursors(list, fx),
+            other => self.on_session_input(other, fx),
+        }
+    }
+
+    fn connect_now(&mut self, fx: &mut Vec<Effect>) {
+        self.conn = Conn::Connecting { join_req: None };
+        fx.push(Effect::Emit(Lifecycle::ConnectionAttempted));
+        fx.push(Effect::OpenSocket);
+        fx.push(Effect::Schedule {
+            timer: TimerId::ConnectTimeout,
+            after: CONNECT_TIMEOUT,
+        });
+    }
+
+    fn fail_connect(&mut self, retry_after_ms: Option<u64>, fx: &mut Vec<Effect>) {
+        fx.push(Effect::Cancel(TimerId::ConnectTimeout));
+        let delay = match retry_after_ms {
+            Some(ms) => Duration::from_millis(ms),
+            None => connect_delay(self.attempt, self.jitter.next_unit()),
+        };
+        self.attempt = self.attempt.saturating_add(1);
+        self.conn = Conn::Disconnected;
+        fx.push(Effect::Schedule {
+            timer: TimerId::Reconnect,
+            after: delay,
+        });
+    }
+
+    fn lose_connection(&mut self, fx: &mut Vec<Effect>) {
+        fx.push(Effect::Emit(Lifecycle::ConnectionLost));
+        fx.push(Effect::CloseSocket);
+        fx.push(Effect::Cancel(TimerId::Heartbeat));
+        fx.push(Effect::Cancel(TimerId::StableReset));
+        let delay = connect_delay(self.attempt, self.jitter.next_unit());
+        self.attempt = self.attempt.saturating_add(1);
+        self.conn = Conn::Disconnected;
+        fx.push(Effect::Schedule {
+            timer: TimerId::Reconnect,
+            after: delay,
+        });
+    }
+
+    fn halt(&mut self, reason: HaltReason, fx: &mut Vec<Effect>) {
+        let code = match &reason {
+            HaltReason::NotEnrolled => "not_enrolled".to_string(),
+            HaltReason::AuthInvalid => "auth_invalid".to_string(),
+            HaltReason::UpdateRequired => "update_required".to_string(),
+            HaltReason::AccountDisabled => "account_disabled".to_string(),
+            HaltReason::Other(c) => c.clone(),
+        };
+        fx.push(Effect::Emit(Lifecycle::SyncError {
+            code,
+            scope: None,
+            doc_id: None,
+            fatal: true,
+        }));
+        if matches!(reason, HaltReason::NotEnrolled | HaltReason::AuthInvalid) {
+            fx.push(Effect::Schedule {
+                timer: TimerId::HaltRetry,
+                after: HALT_RETRY,
+            });
+        }
+        self.conn = Conn::Halted(reason);
+    }
+
+    fn halt_reason_for(e: &ServerError) -> Option<HaltReason> {
+        match e.code.as_str() {
+            "update_required" => Some(HaltReason::UpdateRequired),
+            "auth_invalid" => Some(HaltReason::AuthInvalid),
+            "account_disabled" => Some(HaltReason::AccountDisabled),
+            code if e.is_fatal => Some(HaltReason::Other(code.to_string())),
+            _ => None,
+        }
+    }
+
+    fn on_joined(&mut self, fx: &mut Vec<Effect>) {
+        fx.push(Effect::Cancel(TimerId::ConnectTimeout));
+        self.conn = Conn::Connected(Session {
+            phase: Some(Phase::LoadingCursors),
+            ..Default::default()
+        });
+        fx.push(Effect::Emit(Lifecycle::ConnectionSucceeded));
+        fx.push(Effect::Schedule {
+            timer: TimerId::Heartbeat,
+            after: HEARTBEAT_EVERY,
+        });
+        fx.push(Effect::Schedule {
+            timer: TimerId::StableReset,
+            after: STABLE_AFTER,
+        });
+        fx.push(Effect::LoadCursors);
+    }
+
+    fn on_reply(&mut self, req: u64, result: Result<Response, ServerError>, fx: &mut Vec<Effect>) {
+        if let Conn::Connecting { join_req: Some(j) } = self.conn {
+            if j == req {
+                match result {
+                    Ok(_) => self.on_joined(fx),
+                    Err(e) => match Self::halt_reason_for(&e) {
+                        Some(reason) => {
+                            fx.push(Effect::Cancel(TimerId::ConnectTimeout));
+                            fx.push(Effect::CloseSocket);
+                            self.halt(reason, fx);
+                        }
+                        None => {
+                            fx.push(Effect::CloseSocket);
+                            self.fail_connect(e.retry_after_ms, fx);
+                        }
+                    },
+                }
+            }
+            return;
+        }
+        let pending = match &mut self.conn {
+            Conn::Connected(s) => s.requests.remove(&req),
+            _ => None,
+        };
+        let Some(pending) = pending else { return };
+        fx.push(Effect::Cancel(TimerId::Request(req)));
+        match pending {
+            Pending::Heartbeat => fx.push(Effect::Cancel(TimerId::HeartbeatTimeout(req))),
+            other => self.on_session_reply(req, other, result, fx),
+        }
+    }
+
+    fn on_timer(&mut self, timer: TimerId, fx: &mut Vec<Effect>) {
+        match (&mut self.conn, timer) {
+            (Conn::Disconnected, TimerId::Reconnect) => self.connect_now(fx),
+            (Conn::Connecting { .. }, TimerId::ConnectTimeout) => {
+                fx.push(Effect::CloseSocket);
+                self.fail_connect(None, fx);
+            }
+            (Conn::Halted(_), TimerId::HaltRetry) => fx.push(Effect::CheckCredentials),
+            (Conn::Connected(_), TimerId::StableReset) => self.attempt = 0,
+            (Conn::Connected(s), TimerId::Heartbeat) => {
+                let req = self.next_req;
+                self.next_req += 1;
+                s.requests.insert(req, Pending::Heartbeat);
+                fx.push(Effect::Send {
+                    req,
+                    request: Request::Heartbeat,
+                });
+                fx.push(Effect::Schedule {
+                    timer: TimerId::HeartbeatTimeout(req),
+                    after: HEARTBEAT_TIMEOUT,
+                });
+                fx.push(Effect::Schedule {
+                    timer: TimerId::Heartbeat,
+                    after: HEARTBEAT_EVERY,
+                });
+            }
+            (Conn::Connected(s), TimerId::HeartbeatTimeout(req)) => {
+                if s.requests.remove(&req).is_some() {
+                    self.lose_connection(fx);
+                }
+            }
+            (Conn::Connected(_), other) => self.on_session_timer(other, fx),
+            _ => {}
+        }
+    }
+
+    fn on_cursors(&mut self, list: Vec<(Scope, Seq)>, fx: &mut Vec<Effect>) {
+        let Conn::Connected(s) = &mut self.conn else {
+            return;
+        };
+        if s.phase != Some(Phase::LoadingCursors) {
+            return;
+        }
+        for name in &self.scope_names {
+            let cursor = list.iter().find(|(n, _)| n == name).map_or(0, |(_, c)| *c);
+            s.cursors.insert(name.clone(), cursor);
+        }
+        s.phase = Some(Phase::CatchingUp);
+        fx.push(Effect::Emit(Lifecycle::SyncStarted));
+        for name in self.scope_names.clone() {
+            self.start_catch_up(&name, fx);
+        }
+        self.request_pump(fx);
+    }
+
+    // Filled in by Task 11.
+    fn start_catch_up(&mut self, _scope: &str, _fx: &mut Vec<Effect>) {}
+    fn on_session_reply(
+        &mut self,
+        _req: u64,
+        _p: Pending,
+        _r: Result<Response, ServerError>,
+        _fx: &mut Vec<Effect>,
+    ) {
+    }
+    fn on_session_timer(&mut self, _t: TimerId, _fx: &mut Vec<Effect>) {}
+    fn on_session_input(&mut self, _i: Input, _fx: &mut Vec<Effect>) {}
+    // Filled in by Task 12.
+    fn request_pump(&mut self, _fx: &mut Vec<Effect>) {}
 }
 
 #[cfg(test)]
@@ -440,5 +695,305 @@ mod skeleton_tests {
         let mut c = core();
         assert!(c.step(Input::OutboxChanged).is_empty());
         assert!(c.step(Input::SocketClosed).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::harness::*;
+    use super::*;
+
+    fn open_and_join(c: &mut Core) -> Vec<Effect> {
+        let fx = c.step(Input::SocketOpened);
+        let (req, request) = sends(&fx).pop().expect("join sent");
+        assert_eq!(request, Request::Join);
+        c.step(Input::Reply {
+            req,
+            result: Ok(Response::Joined),
+        })
+    }
+
+    #[test]
+    fn start_without_credentials_halts_not_enrolled_with_retry() {
+        let mut c = core();
+        let fx = c.step(Input::Start {
+            has_credentials: false,
+        });
+        assert_eq!(
+            c.state().connection,
+            ConnectionView::Halted(HaltReason::NotEnrolled)
+        );
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::HaltRetry,
+            after: Duration::from_secs(300)
+        }));
+        assert!(emitted(&fx)
+            .iter()
+            .any(|l| matches!(l, Lifecycle::SyncError { fatal: true, .. })));
+    }
+
+    #[test]
+    fn start_connects_and_emits_attempted_once() {
+        let mut c = core();
+        let fx = c.step(Input::Start {
+            has_credentials: true,
+        });
+        assert!(fx.contains(&Effect::OpenSocket));
+        assert_eq!(emitted(&fx), vec![Lifecycle::ConnectionAttempted]);
+        assert_eq!(c.state().connection, ConnectionView::Connecting);
+    }
+
+    #[test]
+    fn join_ok_connects_and_loads_cursors() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let fx = open_and_join(&mut c);
+        assert_eq!(emitted(&fx), vec![Lifecycle::ConnectionSucceeded]);
+        assert!(fx.contains(&Effect::LoadCursors));
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::Heartbeat,
+            after: Duration::from_secs(30)
+        }));
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::StableReset,
+            after: Duration::from_secs(60)
+        }));
+    }
+
+    #[test]
+    fn transient_join_error_backs_off_and_reconnects() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let fx = c.step(Input::SocketOpened);
+        let (req, _) = sends(&fx).pop().unwrap();
+        let fx = c.step(Input::Reply {
+            req,
+            result: Err(ServerError::new("internal")),
+        });
+        assert_eq!(c.state().connection, ConnectionView::Disconnected);
+        assert!(fx.iter().any(|e| matches!(e, Effect::Schedule { timer: TimerId::Reconnect, after } if *after < Duration::from_secs(1))));
+        let fx = c.step(Input::Timer(TimerId::Reconnect));
+        assert!(fx.contains(&Effect::OpenSocket));
+    }
+
+    #[test]
+    fn server_retry_after_overrides_backoff() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (req, _) = sends(&c.step(Input::SocketOpened)).pop().unwrap();
+        let err = ServerError {
+            retry_after_ms: Some(12_000),
+            ..ServerError::new("rate_limited")
+        };
+        let fx = c.step(Input::Reply {
+            req,
+            result: Err(err),
+        });
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::Reconnect,
+            after: Duration::from_millis(12_000)
+        }));
+    }
+
+    #[test]
+    fn update_required_halts_without_retry_timer() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (req, _) = sends(&c.step(Input::SocketOpened)).pop().unwrap();
+        let err = ServerError {
+            is_fatal: true,
+            ..ServerError::new("update_required")
+        };
+        let fx = c.step(Input::Reply {
+            req,
+            result: Err(err),
+        });
+        assert_eq!(
+            c.state().connection,
+            ConnectionView::Halted(HaltReason::UpdateRequired)
+        );
+        assert!(!fx.iter().any(|e| matches!(
+            e,
+            Effect::Schedule {
+                timer: TimerId::HaltRetry,
+                ..
+            }
+        )));
+        assert!(fx.contains(&Effect::CloseSocket));
+    }
+
+    #[test]
+    fn auth_invalid_retries_via_credential_check() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (req, _) = sends(&c.step(Input::SocketOpened)).pop().unwrap();
+        c.step(Input::Reply {
+            req,
+            result: Err(ServerError {
+                is_fatal: true,
+                ..ServerError::new("auth_invalid")
+            }),
+        });
+        let fx = c.step(Input::Timer(TimerId::HaltRetry));
+        assert_eq!(fx.first(), Some(&Effect::CheckCredentials));
+        let fx = c.step(Input::CredentialsChanged {
+            has_credentials: true,
+        });
+        assert!(fx.contains(&Effect::OpenSocket));
+    }
+
+    #[test]
+    fn unknown_code_follows_is_fatal() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (req, _) = sends(&c.step(Input::SocketOpened)).pop().unwrap();
+        c.step(Input::Reply {
+            req,
+            result: Err(ServerError {
+                is_fatal: true,
+                ..ServerError::new("weird")
+            }),
+        });
+        assert_eq!(
+            c.state().connection,
+            ConnectionView::Halted(HaltReason::Other("weird".into()))
+        );
+    }
+
+    #[test]
+    fn connect_timeout_counts_as_transient_failure() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let fx = c.step(Input::Timer(TimerId::ConnectTimeout));
+        assert!(fx.contains(&Effect::CloseSocket));
+        assert_eq!(c.state().connection, ConnectionView::Disconnected);
+    }
+
+    #[test]
+    fn socket_closed_while_connected_emits_connection_lost_once() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        open_and_join(&mut c);
+        let fx = c.step(Input::SocketClosed);
+        assert_eq!(emitted(&fx), vec![Lifecycle::ConnectionLost]);
+        assert!(emitted(&c.step(Input::SocketClosed)).is_empty());
+    }
+
+    #[test]
+    fn heartbeat_timeout_drops_connection() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        open_and_join(&mut c);
+        let fx = c.step(Input::Timer(TimerId::Heartbeat));
+        let (req, request) = sends(&fx).pop().unwrap();
+        assert_eq!(request, Request::Heartbeat);
+        let fx = c.step(Input::Timer(TimerId::HeartbeatTimeout(req)));
+        assert_eq!(emitted(&fx), vec![Lifecycle::ConnectionLost]);
+    }
+
+    #[test]
+    fn heartbeat_reply_cancels_timeout() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        open_and_join(&mut c);
+        let (req, _) = sends(&c.step(Input::Timer(TimerId::Heartbeat)))
+            .pop()
+            .unwrap();
+        let fx = c.step(Input::Reply {
+            req,
+            result: Ok(Response::HeartbeatOk),
+        });
+        assert!(fx.contains(&Effect::Cancel(TimerId::HeartbeatTimeout(req))));
+    }
+
+    #[test]
+    fn stale_heartbeat_timeout_after_reconnect_is_ignored() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        open_and_join(&mut c);
+        let (old_req, _) = sends(&c.step(Input::Timer(TimerId::Heartbeat)))
+            .pop()
+            .unwrap();
+        c.step(Input::SocketClosed);
+        c.step(Input::Reconnect);
+        open_and_join(&mut c);
+        let fx = c.step(Input::Timer(TimerId::HeartbeatTimeout(old_req)));
+        assert!(emitted(&fx).is_empty());
+        assert_eq!(c.state().connection, ConnectionView::Connected);
+    }
+
+    #[test]
+    fn reconnect_is_noop_while_connecting_or_connected() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        assert!(!c.step(Input::Reconnect).contains(&Effect::OpenSocket));
+        open_and_join(&mut c);
+        assert!(!c.step(Input::Reconnect).contains(&Effect::OpenSocket));
+    }
+
+    #[test]
+    fn stable_reset_zeroes_attempts() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        for _ in 0..5 {
+            c.step(Input::Timer(TimerId::ConnectTimeout));
+            c.step(Input::Timer(TimerId::Reconnect));
+        }
+        open_and_join(&mut c);
+        c.step(Input::Timer(TimerId::StableReset));
+        let fx = c.step(Input::SocketClosed);
+        assert!(fx.iter().any(|e| matches!(e, Effect::Schedule { timer: TimerId::Reconnect, after } if *after < Duration::from_secs(1))));
+    }
+
+    #[test]
+    fn shutdown_stops_everything() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        open_and_join(&mut c);
+        let fx = c.step(Input::Shutdown);
+        assert!(fx.contains(&Effect::CloseSocket));
+        assert_eq!(c.state().connection, ConnectionView::Stopped);
+        assert!(c.step(Input::Reconnect).is_empty());
+        assert!(c.step(Input::Timer(TimerId::Heartbeat)).is_empty());
+    }
+
+    #[test]
+    fn shutdown_before_start_stops() {
+        let mut c = core();
+        c.step(Input::Shutdown);
+        assert_eq!(c.state().connection, ConnectionView::Stopped);
+        assert!(c
+            .step(Input::Start {
+                has_credentials: true
+            })
+            .is_empty());
     }
 }
