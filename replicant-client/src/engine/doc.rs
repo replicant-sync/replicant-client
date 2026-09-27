@@ -187,6 +187,10 @@ pub(crate) fn conflict_ops(snap: &DocSnapshot) -> Vec<DocOp> {
     ops
 }
 
+pub(crate) fn delete_pending(snap: &DocSnapshot) -> bool {
+    snap.soft_deleted || snap.rows.last().is_some_and(|r| r.kind == RowKind::Delete)
+}
+
 fn membership_seq(snap: &DocSnapshot, scope: &str) -> Seq {
     snap.memberships
         .iter()
@@ -223,6 +227,11 @@ fn apply_upsert(snap: &DocSnapshot, doc: &DocEnvelope, seq: Seq) -> Vec<DocOp> {
     if !pending {
         ops.push(DocOp::SetShadow(new_shadow));
         ops.push(DocOp::SetContent(doc.content.clone()));
+        return ops;
+    }
+    // The pending delete is unconditional and will win; leave content and rows untouched.
+    if delete_pending(snap) {
+        ops.push(DocOp::SetShadow(new_shadow));
         return ops;
     }
     let content = match &snap.shadow {
@@ -306,6 +315,7 @@ pub fn apply_change(snap: &DocSnapshot, change: &Change, me: Uuid) -> Vec<DocOp>
             }
         }
         (ChangeKind::Upsert, None) => {
+            debug_assert!(change.doc.is_some(), "upsert without doc");
             if is_member(&ops) {
                 if let Some(doc) = &change.doc {
                     ops.extend(apply_upsert(snap, doc, change.seq));
@@ -338,7 +348,7 @@ fn apply_delete(snap: &DocSnapshot, seq: Seq, is_echo: bool) -> Vec<DocOp> {
 
 /// `get_document` reported the document as deleted on the server (tombstoned).
 pub fn apply_server_deleted(snap: &DocSnapshot, seq: Seq) -> Vec<DocOp> {
-    apply_delete(snap, seq, false)
+    apply_delete(snap, seq.max(snap.server_seq()), false)
 }
 
 pub fn apply_server_copy(snap: &DocSnapshot, doc: &DocEnvelope, _me: Uuid) -> Vec<DocOp> {
@@ -355,6 +365,8 @@ pub fn apply_server_missing(snap: &DocSnapshot) -> Vec<DocOp> {
     match snap.rows.last() {
         None => Vec::new(),
         Some(r) if r.kind == RowKind::Delete => vec![DocOp::DropAllRows, DocOp::HardDelete],
+        // build_upload resolves the marker into a create when there is no shadow, or into an
+        // update when a shadow exists (the "exists and mine" flow).
         Some(_) => vec![DocOp::DropAllRows, DocOp::InsertMarker(RowKind::Create)],
     }
 }
@@ -673,6 +685,23 @@ mod apply_change_tests {
     }
 
     #[test]
+    fn upsert_conflict_on_soft_deleted_keeps_delete_pending() {
+        let mut s = synced(json!({"a": {"x": 1}}), 1);
+        s.content = json!({"a": {"x": 2}});
+        s.soft_deleted = true;
+        s.rows = vec![row(5, RowKind::Update), row(6, RowKind::Delete)];
+        let ops = apply_change(&s, &upsert("own", json!({}), 2), ME);
+        assert!(!ops.iter().any(|o| matches!(
+            o,
+            DocOp::Recover { .. } | DocOp::SetContent(_) | DocOp::Emit(_)
+        )));
+        let after = s.project(&ops);
+        assert_eq!(after.rows, s.rows);
+        assert_eq!(after.content, s.content);
+        assert_eq!(after.shadow.unwrap().seq, 2);
+    }
+
+    #[test]
     fn null_shadow_keeps_local_content() {
         let mut s = synced(json!({"mine": 1}), 0);
         s.shadow = None;
@@ -967,6 +996,30 @@ mod echo_and_delete_tests {
         let after = s.project(&ops);
         assert!(!after.exists);
         assert_eq!(after.tombstone_seq, Some(9));
+    }
+
+    #[test]
+    fn server_deleted_never_moves_tombstone_backwards() {
+        let s = DocSnapshot {
+            tombstone_seq: Some(20),
+            ..empty()
+        };
+        assert_eq!(
+            s.project(&apply_server_deleted(&s, 5)).tombstone_seq,
+            Some(20)
+        );
+        let s = synced(sample(), 7);
+        assert_eq!(
+            s.project(&apply_server_deleted(&s, 0)).tombstone_seq,
+            Some(7)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "upsert without doc")]
+    fn upsert_without_doc_is_a_bug() {
+        let s = synced(sample(), 1);
+        apply_change(&s, &kind_change("own", ChangeKind::Upsert, 2), ME);
     }
 }
 

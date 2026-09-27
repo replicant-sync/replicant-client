@@ -2,8 +2,8 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::doc::{
-    conflict_ops, with_settle_invariant, DocEvent, DocOp, DocSnapshot, RecoverReason, RowKind,
-    Shadow,
+    conflict_ops, delete_pending, with_settle_invariant, DocEvent, DocOp, DocSnapshot,
+    RecoverReason, RowKind, Shadow,
 };
 use super::types::{DocEnvelope, Seq, ServerError, Upload, UploadKind};
 
@@ -131,7 +131,14 @@ pub fn settle(
         }
         Err(e) => match e.code.as_str() {
             "hash_mismatch" if mismatch_attempts >= MAX_MISMATCH_ATTEMPTS => {
-                SettleResult::Ops(conflict_ops(snap))
+                if delete_pending(snap) {
+                    SettleResult::Ops(vec![
+                        DocOp::DropAllRows,
+                        DocOp::InsertMarker(RowKind::Delete),
+                    ])
+                } else {
+                    SettleResult::Ops(conflict_ops(snap))
+                }
             }
             "hash_mismatch" => {
                 let shadow_current =
@@ -449,6 +456,22 @@ mod upload_tests {
             reason: RecoverReason::Conflict
         }));
         assert_eq!(s.project(&ops).content, json!({"a": 1}));
+    }
+
+    #[test]
+    fn mismatch_conflict_on_soft_deleted_requeues_delete() {
+        let mut s = synced(json!({"a": 1}), 1);
+        s.content = json!({"a": 2});
+        s.soft_deleted = true;
+        s.rows = vec![row(1, RowKind::Update), row(2, RowKind::Delete)];
+        let f = inflight_update(vec![m(1)], json!({"a": 2}));
+        assert_eq!(
+            settle(&s, &f, &Err(mismatch("x")), ME, MAX_MISMATCH_ATTEMPTS),
+            SettleResult::Ops(vec![
+                DocOp::DropAllRows,
+                DocOp::InsertMarker(RowKind::Delete)
+            ])
+        );
     }
 
     #[test]
