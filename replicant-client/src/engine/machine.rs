@@ -115,7 +115,8 @@ pub enum ApplyTag {
     Page(u64),
     Push,
     SnapshotPage(u64),
-    SnapshotFinish,
+    /// Carries the req of the scope's last snapshot page.
+    SnapshotFinish(u64),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -230,11 +231,12 @@ pub enum Effect {
         docs: Vec<DocEnvelope>,
         tag: ApplyTag,
     },
-    /// Answered with `Input::Applied { tag: ApplyTag::SnapshotFinish, .. }`.
+    /// Answered with `Input::Applied` echoing `tag` (an `ApplyTag::SnapshotFinish`).
     FinishSnapshot {
         scope: Scope,
         seen: Vec<Uuid>,
         snapshot_seq: Seq,
+        tag: ApplyTag,
     },
     /// Answered with `Input::PendingDocs`.
     LoadPending,
@@ -286,6 +288,7 @@ enum ScopeSync {
         next_page: Option<String>,
     },
     SnapshotFinishing {
+        req: u64,
         snapshot_seq: Seq,
     },
     RetryWait,
@@ -348,7 +351,6 @@ enum Conn {
 }
 
 pub struct Core {
-    me: Uuid,
     scope_names: Vec<Scope>,
     conn: Conn,
     attempt: u32,
@@ -358,9 +360,8 @@ pub struct Core {
 }
 
 impl Core {
-    pub fn new(me: Uuid, scopes: Vec<Scope>, seed: u64) -> Self {
+    pub fn new(scopes: Vec<Scope>, seed: u64) -> Self {
         Core {
-            me,
             scope_names: scopes,
             conn: Conn::Idle,
             attempt: 0,
@@ -1025,17 +1026,23 @@ impl Core {
                     None => {
                         let (seen, snapshot_seq) =
                             s.snapshot_seen.remove(&scope).unwrap_or_default();
-                        s.scopes
-                            .insert(scope.clone(), ScopeSync::SnapshotFinishing { snapshot_seq });
+                        s.scopes.insert(
+                            scope.clone(),
+                            ScopeSync::SnapshotFinishing { req, snapshot_seq },
+                        );
                         fx.push(Effect::FinishSnapshot {
                             scope,
                             seen,
                             snapshot_seq,
+                            tag: ApplyTag::SnapshotFinish(req),
                         });
                     }
                 }
             }
-            (Some(ScopeSync::SnapshotFinishing { snapshot_seq }), ApplyTag::SnapshotFinish) => {
+            (
+                Some(ScopeSync::SnapshotFinishing { req, snapshot_seq }),
+                ApplyTag::SnapshotFinish(t),
+            ) if req == t => {
                 s.cursors.insert(scope.clone(), snapshot_seq);
                 self.request_changes(&scope, snapshot_seq, fx);
             }
@@ -1302,7 +1309,7 @@ pub(crate) mod harness {
     pub const ME: Uuid = Uuid::from_u128(0xA);
 
     pub fn core() -> Core {
-        Core::new(ME, vec!["own".into(), "collection:curated".into()], 7)
+        Core::new(vec!["own".into(), "collection:curated".into()], 7)
     }
 
     /// The driver's answer for the socket the core most recently opened.
@@ -1922,11 +1929,12 @@ mod catch_up_tests {
         assert!(fx.contains(&Effect::FinishSnapshot {
             scope: "own".into(),
             seen: vec![],
-            snapshot_seq: 40
+            snapshot_seq: 40,
+            tag: ApplyTag::SnapshotFinish(snap_req),
         }));
         let fx = c.step(Input::Applied {
             scope: "own".into(),
-            tag: ApplyTag::SnapshotFinish,
+            tag: ApplyTag::SnapshotFinish(snap_req),
         });
         assert!(sends(&fx).iter().any(|(_, r)| *r
             == Request::GetChangesSince {
@@ -2108,10 +2116,11 @@ mod catch_up_tests {
                 scope: scope.clone(),
                 seen: vec![],
                 snapshot_seq: 0,
+                tag: ApplyTag::SnapshotFinish(snap_req),
             }));
             let fx = c.step(Input::Applied {
                 scope: scope.clone(),
-                tag: ApplyTag::SnapshotFinish,
+                tag: ApplyTag::SnapshotFinish(snap_req),
             });
             assert!(sends(&fx).iter().any(|(_, r)| *r
                 == Request::GetChangesSince {
@@ -2134,6 +2143,45 @@ mod catch_up_tests {
             });
         }
         assert_eq!(c.state().sync, SyncView::Live);
+    }
+
+    #[test]
+    fn stale_snapshot_finish_is_ignored() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![("collection:curated".into(), 4)]));
+        let (req, _) = sends(&fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetSnapshot { .. }))
+            .unwrap();
+        c.step(Input::Reply {
+            req,
+            result: Ok(Response::SnapshotPage {
+                docs: vec![],
+                snapshot_seq: 6,
+                next_page_token: None,
+            }),
+        });
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::SnapshotPage(req),
+        });
+        assert!(fx.contains(&Effect::FinishSnapshot {
+            scope: "own".into(),
+            seen: vec![],
+            snapshot_seq: 6,
+            tag: ApplyTag::SnapshotFinish(req),
+        }));
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::SnapshotFinish(req + 1000),
+        });
+        assert!(sends(&fx).is_empty());
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::SnapshotFinish(req),
+        });
+        assert!(changes_req(&fx, "own") > req);
     }
 
     #[test]

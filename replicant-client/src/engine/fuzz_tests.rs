@@ -1,5 +1,3 @@
-use uuid::Uuid;
-
 use super::backoff::Jitter;
 use super::machine::*;
 
@@ -54,6 +52,8 @@ fn next_input(rng: &mut Jitter, outstanding: &mut Vec<(u64, Request)>, socket_ge
         };
         return Input::Reply { req, result };
     }
+    // Usually stale; occasionally matches a live snapshot finish.
+    let finish_req = (rng.next_unit() * 50.0) as u64;
     let closed_gen = if rng.next_unit() < 0.5 {
         socket_gen
     } else {
@@ -82,11 +82,11 @@ fn next_input(rng: &mut Jitter, outstanding: &mut Vec<(u64, Request)>, socket_ge
             },
             Input::Applied {
                 scope: "own".into(),
-                tag: ApplyTag::SnapshotFinish,
+                tag: ApplyTag::SnapshotFinish(finish_req),
             },
             Input::Applied {
                 scope: "collection:curated".into(),
-                tag: ApplyTag::SnapshotFinish,
+                tag: ApplyTag::SnapshotFinish(finish_req),
             },
         ],
     )
@@ -132,13 +132,10 @@ impl Harness {
                     Effect::Send { req, request } => self.outstanding.push((req, request)),
                     Effect::Emit(l) => self.events.push(l),
                     Effect::ApplyChanges { scope, tag, .. }
-                    | Effect::ApplySnapshotPage { scope, tag, .. } => {
+                    | Effect::ApplySnapshotPage { scope, tag, .. }
+                    | Effect::FinishSnapshot { scope, tag, .. } => {
                         queue.push_back(Input::Applied { scope, tag })
                     }
-                    Effect::FinishSnapshot { scope, .. } => queue.push_back(Input::Applied {
-                        scope,
-                        tag: ApplyTag::SnapshotFinish,
-                    }),
                     Effect::CheckCredentials => queue.push_back(Input::CredentialsChanged {
                         has_credentials: true,
                     }),
@@ -157,11 +154,7 @@ fn random_sequences_preserve_connection_and_ordering_invariants() {
     for seed in 1..=2000u64 {
         let mut rng = Jitter::new(seed * 7919);
         let mut h = Harness {
-            core: Core::new(
-                Uuid::from_u128(0xA),
-                vec!["own".into(), "collection:curated".into()],
-                seed,
-            ),
+            core: Core::new(vec!["own".into(), "collection:curated".into()], seed),
             seed,
             outstanding: Vec::new(),
             socket_open: false,
