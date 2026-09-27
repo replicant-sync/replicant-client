@@ -252,6 +252,10 @@ pub enum Effect {
         doc_id: Uuid,
         seq: Seq,
     },
+    /// Driver deletes the subscription row; no reply.
+    DropSubscription {
+        scope: Scope,
+    },
     Emit(Lifecycle),
     SetState(EngineState),
 }
@@ -279,6 +283,8 @@ enum ScopeSync {
     },
     RetryWait,
     Live,
+    /// Server rejected the subscription; treated as done, pushes ignored.
+    Dropped,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -311,7 +317,7 @@ struct Session {
     backing_off: HashSet<Uuid>,
     doc_failures: HashMap<Uuid, u32>,
     mismatch_attempts: HashMap<Uuid, u32>,
-    catch_up_failures: u32,
+    catch_up_failures: HashMap<Scope, u32>,
     pump_scheduled: bool,
 }
 
@@ -637,10 +643,13 @@ impl Core {
     }
 
     fn start_catch_up(&mut self, scope: &str, fx: &mut Vec<Effect>) {
-        let req = self.alloc_req();
-        let Some(s) = self.session() else { return };
-        let cursor = *s.cursors.get(scope).unwrap_or(&0);
+        let cursor = match self.session() {
+            Some(s) => *s.cursors.get(scope).unwrap_or(&0),
+            None => return,
+        };
         if cursor == 0 {
+            let req = self.alloc_req();
+            let Some(s) = self.session() else { return };
             s.scopes
                 .insert(scope.to_string(), ScopeSync::SnapshotRequesting { req });
             s.snapshot_seen.insert(scope.to_string(), (Vec::new(), 0));
@@ -657,24 +666,34 @@ impl Core {
                     page_token: None,
                 },
             });
-        } else {
-            s.scopes
-                .insert(scope.to_string(), ScopeSync::Requesting { req });
-            s.requests.insert(
-                req,
-                Pending::Changes {
-                    scope: scope.to_string(),
-                },
-            );
-            fx.push(Effect::Send {
-                req,
-                request: Request::GetChangesSince {
-                    scope: scope.to_string(),
-                    cursor,
-                    limit: PAGE_LIMIT,
-                },
+            fx.push(Effect::Schedule {
+                timer: TimerId::Request(req),
+                after: REQUEST_TIMEOUT,
             });
+        } else {
+            self.request_changes(scope, cursor, fx);
         }
+    }
+
+    fn request_changes(&mut self, scope: &str, cursor: Seq, fx: &mut Vec<Effect>) {
+        let req = self.alloc_req();
+        let Some(s) = self.session() else { return };
+        s.scopes
+            .insert(scope.to_string(), ScopeSync::Requesting { req });
+        s.requests.insert(
+            req,
+            Pending::Changes {
+                scope: scope.to_string(),
+            },
+        );
+        fx.push(Effect::Send {
+            req,
+            request: Request::GetChangesSince {
+                scope: scope.to_string(),
+                cursor,
+                limit: PAGE_LIMIT,
+            },
+        });
         fx.push(Effect::Schedule {
             timer: TimerId::Request(req),
             after: REQUEST_TIMEOUT,
@@ -710,19 +729,52 @@ impl Core {
         });
     }
 
-    fn fail_catch_up(&mut self, scope: &str, fx: &mut Vec<Effect>) {
-        let Some(s) = self.session() else { return };
-        s.catch_up_failures += 1;
-        if s.catch_up_failures >= MAX_CATCH_UP_FAILURES {
+    fn fail_catch_up(&mut self, scope: &str, err: Option<&ServerError>, fx: &mut Vec<Effect>) {
+        let count = {
+            let Some(s) = self.session() else { return };
+            let count = s.catch_up_failures.entry(scope.to_string()).or_insert(0);
+            *count += 1;
+            *count
+        };
+        if count >= MAX_CATCH_UP_FAILURES {
             self.lose_connection(fx);
             return;
         }
-        let delay = catch_up_retry_delay(s.catch_up_failures);
+        let delay = match err.and_then(|e| e.retry_after_ms) {
+            Some(ms) => Duration::from_millis(ms),
+            None => catch_up_retry_delay(count),
+        };
+        let Some(s) = self.session() else { return };
         s.scopes.insert(scope.to_string(), ScopeSync::RetryWait);
         fx.push(Effect::Schedule {
             timer: TimerId::CatchUpRetry(scope.to_string()),
             after: delay,
         });
+    }
+
+    /// A fatal server error ends the Connected period like `lose_connection`, then halts
+    /// instead of scheduling a reconnect.
+    fn catch_up_fatal(&mut self, reason: HaltReason, fx: &mut Vec<Effect>) {
+        fx.push(Effect::Emit(Lifecycle::ConnectionLost));
+        fx.push(Effect::CloseSocket);
+        fx.push(Effect::Cancel(TimerId::Heartbeat));
+        fx.push(Effect::Cancel(TimerId::StableReset));
+        self.halt(reason, fx);
+    }
+
+    fn drop_subscription(&mut self, scope: &str, code: String, fx: &mut Vec<Effect>) {
+        fx.push(Effect::Emit(Lifecycle::SyncError {
+            code,
+            scope: Some(scope.to_string()),
+            doc_id: None,
+            fatal: false,
+        }));
+        fx.push(Effect::DropSubscription {
+            scope: scope.to_string(),
+        });
+        let Some(s) = self.session() else { return };
+        s.scopes.insert(scope.to_string(), ScopeSync::Dropped);
+        self.check_all_live(fx);
     }
 
     fn on_session_reply(
@@ -756,7 +808,15 @@ impl Core {
                     }
                     self.request_snapshot_page(&scope, None, fx);
                 }
-                _ => self.fail_catch_up(&scope, fx),
+                Err(e) if Self::halt_reason_for(&e).is_some() => {
+                    let reason = Self::halt_reason_for(&e).unwrap();
+                    self.catch_up_fatal(reason, fx);
+                }
+                Err(e) if e.code == "subscription_forbidden" => {
+                    self.drop_subscription(&scope, e.code, fx);
+                }
+                Err(e) => self.fail_catch_up(&scope, Some(&e), fx),
+                Ok(_) => self.fail_catch_up(&scope, None, fx),
             },
             Pending::Snapshot { scope } => match result {
                 Ok(Response::SnapshotPage {
@@ -786,7 +846,15 @@ impl Core {
                         tag: ApplyTag::SnapshotPage(req),
                     });
                 }
-                _ => self.fail_catch_up(&scope, fx),
+                Err(e) if Self::halt_reason_for(&e).is_some() => {
+                    let reason = Self::halt_reason_for(&e).unwrap();
+                    self.catch_up_fatal(reason, fx);
+                }
+                Err(e) if e.code == "subscription_forbidden" => {
+                    self.drop_subscription(&scope, e.code, fx);
+                }
+                Err(e) => self.fail_catch_up(&scope, Some(&e), fx),
+                Ok(_) => self.fail_catch_up(&scope, None, fx),
             },
             // Filled in by Task 12.
             Pending::Upload { .. } | Pending::Document { .. } => {}
@@ -808,7 +876,7 @@ impl Core {
                 let pending = self.session().and_then(|s| s.requests.remove(&req));
                 match pending {
                     Some(Pending::Changes { scope }) | Some(Pending::Snapshot { scope }) => {
-                        self.fail_catch_up(&scope, fx)
+                        self.fail_catch_up(&scope, None, fx)
                     }
                     Some(other) => self.on_request_timeout(other, fx),
                     None => {}
@@ -834,6 +902,7 @@ impl Core {
         let scope = change.scope.clone();
         match s.scopes.get(&scope) {
             Some(ScopeSync::Live) => {}
+            Some(ScopeSync::Dropped) => return,
             Some(_) => {
                 s.buffered.entry(scope).or_default().push(change);
                 return;
@@ -889,7 +958,7 @@ impl Core {
             }
             (Some(ScopeSync::SnapshotFinishing { snapshot_seq }), ApplyTag::SnapshotFinish) => {
                 s.cursors.insert(scope.clone(), snapshot_seq);
-                self.start_catch_up(&scope, fx);
+                self.request_changes(&scope, snapshot_seq, fx);
             }
             _ => {} // push applies and stale tags
         }
@@ -899,6 +968,7 @@ impl Core {
     fn finish_scope(&mut self, scope: &str, fx: &mut Vec<Effect>) {
         let Some(s) = self.session() else { return };
         s.scopes.insert(scope.to_string(), ScopeSync::Live);
+        s.catch_up_failures.remove(scope);
         let mut buffered = s.buffered.remove(scope).unwrap_or_default();
         buffered.sort_by_key(|c| c.seq);
         for change in buffered {
@@ -919,12 +989,13 @@ impl Core {
         if s.phase != Some(Phase::CatchingUp) {
             return;
         }
-        if names
-            .iter()
-            .all(|n| s.scopes.get(n) == Some(&ScopeSync::Live))
-        {
+        if names.iter().all(|n| {
+            matches!(
+                s.scopes.get(n),
+                Some(ScopeSync::Live) | Some(ScopeSync::Dropped)
+            )
+        }) {
             s.phase = Some(Phase::Live);
-            s.catch_up_failures = 0;
             if !s.synced_once {
                 s.synced_once = true;
                 fx.push(Effect::Emit(Lifecycle::SyncCompleted));
@@ -1681,5 +1752,180 @@ mod catch_up_tests {
             ("collection:curated".into(), 5),
         ]));
         assert_eq!(emitted(&fx), vec![Lifecycle::SyncStarted]);
+    }
+
+    #[test]
+    fn empty_scope_snapshot_goes_live() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![]));
+        let snap_reqs: Vec<(String, u64)> = ["own", "collection:curated"]
+            .iter()
+            .map(|scope| {
+                let (req, _) = sends(&fx)
+                    .into_iter()
+                    .find(
+                        |(_, r)| matches!(r, Request::GetSnapshot { scope: s, .. } if s == *scope),
+                    )
+                    .unwrap();
+                (scope.to_string(), req)
+            })
+            .collect();
+        for (scope, snap_req) in snap_reqs {
+            c.step(Input::Reply {
+                req: snap_req,
+                result: Ok(Response::SnapshotPage {
+                    docs: vec![],
+                    snapshot_seq: 0,
+                    next_page_token: None,
+                }),
+            });
+            let fx = c.step(Input::Applied {
+                scope: scope.clone(),
+                tag: ApplyTag::SnapshotPage(snap_req),
+            });
+            assert!(fx.contains(&Effect::FinishSnapshot {
+                scope: scope.clone(),
+                seen: vec![],
+                snapshot_seq: 0,
+            }));
+            let fx = c.step(Input::Applied {
+                scope: scope.clone(),
+                tag: ApplyTag::SnapshotFinish,
+            });
+            assert!(sends(&fx).iter().any(|(_, r)| *r
+                == Request::GetChangesSince {
+                    scope: scope.clone(),
+                    cursor: 0,
+                    limit: 500,
+                }));
+            let page_req = changes_req(&fx, &scope);
+            c.step(Input::Reply {
+                req: page_req,
+                result: Ok(Response::Changes {
+                    changes: vec![],
+                    next_cursor: 0,
+                    has_more: false,
+                }),
+            });
+            c.step(Input::Applied {
+                scope: scope.clone(),
+                tag: ApplyTag::Page(page_req),
+            });
+        }
+        assert_eq!(c.state().sync, SyncView::Live);
+    }
+
+    #[test]
+    fn failures_in_different_scopes_count_separately() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        let own = changes_req(&fx, "own");
+        let cur = changes_req(&fx, "collection:curated");
+        let fx = c.step(Input::Reply {
+            req: own,
+            result: Err(ServerError::new("internal")),
+        });
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::CatchUpRetry("own".into()),
+            after: Duration::from_secs(1),
+        }));
+        let fx = c.step(Input::Reply {
+            req: cur,
+            result: Err(ServerError::new("internal")),
+        });
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::CatchUpRetry("collection:curated".into()),
+            after: Duration::from_secs(1),
+        }));
+    }
+
+    #[test]
+    fn catch_up_honours_retry_after() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        let own = changes_req(&fx, "own");
+        let err = ServerError {
+            retry_after_ms: Some(7_000),
+            ..ServerError::new("rate_limited")
+        };
+        let fx = c.step(Input::Reply {
+            req: own,
+            result: Err(err),
+        });
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::CatchUpRetry("own".into()),
+            after: Duration::from_secs(7),
+        }));
+    }
+
+    #[test]
+    fn fatal_catch_up_error_halts() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        let own = changes_req(&fx, "own");
+        let err = ServerError {
+            is_fatal: true,
+            ..ServerError::new("auth_invalid")
+        };
+        let fx = c.step(Input::Reply {
+            req: own,
+            result: Err(err),
+        });
+        let em = emitted(&fx);
+        assert_eq!(em.first(), Some(&Lifecycle::ConnectionLost));
+        assert!(em
+            .iter()
+            .any(|l| matches!(l, Lifecycle::SyncError { fatal: true, .. })));
+        assert_eq!(
+            c.state().connection,
+            ConnectionView::Halted(HaltReason::AuthInvalid)
+        );
+    }
+
+    #[test]
+    fn subscription_forbidden_drops_scope() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        let own = changes_req(&fx, "own");
+        let cur = changes_req(&fx, "collection:curated");
+        let fx = c.step(Input::Reply {
+            req: cur,
+            result: Err(ServerError::new("subscription_forbidden")),
+        });
+        assert!(fx.contains(&Effect::DropSubscription {
+            scope: "collection:curated".into(),
+        }));
+        c.step(Input::Reply {
+            req: own,
+            result: Ok(Response::Changes {
+                changes: vec![],
+                next_cursor: 5,
+                has_more: false,
+            }),
+        });
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::Page(own),
+        });
+        assert_eq!(emitted(&fx), vec![Lifecycle::SyncCompleted]);
+        let fx = c.step(Input::Push(change("collection:curated", 6, 5)));
+        assert!(!fx.iter().any(|e| matches!(e, Effect::ApplyChanges { .. })));
     }
 }
