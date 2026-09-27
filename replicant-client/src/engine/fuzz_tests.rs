@@ -13,6 +13,13 @@ fn next_input(rng: &mut Jitter, outstanding: &mut Vec<(u64, Request)>) -> Input 
     if roll < 0.45 && !outstanding.is_empty() {
         let i = (rng.next_unit() * outstanding.len() as f64) as usize;
         let (req, request) = outstanding.remove(i);
+        if rng.next_unit() < 0.15 {
+            return Input::Timer(if request == Request::Heartbeat {
+                TimerId::HeartbeatTimeout(req)
+            } else {
+                TimerId::Request(req)
+            });
+        }
         let ok = rng.next_unit() < 0.8;
         let result = match (request, ok) {
             (Request::Join, true) => Ok(Response::Joined),
@@ -27,10 +34,22 @@ fn next_input(rng: &mut Jitter, outstanding: &mut Vec<(u64, Request)>) -> Input 
                 snapshot_seq: 10,
                 next_page_token: None,
             }),
-            (_, _) => Err(super::types::ServerError::new(pick(
-                rng,
-                &["internal", "cursor_too_old", "rate_limited"],
-            ))),
+            (_, _) => {
+                let code = pick(
+                    rng,
+                    &[
+                        "internal",
+                        "cursor_too_old",
+                        "rate_limited",
+                        "auth_invalid",
+                        "update_required",
+                        "subscription_forbidden",
+                    ],
+                );
+                let mut err = super::types::ServerError::new(code);
+                err.is_fatal = matches!(code, "auth_invalid" | "update_required");
+                Err(err)
+            }
         };
         return Input::Reply { req, result };
     }
@@ -46,7 +65,10 @@ fn next_input(rng: &mut Jitter, outstanding: &mut Vec<(u64, Request)>) -> Input 
             Input::Timer(TimerId::Heartbeat),
             Input::Timer(TimerId::StableReset),
             Input::Timer(TimerId::Pump),
+            Input::Timer(TimerId::PumpCap),
+            Input::Timer(TimerId::HaltRetry),
             Input::Timer(TimerId::CatchUpRetry("own".into())),
+            Input::Timer(TimerId::CatchUpRetry("collection:curated".into())),
             Input::Cursors(vec![("own".into(), 3), ("collection:curated".into(), 0)]),
             Input::Applied {
                 scope: "own".into(),
@@ -101,6 +123,9 @@ impl Harness {
                         scope,
                         tag: ApplyTag::SnapshotFinish,
                     }),
+                    Effect::CheckCredentials => queue.push_back(Input::CredentialsChanged {
+                        has_credentials: true,
+                    }),
                     _ => {}
                 }
             }
@@ -110,6 +135,9 @@ impl Harness {
 
 #[test]
 fn random_sequences_preserve_connection_and_ordering_invariants() {
+    let mut fatal_errors = 0u64;
+    let mut sync_completed = 0u64;
+    let mut connection_lost = 0u64;
     for seed in 1..=2000u64 {
         let mut rng = Jitter::new(seed * 7919);
         let mut h = Harness {
@@ -131,12 +159,40 @@ fn random_sequences_preserve_connection_and_ordering_invariants() {
             h.feed(input);
         }
         assert_ordering(seed, &h.events);
+        for e in &h.events {
+            match e {
+                Lifecycle::SyncError { fatal: true, .. } => fatal_errors += 1,
+                Lifecycle::SyncCompleted => sync_completed += 1,
+                Lifecycle::ConnectionLost => connection_lost += 1,
+                _ => {}
+            }
+        }
         h.feed(Input::Shutdown);
-        assert!(
-            h.core.step(Input::Reconnect).is_empty(),
-            "seed {seed}: effects after shutdown"
-        );
+        for input in [
+            Input::Reconnect,
+            Input::SocketOpened,
+            Input::Timer(TimerId::Reconnect),
+            Input::Timer(TimerId::HaltRetry),
+            Input::Timer(TimerId::Heartbeat),
+        ] {
+            assert!(
+                h.core.step(input.clone()).is_empty(),
+                "seed {seed}: {input:?} produced effects after shutdown"
+            );
+        }
     }
+    assert!(
+        fatal_errors >= 1,
+        "harness never produced a fatal SyncError (auth_invalid/update_required never reached); count = {fatal_errors}"
+    );
+    assert!(
+        sync_completed >= 100,
+        "harness rarely reached SyncCompleted; count = {sync_completed}"
+    );
+    assert!(
+        connection_lost >= 100,
+        "harness rarely reached ConnectionLost; count = {connection_lost}"
+    );
 }
 
 fn assert_ordering(seed: u64, events: &[Lifecycle]) {
