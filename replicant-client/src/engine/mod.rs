@@ -4,4 +4,5 @@ pub mod backoff;
 pub mod doc;
 pub mod doc_upload;
 pub mod hash;
+pub mod machine;
 pub mod types;
