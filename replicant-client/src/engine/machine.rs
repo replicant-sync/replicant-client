@@ -412,6 +412,7 @@ impl Core {
                 }
                 Conn::Halted(_) => {
                     fx.push(Effect::Cancel(TimerId::HaltRetry));
+                    self.attempt = 0;
                     self.connect_now(fx);
                 }
                 _ => {}
@@ -968,6 +969,33 @@ mod connection_tests {
         open_and_join(&mut c);
         c.step(Input::Timer(TimerId::StableReset));
         let fx = c.step(Input::SocketClosed);
+        assert!(fx.iter().any(|e| matches!(e, Effect::Schedule { timer: TimerId::Reconnect, after } if *after < Duration::from_secs(1))));
+    }
+
+    #[test]
+    fn reconnect_from_halted_resets_backoff() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        for _ in 0..5 {
+            c.step(Input::Timer(TimerId::ConnectTimeout));
+            c.step(Input::Timer(TimerId::Reconnect));
+        }
+        let (req, _) = sends(&c.step(Input::SocketOpened)).pop().unwrap();
+        c.step(Input::Reply {
+            req,
+            result: Err(ServerError {
+                is_fatal: true,
+                ..ServerError::new("auth_invalid")
+            }),
+        });
+        assert_eq!(
+            c.state().connection,
+            ConnectionView::Halted(HaltReason::AuthInvalid)
+        );
+        c.step(Input::Reconnect);
+        let fx = c.step(Input::Timer(TimerId::ConnectTimeout));
         assert!(fx.iter().any(|e| matches!(e, Effect::Schedule { timer: TimerId::Reconnect, after } if *after < Duration::from_secs(1))));
     }
 
