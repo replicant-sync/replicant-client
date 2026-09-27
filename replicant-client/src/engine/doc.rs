@@ -265,28 +265,76 @@ pub fn apply_change(snap: &DocSnapshot, change: &Change, me: Uuid) -> Vec<DocOp>
         return ops;
     }
 
-    match change.kind {
-        ChangeKind::Upsert => {
-            let is_member = snap
-                .project(&ops)
-                .memberships
-                .iter()
-                .any(|m| m.scope == change.scope && m.member);
-            if is_member {
+    let is_member = |applied: &[DocOp]| {
+        snap.project(applied)
+            .memberships
+            .iter()
+            .any(|m| m.scope == change.scope && m.member)
+    };
+    let echo_upload = change
+        .upload_id
+        .filter(|u| snap.rows.iter().any(|r| r.mutation_id == *u));
+
+    match (change.kind, echo_upload) {
+        // Echo of an upload from this data dir: never rebase, it would re-apply the delta.
+        (ChangeKind::Upsert, Some(upload_id)) => {
+            if !is_member(&ops) {
+                return ops;
+            }
+            if let Some(doc) = &change.doc {
+                ops.push(DocOp::SetMeta {
+                    owner_id: doc.owner_id,
+                    read_only: doc.read_only,
+                });
+                ops.push(DocOp::SetShadow(Shadow {
+                    content: doc.content.clone(),
+                    hash: doc.hash.clone(),
+                    seq: change.seq,
+                }));
+                let covered = snap
+                    .rows
+                    .iter()
+                    .filter(|r| r.mutation_id <= upload_id)
+                    .map(|r| r.mutation_id)
+                    .collect();
+                ops.push(DocOp::DeleteRows(covered));
+                return with_settle_invariant(snap, ops, me);
+            }
+        }
+        (ChangeKind::Upsert, None) => {
+            if is_member(&ops) {
                 if let Some(doc) = &change.doc {
                     ops.extend(apply_upsert(snap, doc, change.seq));
                 }
             }
         }
-        ChangeKind::Delete => ops.extend(apply_delete(snap, change, me)),
-        ChangeKind::Leave => unreachable!(),
+        (ChangeKind::Delete, echo) => ops.extend(apply_delete(snap, change.seq, echo.is_some())),
+        (ChangeKind::Leave, _) => unreachable!(),
     }
     ops
 }
 
-/// Placeholder until Task 6; deletes are covered there.
-fn apply_delete(_snap: &DocSnapshot, _change: &Change, _me: Uuid) -> Vec<DocOp> {
-    Vec::new()
+fn apply_delete(snap: &DocSnapshot, seq: Seq, is_echo: bool) -> Vec<DocOp> {
+    let pending_delete = snap.rows.last().is_some_and(|r| r.kind == RowKind::Delete);
+    let mut ops = Vec::new();
+    if snap.exists && !snap.rows.is_empty() && !is_echo && !pending_delete {
+        ops.push(DocOp::Recover {
+            content: snap.content.clone(),
+            reason: RecoverReason::DeleteWins,
+        });
+        ops.push(DocOp::Emit(DocEvent::ConflictDetected));
+    }
+    ops.push(DocOp::DropAllRows);
+    if snap.exists {
+        ops.push(DocOp::HardDelete);
+    }
+    ops.push(DocOp::RecordTombstone(seq));
+    ops
+}
+
+/// `get_document` reported the document as deleted on the server (tombstoned).
+pub fn apply_server_deleted(snap: &DocSnapshot, seq: Seq) -> Vec<DocOp> {
+    apply_delete(snap, seq, false)
 }
 
 pub fn apply_server_copy(snap: &DocSnapshot, doc: &DocEnvelope, _me: Uuid) -> Vec<DocOp> {
@@ -758,6 +806,163 @@ mod apply_change_tests {
         let after = s.project(&apply_server_missing(&s));
         assert!(!after.exists);
         assert!(after.rows.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod echo_and_delete_tests {
+    use super::change_fixtures::*;
+    use super::fixtures::*;
+    use super::*;
+    use crate::engine::types::ChangeKind;
+    use serde_json::json;
+
+    #[test]
+    fn echo_settles_rows_and_keeps_content() {
+        // Upload m1 sent {items:[x]}; user then appended y (row m2). Echo of m1 arrives.
+        let mut s = synced(json!({"items": []}), 1);
+        s.content = json!({"items": ["x", "y"]});
+        s.rows = vec![row(1, RowKind::Update), row(2, RowKind::Update)];
+        let echo = with_upload(upsert("own", json!({"items": ["x"]}), 2), m(1));
+        let after = s.project(&apply_change(&s, &echo, ME));
+        assert_eq!(
+            after.content,
+            json!({"items": ["x", "y"]}),
+            "no double-apply"
+        );
+        assert_eq!(after.shadow.unwrap().content, json!({"items": ["x"]}));
+        assert_eq!(
+            after.rows.iter().map(|r| r.mutation_id).collect::<Vec<_>>(),
+            vec![m(2)]
+        );
+    }
+
+    #[test]
+    fn echo_covering_all_rows_settles_without_marker() {
+        let mut s = synced(json!({"n": 1}), 1);
+        s.content = json!({"n": 2});
+        s.rows = vec![row(1, RowKind::Update)];
+        let ops = apply_change(
+            &s,
+            &with_upload(upsert("own", json!({"n": 2}), 2), m(1)),
+            ME,
+        );
+        let after = s.project(&ops);
+        assert!(after.rows.is_empty());
+        assert!(!ops.iter().any(|o| matches!(o, DocOp::InsertMarker(_))));
+    }
+
+    #[test]
+    fn echo_of_create_sets_first_shadow() {
+        let s = DocSnapshot {
+            shadow: None,
+            rows: vec![row(1, RowKind::Create)],
+            ..synced(sample(), 0)
+        };
+        let after = s.project(&apply_change(
+            &s,
+            &with_upload(upsert("own", sample(), 3), m(1)),
+            ME,
+        ));
+        assert_eq!(after.shadow.unwrap().seq, 3);
+        assert!(after.rows.is_empty());
+    }
+
+    #[test]
+    fn stale_echo_is_skipped_by_content_guard() {
+        // Reply already settled rows and set shadow seq 2; echo arrives later.
+        let s = synced(json!({"n": 2}), 2);
+        let ops = apply_change(
+            &s,
+            &with_upload(upsert("own", json!({"n": 2}), 2), m(1)),
+            ME,
+        );
+        assert!(!ops
+            .iter()
+            .any(|o| matches!(o, DocOp::SetContent(_) | DocOp::SetShadow(_))));
+    }
+
+    #[test]
+    fn delete_echo_hard_deletes_and_records_tombstone() {
+        let mut s = synced(sample(), 1);
+        s.soft_deleted = true;
+        s.rows = vec![row(1, RowKind::Delete)];
+        let ops = apply_change(
+            &s,
+            &with_upload(kind_change("own", ChangeKind::Delete, 2), m(1)),
+            ME,
+        );
+        let after = s.project(&ops);
+        assert!(!after.exists);
+        assert_eq!(after.tombstone_seq, Some(2));
+        assert!(!ops
+            .iter()
+            .any(|o| matches!(o, DocOp::InsertMarker(_) | DocOp::Recover { .. })));
+    }
+
+    #[test]
+    fn own_pending_delete_is_not_a_conflict() {
+        let mut s = synced(sample(), 1);
+        s.soft_deleted = true;
+        s.rows = vec![row(1, RowKind::Update), row(2, RowKind::Delete)];
+        let ops = apply_change(&s, &kind_change("own", ChangeKind::Delete, 2), ME);
+        assert!(!ops
+            .iter()
+            .any(|o| matches!(o, DocOp::Recover { .. } | DocOp::Emit(_))));
+        assert!(!s.project(&ops).exists);
+    }
+
+    #[test]
+    fn delete_wins_over_pending_edits() {
+        let mut s = synced(json!({"a": 1}), 1);
+        s.content = json!({"a": 2});
+        s.rows = vec![row(1, RowKind::Update)];
+        let ops = apply_change(&s, &kind_change("own", ChangeKind::Delete, 2), ME);
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"a": 2}),
+            reason: RecoverReason::DeleteWins
+        }));
+        assert!(ops.contains(&DocOp::Emit(DocEvent::ConflictDetected)));
+        let after = s.project(&ops);
+        assert!(!after.exists);
+        assert_eq!(after.tombstone_seq, Some(2));
+    }
+
+    #[test]
+    fn delete_without_rows_deletes_and_tombstones() {
+        let s = synced(sample(), 1);
+        let after = s.project(&apply_change(
+            &s,
+            &kind_change("own", ChangeKind::Delete, 2),
+            ME,
+        ));
+        assert!(!after.exists);
+        assert_eq!(after.tombstone_seq, Some(2));
+    }
+
+    #[test]
+    fn tombstone_blocks_recreation_by_lagging_scope() {
+        let s = DocSnapshot {
+            tombstone_seq: Some(20),
+            ..empty()
+        };
+        let ops = apply_change(&s, &upsert("collection:y", sample(), 15), ME);
+        assert!(!s.project(&ops).exists);
+    }
+
+    #[test]
+    fn server_deleted_is_delete_wins_for_pending_edits() {
+        let mut s = synced(json!({"a": 1}), 1);
+        s.content = json!({"a": 2});
+        s.rows = vec![row(1, RowKind::Update)];
+        let ops = apply_server_deleted(&s, 9);
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"a": 2}),
+            reason: RecoverReason::DeleteWins
+        }));
+        let after = s.project(&ops);
+        assert!(!after.exists);
+        assert_eq!(after.tombstone_seq, Some(9));
     }
 }
 
