@@ -57,10 +57,7 @@ pub fn build_upload(snap: &DocSnapshot, me: Uuid) -> BuildResult {
     };
 
     match (&snap.shadow, ends_in_delete) {
-        (None, true) => {
-            BuildResult::SettleLocally(vec![DocOp::DeleteRows(covered.clone()), DocOp::HardDelete])
-        }
-        (Some(_), true) => send(UploadKind::Delete, None, Value::Null, Value::Null),
+        (_, true) => send(UploadKind::Delete, None, Value::Null, Value::Null),
         (None, false) if has_create => send(
             UploadKind::Create,
             None,
@@ -218,17 +215,29 @@ mod upload_tests {
     }
 
     #[test]
-    fn create_then_delete_never_uploaded_settles_locally() {
+    fn create_then_delete_sends_unconditional_delete() {
         let s = DocSnapshot {
             shadow: None,
             soft_deleted: true,
             rows: vec![row(1, RowKind::Create), row(2, RowKind::Delete)],
             ..synced(sample(), 0)
         };
-        match build_upload(&s, ME) {
-            BuildResult::SettleLocally(ops) => assert!(!s.project(&ops).exists),
-            other => panic!("{other:?}"),
-        }
+        let (u, f) = sent(build_upload(&s, ME));
+        assert_eq!(u.kind, UploadKind::Delete);
+        assert_eq!(u.base_hash, None);
+        assert_eq!(f.covered, vec![m(1), m(2)]);
+    }
+
+    #[test]
+    fn migrated_update_then_delete_sends_delete() {
+        let s = DocSnapshot {
+            shadow: None,
+            soft_deleted: true,
+            rows: vec![row(1, RowKind::Update), row(2, RowKind::Delete)],
+            ..synced(sample(), 0)
+        };
+        let (u, _) = sent(build_upload(&s, ME));
+        assert_eq!(u.kind, UploadKind::Delete);
     }
 
     #[test]
@@ -366,6 +375,25 @@ mod upload_tests {
         let after = s.project(&ops);
         assert!(!after.exists);
         assert_eq!(after.tombstone_seq, Some(2));
+    }
+
+    #[test]
+    fn not_found_on_delete_upload_settles_locally() {
+        let mut s = synced(sample(), 1);
+        s.soft_deleted = true;
+        s.rows = vec![row(1, RowKind::Delete)];
+        let f = InFlight {
+            kind: UploadKind::Delete,
+            base_hash: None,
+            ..inflight_update(vec![m(1)], Value::Null)
+        };
+        let SettleResult::Ops(ops) = settle(&s, &f, &Err(ServerError::new("not_found")), ME, 0)
+        else {
+            panic!()
+        };
+        let after = s.project(&ops);
+        assert!(!after.exists);
+        assert!(after.rows.is_empty());
     }
 
     fn mismatch(current_hash: &str) -> ServerError {
