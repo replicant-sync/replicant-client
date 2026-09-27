@@ -4,6 +4,10 @@ use uuid::Uuid;
 use super::hash::content_hash;
 use super::types::{Change, ChangeKind, DocEnvelope, Scope, Seq};
 
+pub use super::doc_upload::{
+    build_upload, settle, BuildResult, InFlight, SettleResult, MAX_MISMATCH_ATTEMPTS,
+};
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Shadow {
     pub content: Value,
