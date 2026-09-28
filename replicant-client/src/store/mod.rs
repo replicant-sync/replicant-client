@@ -66,6 +66,7 @@ pub enum IdentityCheck {
 
 pub struct Store {
     pool: SqlitePool,
+    options: SqliteConnectOptions,
     instance_id: Uuid,
 }
 
@@ -78,7 +79,7 @@ impl Store {
             .busy_timeout(BUSY_TIMEOUT);
         let pool = SqlitePoolOptions::new()
             .max_connections(POOL_SIZE)
-            .connect_with(options)
+            .connect_with(options.clone())
             .await?;
         if let Err(error) = prepare(&pool).await {
             pool.close().await;
@@ -86,6 +87,7 @@ impl Store {
         }
         Ok(Store {
             pool,
+            options,
             instance_id: Uuid::new_v4(),
         })
     }
@@ -189,6 +191,7 @@ pub(crate) fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+pub mod change_log;
 mod docs;
 mod feed;
 mod uploads;
