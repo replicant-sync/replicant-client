@@ -198,8 +198,11 @@ fn membership_seq(snap: &DocSnapshot, scope: &str) -> Seq {
         .map_or(0, |m| m.seq)
 }
 
-/// Non-echo upsert: content guard already passed. When `local_base_known` is false the shadow
-/// is not the base of the pending rows, so edits that would need a rebase settle as a conflict.
+/// Non-echo upsert: content guard already passed. A rebase of pending rows onto the incoming
+/// envelope is only attempted when a shadow exists and the caller says it is that base
+/// (`local_base_known`); with no shadow at all there is no trustworthy base to rebase from — the
+/// envelope may already hold our own upload whose reply was lost, or another device's edit the
+/// shadow never captured — so it settles as a conflict, same as when `local_base_known` is false.
 fn apply_upsert(
     snap: &DocSnapshot,
     doc: &DocEnvelope,
@@ -241,13 +244,11 @@ fn apply_upsert(
         return ops;
     }
     let rebased = match &snap.shadow {
-        _ if !local_base_known => None,
-        // Migration only: no known base, keep local content; pending = diff(new shadow, content).
-        None => Some(snap.content.clone()),
-        Some(old) => match rebase(&old.content, &doc.content, &snap.content) {
+        Some(old) if local_base_known => match rebase(&old.content, &doc.content, &snap.content) {
             Rebased::Clean(v) => Some(v),
             Rebased::Conflict => None,
         },
+        _ => None,
     };
     let Some(content) = rebased else {
         let with_new_shadow = snap.project(&[DocOp::SetShadow(new_shadow.clone())]);
@@ -791,17 +792,23 @@ mod apply_change_tests {
     }
 
     #[test]
-    fn null_shadow_keeps_local_content() {
-        let mut s = synced(json!({"mine": 1}), 0);
+    fn null_shadow_with_pending_rows_recovers_exact_local_content() {
+        // No known base (a v2 create whose reply was lost, or a migrated v1 doc with no
+        // captured base): rebasing risks re-applying or silently dropping content, so this
+        // settles as a conflict instead of keeping local content unconditionally.
+        let mut s = synced(json!({"items": ["a"]}), 0);
         s.shadow = None;
-        s.rows = vec![row(5, RowKind::Update)];
-        let after = s.project(&apply_change(
-            &s,
-            &upsert("own", json!({"server": 1}), 4),
-            ME,
-        ));
-        assert_eq!(after.content, json!({"mine": 1}));
-        assert_eq!(after.shadow.unwrap().content, json!({"server": 1}));
+        s.rows = vec![row(1, RowKind::Create)];
+        let ops = apply_change(&s, &upsert("own", json!({"items": ["a", "x"]}), 4), ME);
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"items": ["a"]}),
+            reason: RecoverReason::Conflict,
+        }));
+        assert!(ops.contains(&DocOp::Emit(DocEvent::ConflictDetected)));
+        let after = s.project(&ops);
+        assert_eq!(after.content, json!({"items": ["a", "x"]}));
+        assert!(after.rows.is_empty());
+        assert_eq!(after.shadow.unwrap().seq, 4);
     }
 
     #[test]
@@ -907,6 +914,22 @@ mod apply_change_tests {
         assert!(apply_server_copy(&s, &env(json!({"x": 1}), 4), ME).is_empty());
         let after = s.project(&apply_server_copy(&s, &env(json!({"x": 1}), 6), ME));
         assert_eq!(after.content, json!({"x": 1}));
+    }
+
+    #[test]
+    fn server_copy_with_no_shadow_and_pending_rows_recovers_exact_local_content() {
+        let mut s = synced(json!({"items": ["a"]}), 0);
+        s.shadow = None;
+        s.rows = vec![row(1, RowKind::Create)];
+        let ops = apply_server_copy(&s, &env(json!({"items": ["a", "x"]}), 4), ME);
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"items": ["a"]}),
+            reason: RecoverReason::Conflict,
+        }));
+        assert!(ops.contains(&DocOp::Emit(DocEvent::ConflictDetected)));
+        let after = s.project(&ops);
+        assert_eq!(after.content, json!({"items": ["a", "x"]}));
+        assert!(after.rows.is_empty());
     }
 
     #[test]
@@ -1376,7 +1399,11 @@ mod property_tests {
         }
 
         /// A v2 create whose upload landed but the reply was lost: no shadow yet, one pending
-        /// `Create` row. Fuzzes the no-shadow branch of `apply_snapshot_doc` and `apply_change`.
+        /// `Create` row. Fuzzes the no-shadow branch of `apply_snapshot_doc` and `apply_change`'s
+        /// non-echo arm (every push or page delivered before this client's create resolves),
+        /// plus its echo arm on the seeds where `server.changes` carries a matching entry.
+        /// `apply_server_copy`'s no-shadow branch is not reached here: `build` never sends while
+        /// the shadow is still unset.
         fn new_lost_create(content: Value) -> Client {
             let mut c = Client::new(content);
             c.snap.shadow = None;
@@ -1437,18 +1464,42 @@ mod property_tests {
             } else {
                 server.envelope(seq)
             };
+            let is_echo_for_us = upload_id.is_some_and(|u| self.rows_contain(u));
+            let pending_delete_before = self
+                .snap
+                .rows
+                .last()
+                .is_some_and(|r| r.kind == RowKind::Delete);
+            let before_server_seq = self.snap.server_seq();
             let change = Change {
                 scope: "own".into(),
                 seq,
                 prev_seq: seq - 1,
                 doc_id: DOC,
                 kind: ChangeKind::Upsert,
-                doc: Some(doc),
+                doc: Some(doc.clone()),
                 client_id: None,
                 upload_id,
             };
             let ops = apply_change(&self.snap, &change, ME);
             self.apply(&ops);
+            if !is_echo_for_us {
+                // apply_change's content guard gates on the change's own seq, not the envelope's
+                // (a page can carry a newer envelope than the change it is delivering).
+                assert_other_device_edit_preserved(
+                    before_server_seq,
+                    seq,
+                    pending_delete_before,
+                    &doc,
+                    self,
+                    &ops,
+                    "deliver",
+                );
+            }
+        }
+
+        fn rows_contain(&self, mutation_id: Uuid) -> bool {
+            self.snap.rows.iter().any(|r| r.mutation_id == mutation_id)
         }
 
         fn catch_up(&mut self, server: &Server, rng: &mut Jitter) {
@@ -1528,8 +1579,25 @@ mod property_tests {
                 }
                 SettleResult::FetchServerCopy => {
                     self.mismatches += 1;
-                    let ops = apply_server_copy(&self.snap, &server.envelope(server.seq()), ME);
+                    let pending_delete_before = self
+                        .snap
+                        .rows
+                        .last()
+                        .is_some_and(|r| r.kind == RowKind::Delete);
+                    let before_server_seq = self.snap.server_seq();
+                    let doc = server.envelope(server.seq());
+                    let ops = apply_server_copy(&self.snap, &doc, ME);
                     self.apply(&ops);
+                    // apply_server_copy's content guard gates on the envelope's own seq.
+                    assert_other_device_edit_preserved(
+                        before_server_seq,
+                        doc.seq,
+                        pending_delete_before,
+                        &doc,
+                        self,
+                        &ops,
+                        "server copy",
+                    );
                 }
                 SettleResult::Retry { mismatch, .. } => {
                     if mismatch {
@@ -1548,6 +1616,42 @@ mod property_tests {
 
     fn token(n: u32) -> Value {
         json!(format!("t{n}"))
+    }
+
+    /// The other-device edit counter this content reflects (0 before any `other_device_edit`).
+    fn theirs_of(content: &Value) -> u64 {
+        content.get("theirs").and_then(Value::as_u64).unwrap_or(0)
+    }
+
+    /// Asserts a non-echo delivery that actually applies (content guard passed, no pending
+    /// delete in play) never silently drops the other-device edit the incoming envelope
+    /// carries: the client's content must catch up to it, or the delivery must explicitly
+    /// recover the pre-delivery local content instead (tracked in `client.recovered`, not
+    /// discarded). A stale or pending-delete delivery is exempt: it is spec-correct for those to
+    /// leave content untouched. `guard_seq` is whatever seq the caller's own content guard
+    /// compares against `before_server_seq` — the change's seq for a delivery (a page can carry
+    /// a newer envelope than the change it is delivering), the envelope's own seq for a server
+    /// copy.
+    fn assert_other_device_edit_preserved(
+        before_server_seq: Seq,
+        guard_seq: Seq,
+        pending_delete_before: bool,
+        envelope: &DocEnvelope,
+        client: &Client,
+        ops: &[DocOp],
+        what: &str,
+    ) {
+        if pending_delete_before || guard_seq <= before_server_seq {
+            return;
+        }
+        let recovered_now = ops.iter().any(|op| matches!(op, DocOp::Recover { .. }));
+        let after = theirs_of(&client.snap.content);
+        let envelope_theirs = theirs_of(&envelope.content);
+        assert!(
+            after >= envelope_theirs || recovered_now,
+            "{what}: an other-device edit (theirs={envelope_theirs}) was dropped without a \
+             Recover (client theirs is now {after})"
+        );
     }
 
     fn check_invariants(seed: u64, client: &Client) {
@@ -1592,11 +1696,17 @@ mod property_tests {
             let mut server = Server::new(start.clone());
             // Half the seeds start as a lost-create client (no shadow, one pending Create row)
             // to fuzz that branch of apply_snapshot_doc and apply_change.
-            let mut client = if seed % 2 == 0 {
+            let lost_create = seed % 2 == 0;
+            let mut client = if lost_create {
                 Client::new_lost_create(start)
             } else {
                 Client::new(start)
             };
+            if lost_create && seed % 4 == 0 {
+                // The create landed on the server as the doc's starting content, but our reply
+                // was lost; deliver it back as a change too, fuzzing the echo arm with no shadow.
+                server.changes.push((1, Some(m(1))));
+            }
             for _ in 0..STEPS {
                 match (rng.next_unit() * 8.0) as u32 {
                     0 => client.edit(),
