@@ -335,7 +335,8 @@ pub fn apply_change(snap: &DocSnapshot, change: &Change, me: Uuid) -> Vec<DocOp>
             debug_assert!(change.doc.is_some(), "upsert without doc");
             if is_member(&ops) {
                 if let Some(doc) = &change.doc {
-                    ops.extend(apply_upsert(snap, doc, change.seq, true));
+                    // Pages carry the current envelope; the shadow holds that version, not the change's.
+                    ops.extend(apply_upsert(snap, doc, doc.seq.max(change.seq), true));
                 }
             }
         }
@@ -650,6 +651,24 @@ mod apply_change_tests {
         let after = s.project(&apply_change(&s, &upsert("own", new.clone(), 2), ME));
         assert_eq!(after.content, new);
         assert_eq!(after.shadow.unwrap().seq, 2);
+    }
+
+    #[test]
+    fn page_upsert_stores_the_envelope_seq_so_older_page_changes_skip() {
+        let s = synced(json!({"a": 1}), 1);
+        // A page row for seq 2 carrying the document's current envelope (seq 5).
+        let mut first = upsert("own", json!({}), 2);
+        first.doc = Some(env(json!({"a": 3}), 5));
+        let after = s.project(&apply_change(&s, &first, ME));
+        assert_eq!(after.shadow.as_ref().unwrap().seq, 5);
+        assert_eq!(after.content, json!({"a": 3}));
+
+        let mut second = upsert("own", json!({}), 4);
+        second.doc = Some(env(json!({"a": 3}), 5));
+        let ops = apply_change(&after, &second, ME);
+        assert!(!ops
+            .iter()
+            .any(|op| matches!(op, DocOp::SetShadow(_) | DocOp::SetContent(_))));
     }
 
     #[test]

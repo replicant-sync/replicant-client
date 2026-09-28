@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-use super::backoff::{catch_up_retry_delay, connect_delay, doc_retry_delay, Jitter};
+use super::backoff::{
+    catch_up_retry_delay, connect_delay, doc_retry_delay, Jitter, MIN_CONNECT_DELAY,
+};
 use super::doc::InFlight;
 use super::types::{Change, DocEnvelope, Scope, Seq, ServerError, Upload};
 
@@ -519,7 +521,7 @@ impl Core {
     fn fail_connect(&mut self, retry_after_ms: Option<u64>, fx: &mut Vec<Effect>) {
         fx.push(Effect::Cancel(TimerId::ConnectTimeout));
         let delay = match retry_after_ms {
-            Some(ms) => Duration::from_millis(ms),
+            Some(ms) => Duration::from_millis(ms).max(MIN_CONNECT_DELAY),
             None => connect_delay(self.attempt, self.jitter.next_unit()),
         };
         self.attempt = self.attempt.saturating_add(1);
@@ -819,6 +821,7 @@ impl Core {
         fx.push(Effect::DropSubscription {
             scope: scope.to_string(),
         });
+        self.scope_names.retain(|name| name != scope);
         let Some(s) = self.session() else { return };
         s.scopes.insert(scope.to_string(), ScopeSync::Dropped);
         self.check_all_live(fx);
@@ -1555,7 +1558,7 @@ mod connection_tests {
             result: Err(ServerError::new("internal")),
         });
         assert_eq!(c.state().connection, ConnectionView::Disconnected);
-        assert!(fx.iter().any(|e| matches!(e, Effect::Schedule { timer: TimerId::Reconnect, after } if *after < Duration::from_secs(1))));
+        assert!(fx.iter().any(|e| matches!(e, Effect::Schedule { timer: TimerId::Reconnect, after } if *after == Duration::from_secs(1))));
         let fx = c.step(Input::Timer(TimerId::Reconnect));
         assert!(opens(&fx));
     }
@@ -1748,7 +1751,7 @@ mod connection_tests {
         open_and_join(&mut c);
         c.step(Input::Timer(TimerId::StableReset));
         let fx = c.step(closed(&c));
-        assert!(fx.iter().any(|e| matches!(e, Effect::Schedule { timer: TimerId::Reconnect, after } if *after < Duration::from_secs(1))));
+        assert!(fx.iter().any(|e| matches!(e, Effect::Schedule { timer: TimerId::Reconnect, after } if *after == Duration::from_secs(1))));
     }
 
     #[test]
@@ -1775,7 +1778,7 @@ mod connection_tests {
         );
         c.step(Input::Reconnect);
         let fx = c.step(Input::Timer(TimerId::ConnectTimeout));
-        assert!(fx.iter().any(|e| matches!(e, Effect::Schedule { timer: TimerId::Reconnect, after } if *after < Duration::from_secs(1))));
+        assert!(fx.iter().any(|e| matches!(e, Effect::Schedule { timer: TimerId::Reconnect, after } if *after == Duration::from_secs(1))));
     }
 
     #[test]
@@ -1802,6 +1805,24 @@ mod connection_tests {
                 has_credentials: true
             })
             .is_empty());
+    }
+
+    #[test]
+    fn retry_after_zero_still_waits_the_minimum() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let mut rate_limited = ServerError::new("rate_limited");
+        rate_limited.retry_after_ms = Some(0);
+        let fx = c.step(Input::ConnectRefused {
+            gen: 1,
+            error: rate_limited,
+        });
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::Reconnect,
+            after: Duration::from_secs(1),
+        }));
     }
 }
 
@@ -2382,6 +2403,44 @@ mod catch_up_tests {
         assert_eq!(emitted(&fx), vec![Lifecycle::SyncCompleted]);
         let fx = c.step(Input::Push(change("collection:curated", 6, 5)));
         assert!(!fx.iter().any(|e| matches!(e, Effect::ApplyChanges { .. })));
+    }
+
+    #[test]
+    fn dropped_scope_is_not_caught_up_next_connection() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        let curated = changes_req(&fx, "collection:curated");
+        c.step(Input::Reply {
+            req: curated,
+            result: Err(ServerError::new("subscription_forbidden")),
+        });
+
+        c.step(closed(&c));
+        c.step(Input::Timer(TimerId::Reconnect));
+        let (req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        c.step(Input::Reply {
+            req,
+            result: Ok(Response::Joined),
+        });
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+
+        let requested: Vec<String> = sends(&fx)
+            .into_iter()
+            .filter_map(|(_, request)| match request {
+                Request::GetChangesSince { scope, .. } | Request::GetSnapshot { scope, .. } => {
+                    Some(scope)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(requested, vec!["own".to_string()]);
     }
 }
 

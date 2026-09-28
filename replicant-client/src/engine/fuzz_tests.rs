@@ -116,16 +116,20 @@ impl Harness {
     fn feed(&mut self, input: Input) {
         let mut queue = std::collections::VecDeque::from([input]);
         while let Some(input) = queue.pop_front() {
+            let connecting = self.core.state().connection == ConnectionView::Connecting;
             let closes_current = match &input {
-                Input::SocketClosed { gen } | Input::ConnectRefused { gen, .. } => {
-                    *gen == self.socket_gen
-                }
+                Input::SocketClosed { gen } => *gen == self.socket_gen,
+                // The core only takes a refusal while connecting; elsewhere it is ignored.
+                Input::ConnectRefused { gen, .. } => *gen == self.socket_gen && connecting,
                 _ => false,
             };
             if closes_current {
                 self.socket_open = false;
             }
-            for e in self.core.step(input) {
+            let answers_open = matches!(input, Input::SocketOpened { .. });
+            let effects = self.core.step(input);
+            let connecting_after = self.core.state().connection == ConnectionView::Connecting;
+            for e in effects {
                 match e {
                     Effect::OpenSocket { gen } => {
                         assert!(
@@ -141,7 +145,18 @@ impl Harness {
                         assert_eq!(gen, self.socket_gen, "seed {}: close gen", self.seed);
                         self.socket_open = false;
                     }
-                    Effect::Send { req, request } => self.outstanding.push((req, request)),
+                    Effect::Send { req, request } => {
+                        // Frames queue in an unbounded channel until the socket opens: only
+                        // the join may be sent while connecting, and only once it has opened.
+                        if connecting_after {
+                            assert!(
+                                request == Request::Join && answers_open,
+                                "seed {}: {request:?} sent while connecting",
+                                self.seed
+                            );
+                        }
+                        self.outstanding.push((req, request))
+                    }
                     Effect::Emit(l) => self.events.push(l),
                     Effect::ApplyChanges { scope, tag, .. }
                     | Effect::ApplySnapshotPage { scope, tag, .. }
