@@ -849,6 +849,14 @@ impl Core {
         self.scope_names.retain(|name| name != scope);
         let Some(s) = self.session() else { return };
         s.scopes.insert(scope.to_string(), ScopeSync::Dropped);
+        if scope == SCOPE_OWN {
+            // No further Applied for `own` will ever arrive to release these; with `own`
+            // dropped, wait_for_stream will let their rebuild through at once.
+            let waiting: Vec<Uuid> = s.awaiting.drain().map(|(doc_id, _)| doc_id).collect();
+            for doc_id in waiting {
+                self.try_build(doc_id, fx);
+            }
+        }
         self.check_all_live(fx);
     }
 
@@ -3713,5 +3721,44 @@ mod server_copy_tests {
             5,
         );
         assert!(applies_copy(&fetch_copy(&mut c, doc(1), 9)));
+    }
+
+    #[test]
+    fn own_dropped_mid_wait_releases_the_waiting_doc() {
+        let mut c = core();
+        live(&mut c);
+        let fx = fetch_copy(&mut c, doc(1), 9);
+        let own = changes_req(&fx, "own");
+        let fx = c.step(Input::Reply {
+            req: own,
+            result: Err(ServerError::new("subscription_forbidden")),
+        });
+        assert!(
+            builds(&fx, doc(1)),
+            "own dropped mid-wait must release the waiting doc, or it is stranded"
+        );
+    }
+
+    #[test]
+    fn push_commits_the_seq_and_releases_the_doc_before_any_round_finishes() {
+        let mut c = core();
+        live(&mut c);
+        // Leaves `own` Live and starts a round that is still outstanding when the doc waits.
+        c.step(Input::UnreadablePush {
+            scope: Some("own".into()),
+        });
+        let fx = fetch_copy(&mut c, doc(1), 6);
+        assert!(
+            !applies_copy(&fx),
+            "own is not Live; the doc waits on the round already out"
+        );
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::Push(6),
+        });
+        assert!(
+            builds(&fx, doc(1)),
+            "the pushed seq commits applied[own] to 6, releasing the doc without waiting for the round to finish"
+        );
     }
 }
