@@ -198,8 +198,14 @@ fn membership_seq(snap: &DocSnapshot, scope: &str) -> Seq {
         .map_or(0, |m| m.seq)
 }
 
-/// Non-echo upsert: content guard already passed.
-fn apply_upsert(snap: &DocSnapshot, doc: &DocEnvelope, seq: Seq) -> Vec<DocOp> {
+/// Non-echo upsert: content guard already passed. When `local_base_known` is false the shadow
+/// is not the base of the pending rows, so edits that would need a rebase settle as a conflict.
+fn apply_upsert(
+    snap: &DocSnapshot,
+    doc: &DocEnvelope,
+    seq: Seq,
+    local_base_known: bool,
+) -> Vec<DocOp> {
     let new_shadow = Shadow {
         content: doc.content.clone(),
         hash: doc.hash.clone(),
@@ -234,18 +240,20 @@ fn apply_upsert(snap: &DocSnapshot, doc: &DocEnvelope, seq: Seq) -> Vec<DocOp> {
         ops.push(DocOp::SetShadow(new_shadow));
         return ops;
     }
-    let content = match &snap.shadow {
+    let rebased = match &snap.shadow {
+        _ if !local_base_known => None,
         // Migration only: no known base, keep local content; pending = diff(new shadow, content).
-        None => snap.content.clone(),
+        None => Some(snap.content.clone()),
         Some(old) => match rebase(&old.content, &doc.content, &snap.content) {
-            Rebased::Clean(v) => v,
-            Rebased::Conflict => {
-                let with_new_shadow = snap.project(&[DocOp::SetShadow(new_shadow.clone())]);
-                ops.push(DocOp::SetShadow(new_shadow));
-                ops.extend(conflict_ops(&with_new_shadow));
-                return ops;
-            }
+            Rebased::Clean(v) => Some(v),
+            Rebased::Conflict => None,
         },
+    };
+    let Some(content) = rebased else {
+        let with_new_shadow = snap.project(&[DocOp::SetShadow(new_shadow.clone())]);
+        ops.push(DocOp::SetShadow(new_shadow));
+        ops.extend(conflict_ops(&with_new_shadow));
+        return ops;
     };
     ops.push(DocOp::SetShadow(new_shadow));
     ops.push(DocOp::SetContent(content));
@@ -289,7 +297,8 @@ pub fn apply_change(snap: &DocSnapshot, change: &Change, me: Uuid) -> Vec<DocOp>
         .filter(|u| snap.rows.iter().any(|r| r.mutation_id == *u));
 
     match (change.kind, echo_upload) {
-        // Echo of an upload from this data dir: never rebase, it would re-apply the delta.
+        // Echo of an upload from this data dir: never rebase, local content already holds the
+        // uploaded delta and re-applying it would duplicate or conflict.
         (ChangeKind::Upsert, Some(upload_id)) => {
             if !is_member(&ops) {
                 return ops;
@@ -301,12 +310,12 @@ pub fn apply_change(snap: &DocSnapshot, change: &Change, me: Uuid) -> Vec<DocOp>
                     .filter(|r| r.mutation_id <= upload_id)
                     .map(|r| r.mutation_id)
                     .collect();
-                // Pages carry the current envelope; only one at the change's own seq is exactly
-                // what was uploaded, so a newer one goes through the normal rebase path.
+                // A newer envelope than the upload (a page without the stored reply): the upload
+                // content is unknown, so rows it did not cover cannot be rebased onto it.
                 if doc.seq != change.seq {
                     ops.push(DocOp::DeleteRows(covered));
                     let acked = snap.project(&ops);
-                    ops.extend(apply_upsert(&acked, doc, change.seq));
+                    ops.extend(apply_upsert(&acked, doc, doc.seq, false));
                     return with_settle_invariant(snap, ops, me);
                 }
                 ops.push(DocOp::SetMeta {
@@ -326,7 +335,7 @@ pub fn apply_change(snap: &DocSnapshot, change: &Change, me: Uuid) -> Vec<DocOp>
             debug_assert!(change.doc.is_some(), "upsert without doc");
             if is_member(&ops) {
                 if let Some(doc) = &change.doc {
-                    ops.extend(apply_upsert(snap, doc, change.seq));
+                    ops.extend(apply_upsert(snap, doc, change.seq, true));
                 }
             }
         }
@@ -363,7 +372,7 @@ pub fn apply_server_copy(snap: &DocSnapshot, doc: &DocEnvelope, _me: Uuid) -> Ve
     if doc.seq <= snap.server_seq() {
         return Vec::new();
     }
-    apply_upsert(snap, doc, doc.seq)
+    apply_upsert(snap, doc, doc.seq, true)
 }
 
 /// `get_document` said the document does not exist on the server: not_found means the server
@@ -878,32 +887,107 @@ mod echo_and_delete_tests {
         );
     }
 
+    /// The page's change for upload m1 (seq 2) carrying the current envelope (seq 4).
+    fn page_echo(content: Value) -> Change {
+        let mut c = with_upload(upsert("own", json!({}), 2), m(1));
+        c.doc = Some(env(content, 4));
+        c
+    }
+
+    /// Settled on the envelope at its own seq with no rows left.
+    fn assert_adopted(after: &DocSnapshot, envelope: Value) {
+        assert!(after.rows.is_empty());
+        assert_eq!(after.content, envelope);
+        let sh = after.shadow.as_ref().unwrap();
+        assert_eq!(sh.content, envelope);
+        assert_eq!(sh.seq, 4);
+    }
+
+    fn assert_no_conflict_or_marker(ops: &[DocOp]) {
+        assert!(!ops.iter().any(|o| matches!(
+            o,
+            DocOp::Recover { .. } | DocOp::Emit(_) | DocOp::InsertMarker(_)
+        )));
+    }
+
+    fn assert_conflict_recovers(ops: &[DocOp], local: Value) {
+        assert!(ops.contains(&DocOp::Recover {
+            content: local,
+            reason: RecoverReason::Conflict
+        }));
+        assert!(ops.contains(&DocOp::Emit(DocEvent::ConflictDetected)));
+        assert!(!ops.iter().any(|o| matches!(o, DocOp::InsertMarker(_))));
+    }
+
     #[test]
-    fn page_echo_with_newer_envelope_acks_rows_and_rebases() {
-        // m1 uploaded "mine"; m2 ("later") is still pending. The page's change for m1 (seq 2)
-        // carries the current envelope (seq 4), which also has another device's "theirs".
+    fn page_echo_with_newer_envelope_and_pending_rows_settles_as_conflict() {
+        // m1 uploaded "mine"; m2 ("later") is still pending; the envelope also has "theirs".
         let mut s = synced(json!({"a": 1}), 1);
         s.content = json!({"a": 1, "mine": true, "later": true});
         s.rows = vec![row(1, RowKind::Update), row(2, RowKind::Update)];
-        let mut page_echo = with_upload(upsert("own", json!({}), 2), m(1));
-        page_echo.doc = Some(env(json!({"a": 1, "mine": true, "theirs": true}), 4));
+        let envelope = json!({"a": 1, "mine": true, "theirs": true});
 
-        let after = s.project(&apply_change(&s, &page_echo, ME));
+        let ops = apply_change(&s, &page_echo(envelope.clone()), ME);
+        let after = s.project(&ops);
 
-        assert_eq!(
-            after.rows.iter().map(|r| r.mutation_id).collect::<Vec<_>>(),
-            vec![m(2)],
-            "covered row acked, newer row kept"
-        );
-        assert_eq!(
-            after.shadow.as_ref().unwrap().content,
-            json!({"a": 1, "mine": true, "theirs": true})
-        );
-        assert_eq!(
-            after.content,
-            json!({"a": 1, "mine": true, "theirs": true, "later": true}),
-            "local edits rebased onto the newer envelope"
-        );
+        assert_adopted(&after, envelope);
+        assert_conflict_recovers(&ops, s.content.clone());
+    }
+
+    #[test]
+    fn page_echo_array_append_covering_all_rows_adopts_envelope() {
+        // m1 appended x; another device then appended z.
+        let mut s = synced(json!({"items": []}), 1);
+        s.content = json!({"items": ["x"]});
+        s.rows = vec![row(1, RowKind::Update)];
+        let envelope = json!({"items": ["x", "z"]});
+
+        let ops = apply_change(&s, &page_echo(envelope.clone()), ME);
+
+        assert_adopted(&s.project(&ops), envelope);
+        assert_no_conflict_or_marker(&ops);
+    }
+
+    #[test]
+    fn page_echo_array_append_with_pending_row_settles_as_conflict() {
+        // m1 appended x (covered), m2 appended y (pending); another device appended z.
+        let mut s = synced(json!({"items": []}), 1);
+        s.content = json!({"items": ["x", "y"]});
+        s.rows = vec![row(1, RowKind::Update), row(2, RowKind::Update)];
+        let envelope = json!({"items": ["x", "z"]});
+
+        let ops = apply_change(&s, &page_echo(envelope.clone()), ME);
+
+        assert_adopted(&s.project(&ops), envelope);
+        assert_conflict_recovers(&ops, json!({"items": ["x", "y"]}));
+    }
+
+    #[test]
+    fn page_echo_key_removal_covering_all_rows_adopts_envelope() {
+        // m1 removed k; another device then added b.
+        let mut s = synced(json!({"a": 1, "k": 1}), 1);
+        s.content = json!({"a": 1});
+        s.rows = vec![row(1, RowKind::Update)];
+        let envelope = json!({"a": 1, "b": 2});
+
+        let ops = apply_change(&s, &page_echo(envelope.clone()), ME);
+
+        assert_adopted(&s.project(&ops), envelope);
+        assert_no_conflict_or_marker(&ops);
+    }
+
+    #[test]
+    fn page_echo_key_removal_with_pending_row_settles_as_conflict() {
+        // m1 removed k (covered), m2 added c (pending); another device added b.
+        let mut s = synced(json!({"a": 1, "k": 1}), 1);
+        s.content = json!({"a": 1, "c": 3});
+        s.rows = vec![row(1, RowKind::Update), row(2, RowKind::Update)];
+        let envelope = json!({"a": 1, "b": 2});
+
+        let ops = apply_change(&s, &page_echo(envelope.clone()), ME);
+
+        assert_adopted(&s.project(&ops), envelope);
+        assert_conflict_recovers(&ops, json!({"a": 1, "c": 3}));
     }
 
     #[test]
