@@ -295,6 +295,20 @@ pub fn apply_change(snap: &DocSnapshot, change: &Change, me: Uuid) -> Vec<DocOp>
                 return ops;
             }
             if let Some(doc) = &change.doc {
+                let covered: Vec<Uuid> = snap
+                    .rows
+                    .iter()
+                    .filter(|r| r.mutation_id <= upload_id)
+                    .map(|r| r.mutation_id)
+                    .collect();
+                // Pages carry the current envelope; only one at the change's own seq is exactly
+                // what was uploaded, so a newer one goes through the normal rebase path.
+                if doc.seq != change.seq {
+                    ops.push(DocOp::DeleteRows(covered));
+                    let acked = snap.project(&ops);
+                    ops.extend(apply_upsert(&acked, doc, change.seq));
+                    return with_settle_invariant(snap, ops, me);
+                }
                 ops.push(DocOp::SetMeta {
                     owner_id: doc.owner_id,
                     read_only: doc.read_only,
@@ -304,12 +318,6 @@ pub fn apply_change(snap: &DocSnapshot, change: &Change, me: Uuid) -> Vec<DocOp>
                     hash: doc.hash.clone(),
                     seq: change.seq,
                 }));
-                let covered = snap
-                    .rows
-                    .iter()
-                    .filter(|r| r.mutation_id <= upload_id)
-                    .map(|r| r.mutation_id)
-                    .collect();
                 ops.push(DocOp::DeleteRows(covered));
                 return with_settle_invariant(snap, ops, me);
             }
@@ -868,6 +876,50 @@ mod echo_and_delete_tests {
             after.rows.iter().map(|r| r.mutation_id).collect::<Vec<_>>(),
             vec![m(2)]
         );
+    }
+
+    #[test]
+    fn page_echo_with_newer_envelope_acks_rows_and_rebases() {
+        // m1 uploaded "mine"; m2 ("later") is still pending. The page's change for m1 (seq 2)
+        // carries the current envelope (seq 4), which also has another device's "theirs".
+        let mut s = synced(json!({"a": 1}), 1);
+        s.content = json!({"a": 1, "mine": true, "later": true});
+        s.rows = vec![row(1, RowKind::Update), row(2, RowKind::Update)];
+        let mut page_echo = with_upload(upsert("own", json!({}), 2), m(1));
+        page_echo.doc = Some(env(json!({"a": 1, "mine": true, "theirs": true}), 4));
+
+        let after = s.project(&apply_change(&s, &page_echo, ME));
+
+        assert_eq!(
+            after.rows.iter().map(|r| r.mutation_id).collect::<Vec<_>>(),
+            vec![m(2)],
+            "covered row acked, newer row kept"
+        );
+        assert_eq!(
+            after.shadow.as_ref().unwrap().content,
+            json!({"a": 1, "mine": true, "theirs": true})
+        );
+        assert_eq!(
+            after.content,
+            json!({"a": 1, "mine": true, "theirs": true, "later": true}),
+            "local edits rebased onto the newer envelope"
+        );
+    }
+
+    #[test]
+    fn page_echo_covering_all_rows_takes_server_content() {
+        let mut s = synced(json!({"n": 1}), 1);
+        s.content = json!({"n": 2});
+        s.rows = vec![row(1, RowKind::Update)];
+        let mut page_echo = with_upload(upsert("own", json!({}), 2), m(1));
+        page_echo.doc = Some(env(json!({"n": 2, "other": 1}), 5));
+
+        let ops = apply_change(&s, &page_echo, ME);
+        let after = s.project(&ops);
+
+        assert!(after.rows.is_empty());
+        assert_eq!(after.content, json!({"n": 2, "other": 1}));
+        assert!(!ops.iter().any(|op| matches!(op, DocOp::InsertMarker(_))));
     }
 
     #[test]
