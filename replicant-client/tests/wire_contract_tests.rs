@@ -1,112 +1,19 @@
-//! Contract test: every recorded server v2 wire frame must deserialize into the
-//! client's engine types. Proves wire compatibility before the client driver exists.
+//! Contract test: every recorded server v2 wire frame round-trips through the client's real
+//! wire types and codec.
 
 use std::collections::BTreeSet;
 
-use replicant_client::engine::types::{Change, ChangeKind, DocEnvelope, Scope, Seq, UploadKind};
+use replicant_client::engine::machine::{Request, Response};
+use replicant_client::engine::types::{ChangeKind, DocEnvelope, ServerError, Upload, UploadKind};
+use replicant_client::transport::codec::{Codec, Incoming};
+use replicant_client::transport::wire::{socket_url, JoinAuth, ReplyEnvelope};
 use replicant_core::patches::calculate_checksum;
-use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 const FRAMES_JSON: &str = include_str!("fixtures/server_v2/v2_frames.json");
-
-/// Mirrors `machine::Response::Changes`, which is not a serde type.
-#[derive(Debug, Deserialize)]
-struct WireChangesResponse {
-    changes: Vec<Change>,
-    next_cursor: Seq,
-    has_more: bool,
-}
-
-/// Mirrors `machine::Response::SnapshotPage`, which is not a serde type.
-#[derive(Debug, Deserialize)]
-struct WireSnapshotResponse {
-    docs: Vec<DocEnvelope>,
-    snapshot_seq: Seq,
-    next_page_token: Option<String>,
-}
-
-/// Mirrors `types::ServerError` plus the `scope`/`doc_id` keys some error replies carry,
-/// which `ServerError` itself does not store.
-#[derive(Debug, Deserialize)]
-struct WireError {
-    code: String,
-    is_fatal: bool,
-    retry_after_ms: Option<u64>,
-    current_hash: Option<String>,
-    current_seq: Option<Seq>,
-    existing_owner: Option<Uuid>,
-    scope: Option<Scope>,
-    doc_id: Option<Uuid>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WireJoinReply {
-    user_id: Uuid,
-    protocol_version: u32,
-}
-
-/// Mirrors `machine::Request::Join`: the `phx_join` payload.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Join {
-    email: String,
-    api_key: String,
-    signature: String,
-    timestamp: i64,
-}
-
-/// Mirrors `machine::Request::GetChangesSince`, which is not a serde type.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GetChangesSince {
-    scope: Scope,
-    cursor: Seq,
-    limit: u32,
-}
-
-/// Mirrors `machine::Request::GetSnapshot`, which is not a serde type.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GetSnapshot {
-    scope: Scope,
-    page_token: Option<String>,
-}
-
-/// Mirrors `machine::Request::Upload` (`types::Upload`), which is not a serde type.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Upload {
-    upload_id: Uuid,
-    doc_id: Uuid,
-    kind: String,
-    base_hash: Option<String>,
-    payload: Value,
-}
-
-/// Mirrors `machine::Request::GetDocument`, which is not a serde type.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GetDocument {
-    doc_id: Uuid,
-}
-
-/// The websocket connect query params.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SocketConnectParams {
-    protocol_version: String,
-    client_id: Uuid,
-}
-
-#[derive(Debug, Deserialize)]
-struct ReplyEnvelope {
-    status: String,
-    response: Value,
-}
-
 const FATAL_CODES: &[&str] = &["update_required", "auth_invalid", "account_disabled"];
+const JOIN_TIMESTAMP: i64 = 1_767_225_600;
 
 /// Every frame name the server fixture is expected to contain. Keeping this list explicit
 /// means a frame added on the server fails this test until the client covers it too.
@@ -147,52 +54,98 @@ const EXPECTED_FRAME_NAMES: &[&str] = &[
     "validation_reply",
 ];
 
-fn load_frames() -> serde_json::Map<String, Value> {
+fn load_frames() -> Map<String, Value> {
     let root: Value = serde_json::from_str(FRAMES_JSON).expect("v2_frames.json must parse");
     root.as_object()
         .expect("v2_frames.json must be a JSON object of named frames")
         .clone()
 }
 
-/// Parses a named entry as a `[join_ref, ref, topic, event, payload]` frame and returns its
-/// payload, asserting the topic and event match.
-fn frame_payload(frames: &serde_json::Map<String, Value>, name: &str, event: &str) -> Value {
-    let frame = frames[name]
-        .as_array()
-        .unwrap_or_else(|| panic!("{name} must be a 5-element phoenix frame array"));
-    assert_eq!(frame.len(), 5, "{name} must have 5 frame elements");
-    assert_eq!(
-        frame[2],
-        Value::String("sync:v2".to_string()),
-        "{name} has unexpected topic"
-    );
-    assert_eq!(
-        frame[3],
-        Value::String(event.to_string()),
-        "{name} has unexpected event"
-    );
-    frame[4].clone()
+fn auth() -> JoinAuth {
+    JoinAuth {
+        email: "wire@example.com".into(),
+        api_key: "<api_key>".into(),
+        api_secret: "rps_test".into(),
+    }
 }
 
-/// Parses a named entry as a `phx_reply` frame and returns its `response`, asserting `status`.
-fn reply_response(frames: &serde_json::Map<String, Value>, name: &str, status: &str) -> Value {
-    let payload = frame_payload(frames, name, "phx_reply");
-    let envelope: ReplyEnvelope = serde_json::from_value(payload)
+/// A codec that has joined with ref "1", as every recorded channel frame assumes.
+fn joined_codec() -> Codec {
+    let mut codec = Codec::new();
+    codec.encode(1, &Request::Join, &auth(), JOIN_TIMESTAMP);
+    codec
+}
+
+fn encode(codec: &mut Codec, req: u64, request: &Request) -> Value {
+    serde_json::from_str(&codec.encode(req, request, &auth(), JOIN_TIMESTAMP))
+        .expect("codec writes JSON")
+}
+
+/// Sends `request` with ref "2", as recorded, and decodes the named reply to it.
+fn reply_to(
+    frames: &Map<String, Value>,
+    name: &str,
+    request: &Request,
+) -> Result<Response, ServerError> {
+    let mut codec = joined_codec();
+    codec.encode(2, request, &auth(), JOIN_TIMESTAMP);
+    match codec.decode(&frames[name].to_string()) {
+        Some(Incoming::Reply { req: 2, result }) => result,
+        other => panic!("{name}: expected a reply to ref 2, got {other:?}"),
+    }
+}
+
+fn expect_error(name: &str, result: Result<Response, ServerError>) -> ServerError {
+    let error = result.expect_err(name);
+    assert_eq!(
+        error.is_fatal,
+        FATAL_CODES.contains(&error.code.as_str()),
+        "{name}: is_fatal mismatch for code {}",
+        error.code
+    );
+    error
+}
+
+/// The raw `response` of a recorded reply, for keys `ServerError` does not keep.
+fn raw_response(frames: &Map<String, Value>, name: &str) -> Value {
+    let envelope: ReplyEnvelope = serde_json::from_value(frames[name][4].clone())
         .unwrap_or_else(|e| panic!("{name} payload must be a reply envelope: {e}"));
-    assert_eq!(envelope.status, status, "{name} has unexpected status");
     envelope.response
 }
 
-fn assert_error_shape(name: &str, response: Value) -> WireError {
-    let err: WireError = serde_json::from_value(response)
-        .unwrap_or_else(|e| panic!("{name} must parse as WireError: {e}"));
-    assert_eq!(
-        err.is_fatal,
-        FATAL_CODES.contains(&err.code.as_str()),
-        "{name}: is_fatal mismatch for code {}",
-        err.code
-    );
-    err
+fn changes_request() -> Request {
+    Request::GetChangesSince {
+        scope: "own".into(),
+        cursor: 0,
+        limit: 500,
+    }
+}
+
+fn snapshot_request() -> Request {
+    Request::GetSnapshot {
+        scope: "own".into(),
+        page_token: None,
+    }
+}
+
+fn document_request() -> Request {
+    Request::GetDocument {
+        doc_id: Uuid::nil(),
+    }
+}
+
+fn upload(kind: UploadKind, base_hash: Option<String>, payload: Value) -> Request {
+    Request::Upload(Upload {
+        upload_id: Uuid::nil(),
+        doc_id: Uuid::nil(),
+        kind,
+        base_hash,
+        payload,
+    })
+}
+
+fn create_upload() -> Request {
+    upload(UploadKind::Create, None, json!({"title": "Wire"}))
 }
 
 #[test]
@@ -204,283 +157,295 @@ fn every_expected_frame_is_present_and_no_others() {
 }
 
 #[test]
-fn change_push_upsert_deserializes_into_change() {
+fn change_pushes_decode_into_changes() {
     let frames = load_frames();
-    let payload = frame_payload(&frames, "change_push", "change");
-    let change: Change = serde_json::from_value(payload).expect("change_push must be a Change");
-    assert_eq!(change.kind, ChangeKind::Upsert);
-    assert!(change.doc.is_some());
-    assert!(change.prev_seq < change.seq);
+    let mut codec = joined_codec();
+
+    let Some(Incoming::Push(upsert)) = codec.decode(&frames["change_push"].to_string()) else {
+        panic!("change_push must decode as a push");
+    };
+    assert_eq!(upsert.kind, ChangeKind::Upsert);
+    assert!(upsert.doc.is_some());
+    assert!(upsert.prev_seq < upsert.seq);
+
+    let Some(Incoming::Push(delete)) = codec.decode(&frames["change_push_delete"].to_string())
+    else {
+        panic!("change_push_delete must decode as a push");
+    };
+    assert_eq!(delete.kind, ChangeKind::Delete);
+    assert_eq!(delete.doc, None);
+    assert!(delete.prev_seq < delete.seq);
 }
 
 #[test]
-fn change_push_delete_has_no_doc_and_advances_seq() {
+fn changes_replies_decode_into_response_changes() {
     let frames = load_frames();
-    let payload = frame_payload(&frames, "change_push_delete", "change");
-    let change: Change =
-        serde_json::from_value(payload).expect("change_push_delete must be a Change");
-    assert_eq!(change.kind, ChangeKind::Delete);
-    assert_eq!(change.doc, None);
-    assert!(change.prev_seq < change.seq);
+    assert_eq!(
+        reply_to(&frames, "changes_reply", &changes_request()),
+        Ok(Response::Changes {
+            changes: vec![],
+            next_cursor: 2,
+            has_more: false
+        })
+    );
+    let Ok(Response::Changes {
+        changes,
+        next_cursor: 4,
+        has_more: false,
+    }) = reply_to(&frames, "changes_reply_populated", &changes_request())
+    else {
+        panic!("changes_reply_populated must decode as a changes page");
+    };
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].kind, ChangeKind::Delete);
+    assert_eq!(changes[0].doc, None);
 }
 
 #[test]
-fn changes_reply_empty_deserializes_into_changes_response() {
+fn snapshot_reply_decodes_into_snapshot_page() {
     let frames = load_frames();
-    let response = reply_response(&frames, "changes_reply", "ok");
-    let page: WireChangesResponse =
-        serde_json::from_value(response).expect("changes_reply must match Response::Changes");
-    assert!(page.changes.is_empty());
-    assert!(!page.has_more);
-    assert_eq!(page.next_cursor, 2);
+    let Ok(Response::SnapshotPage {
+        docs,
+        snapshot_seq,
+        next_page_token,
+    }) = reply_to(&frames, "snapshot_reply", &snapshot_request())
+    else {
+        panic!("snapshot_reply must decode as a snapshot page");
+    };
+    assert_eq!(docs.len(), 1);
+    assert_eq!(snapshot_seq, 3);
+    assert_eq!(next_page_token, None);
 }
 
 #[test]
-fn changes_reply_populated_deserializes_every_changes_item() {
+fn join_reply_decodes_as_joined_with_the_user_id() {
     let frames = load_frames();
-    let response = reply_response(&frames, "changes_reply_populated", "ok");
-    let page: WireChangesResponse = serde_json::from_value(response)
-        .expect("changes_reply_populated must match Response::Changes");
-    assert_eq!(page.changes.len(), 1);
-    assert_eq!(page.changes[0].kind, ChangeKind::Delete);
-    assert_eq!(page.changes[0].doc, None);
+    let mut codec = joined_codec();
+    assert_eq!(
+        codec.decode(&frames["join_reply"].to_string()),
+        Some(Incoming::Joined {
+            req: 1,
+            user_id: Uuid::nil()
+        })
+    );
 }
 
 #[test]
-fn snapshot_reply_deserializes_into_snapshot_response() {
+fn document_shaped_replies_decode_into_doc_envelopes() {
     let frames = load_frames();
-    let response = reply_response(&frames, "snapshot_reply", "ok");
-    let page: WireSnapshotResponse =
-        serde_json::from_value(response).expect("snapshot_reply must match Response::SnapshotPage");
-    assert_eq!(page.docs.len(), 1);
-    assert_eq!(page.snapshot_seq, 3);
-    assert_eq!(page.next_page_token, None);
-}
-
-#[test]
-fn join_reply_carries_protocol_version_two() {
-    let frames = load_frames();
-    let response = reply_response(&frames, "join_reply", "ok");
-    let join: WireJoinReply =
-        serde_json::from_value(response).expect("join_reply must parse as WireJoinReply");
-    assert_eq!(join.protocol_version, 2);
-    assert_eq!(join.user_id, Uuid::from_u128(0));
-}
-
-#[test]
-fn document_shaped_replies_deserialize_into_doc_envelope() {
-    let frames = load_frames();
-    for name in [
-        "document_reply",
-        "publish_reply",
-        "publish_update_reply",
-        "unpublish_reply",
-        "upload_reply",
-    ] {
-        let response = reply_response(&frames, name, "ok");
-        let _doc: DocEnvelope =
-            serde_json::from_value(response).unwrap_or_else(|e| panic!("{name}: {e}"));
+    assert!(matches!(
+        reply_to(&frames, "document_reply", &document_request()),
+        Ok(Response::Document(_))
+    ));
+    assert!(matches!(
+        reply_to(&frames, "upload_reply", &create_upload()),
+        Ok(Response::Uploaded(_))
+    ));
+    // The client sends no publish requests yet; their replies still share the envelope.
+    for name in ["publish_reply", "publish_update_reply", "unpublish_reply"] {
+        let _doc: DocEnvelope = serde_json::from_value(raw_response(&frames, name))
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
     }
 }
 
 #[test]
-fn error_replies_and_socket_refusal_parse_extra_keys() {
+fn error_replies_decode_into_server_errors() {
     let frames = load_frames();
 
-    let cursor_too_old = assert_error_shape(
+    let cursor_too_old = expect_error(
         "cursor_too_old_reply",
-        reply_response(&frames, "cursor_too_old_reply", "error"),
+        reply_to(&frames, "cursor_too_old_reply", &changes_request()),
     );
-    assert_eq!(cursor_too_old.scope.as_deref(), Some("own"));
+    assert_eq!(cursor_too_old.code, "cursor_too_old");
     assert_eq!(cursor_too_old.retry_after_ms, None);
+    assert_eq!(
+        raw_response(&frames, "cursor_too_old_reply")["scope"],
+        "own"
+    );
 
-    let deleted = assert_error_shape(
+    let deleted = expect_error(
         "deleted_reply",
-        reply_response(&frames, "deleted_reply", "error"),
+        reply_to(&frames, "deleted_reply", &document_request()),
     );
+    assert_eq!(deleted.code, "deleted");
     assert_eq!(deleted.current_seq, Some(4));
-    assert!(deleted.doc_id.is_some());
+    assert!(raw_response(&frames, "deleted_reply")["doc_id"].is_string());
 
-    let exists = assert_error_shape(
+    let exists = expect_error(
         "exists_reply",
-        reply_response(&frames, "exists_reply", "error"),
+        reply_to(&frames, "exists_reply", &create_upload()),
     );
+    assert_eq!(exists.code, "exists");
     assert!(exists.existing_owner.is_some());
-    assert!(exists.doc_id.is_some());
 
-    let hash_mismatch = assert_error_shape(
+    let hash_mismatch = expect_error(
         "hash_mismatch_reply",
-        reply_response(&frames, "hash_mismatch_reply", "error"),
+        reply_to(&frames, "hash_mismatch_reply", &create_upload()),
     );
     assert!(hash_mismatch.current_hash.is_some());
     assert_eq!(hash_mismatch.current_seq, Some(3));
 
-    let join_error = assert_error_shape(
-        "join_error_reply",
-        reply_response(&frames, "join_error_reply", "error"),
+    let forbidden = expect_error(
+        "subscription_forbidden_reply",
+        reply_to(&frames, "subscription_forbidden_reply", &snapshot_request()),
     );
+    assert_eq!(forbidden.code, "subscription_forbidden");
+    assert_eq!(
+        raw_response(&frames, "subscription_forbidden_reply")["scope"],
+        "collection:nope"
+    );
+
+    let too_large = expect_error(
+        "too_large_reply",
+        reply_to(&frames, "too_large_reply", &create_upload()),
+    );
+    assert_eq!(too_large.code, "too_large");
+    assert!(raw_response(&frames, "too_large_reply")["doc_id"].is_string());
+
+    let validation = expect_error(
+        "validation_reply",
+        reply_to(&frames, "validation_reply", &create_upload()),
+    );
+    assert_eq!(validation.code, "validation");
+}
+
+#[test]
+fn join_errors_and_socket_refusal_are_fatal_server_errors() {
+    let frames = load_frames();
+    let mut codec = joined_codec();
+    let Some(Incoming::Reply { req: 1, result }) =
+        codec.decode(&frames["join_error_reply"].to_string())
+    else {
+        panic!("join_error_reply must decode as a reply to the join");
+    };
+    let join_error = expect_error("join_error_reply", result);
     assert_eq!(join_error.code, "auth_invalid");
     assert!(join_error.is_fatal);
 
-    let subscription_forbidden = assert_error_shape(
-        "subscription_forbidden_reply",
-        reply_response(&frames, "subscription_forbidden_reply", "error"),
-    );
-    assert_eq!(
-        subscription_forbidden.scope.as_deref(),
-        Some("collection:nope")
-    );
-
-    let too_large = assert_error_shape(
-        "too_large_reply",
-        reply_response(&frames, "too_large_reply", "error"),
-    );
-    assert!(too_large.doc_id.is_some());
-
-    assert_error_shape(
-        "validation_reply",
-        reply_response(&frames, "validation_reply", "error"),
-    );
-
-    let socket_refusal = &frames["socket_refusal"];
-    let refusal = assert_error_shape("socket_refusal", socket_refusal.clone());
+    let refusal: ServerError = serde_json::from_value(frames["socket_refusal"].clone())
+        .expect("socket_refusal must parse as ServerError");
     assert_eq!(refusal.code, "update_required");
     assert!(refusal.is_fatal);
 }
 
 #[test]
-fn client_push_requests_carry_their_expected_ids() {
+fn socket_url_carries_the_recorded_connect_params() {
     let frames = load_frames();
-
-    let publish = frame_payload(&frames, "publish_request", "publish");
-    assert!(publish
-        .get("source_doc_id")
-        .and_then(Value::as_str)
-        .is_some());
-
-    let publish_update = frame_payload(&frames, "publish_update_request", "publish_update");
-    assert!(publish_update
-        .get("publication_id")
-        .and_then(Value::as_str)
-        .is_some());
-
-    let unpublish = frame_payload(&frames, "unpublish_request", "unpublish");
-    assert!(unpublish
-        .get("publication_id")
-        .and_then(Value::as_str)
-        .is_some());
+    let url = url::Url::parse(&socket_url("ws://localhost:4000", Uuid::nil()).unwrap()).unwrap();
+    let params: Map<String, Value> = url
+        .query_pairs()
+        .filter(|(key, _)| key != "vsn")
+        .map(|(key, value)| (key.into_owned(), Value::String(value.into_owned())))
+        .collect();
+    assert_eq!(Value::Object(params), frames["socket_connect_params"]);
 }
 
-fn upload_kind(kind: &str) -> UploadKind {
-    match kind {
-        "create" => UploadKind::Create,
-        "update" => UploadKind::Update,
-        "delete" => UploadKind::Delete,
-        other => panic!("unknown upload kind {other}"),
+#[test]
+fn join_request_matches_the_recorded_frame_with_a_real_signature() {
+    let frames = load_frames();
+    let join = encode(&mut Codec::new(), 1, &Request::Join);
+    let recorded = &frames["join_request"];
+    for i in 0..4 {
+        assert_eq!(join[i], recorded[i], "join frame element {i}");
     }
-}
-
-fn upload_request(frames: &serde_json::Map<String, Value>, name: &str) -> (Value, Upload) {
-    let payload = frame_payload(frames, name, "upload");
-    let upload: Upload = serde_json::from_value(payload.clone())
-        .unwrap_or_else(|e| panic!("{name} must match Request::Upload: {e}"));
-    assert_eq!(upload.upload_id, Uuid::nil(), "{name}");
-    assert_eq!(upload.doc_id, Uuid::nil(), "{name}");
-    (payload, upload)
-}
-
-#[test]
-fn socket_connect_and_join_requests_carry_the_contract_fields() {
-    let frames = load_frames();
-
-    let connect: SocketConnectParams =
-        serde_json::from_value(frames["socket_connect_params"].clone())
-            .expect("socket_connect_params must match the connect query params");
-    assert_eq!(connect.protocol_version, "2");
-    assert_eq!(connect.client_id, Uuid::nil());
-
-    let join = frame_payload(&frames, "join_request", "phx_join");
-    let join: Join = serde_json::from_value(join).expect("join_request must match Request::Join");
-    assert!(join.email.contains('@'));
-    assert!(!join.api_key.is_empty());
-    assert_eq!(join.signature.len(), 64);
-    assert!(join.timestamp > 0);
+    let ours = join[4].as_object().unwrap();
+    let theirs = recorded[4].as_object().unwrap();
+    assert_eq!(
+        ours.keys().collect::<BTreeSet<_>>(),
+        theirs.keys().collect::<BTreeSet<_>>()
+    );
+    for key in ["email", "api_key", "timestamp"] {
+        assert_eq!(ours[key], theirs[key], "{key}");
+    }
+    assert_eq!(
+        ours["signature"],
+        "c53b53ad283f08d4cd2e9261f8f65d08dc0815b8ad0ff41aa4574f293bb1d9c2"
+    );
 }
 
 #[test]
-fn feed_and_document_requests_match_their_request_variants() {
+fn feed_and_document_requests_match_the_recorded_frames() {
     let frames = load_frames();
-
-    let changes: GetChangesSince = serde_json::from_value(frame_payload(
-        &frames,
-        "changes_request",
-        "get_changes_since",
-    ))
-    .expect("changes_request must match Request::GetChangesSince");
-    assert_eq!(changes.scope, "own");
-    assert!(changes.cursor >= 0 && changes.limit > 0);
-
-    let first_page = frame_payload(&frames, "snapshot_request", "get_snapshot");
-    assert!(first_page.get("page_token").is_none());
-    let first_page: GetSnapshot = serde_json::from_value(first_page)
-        .expect("snapshot_request must match Request::GetSnapshot");
-    assert_eq!(first_page.scope, "own");
-    assert_eq!(first_page.page_token, None);
-
-    let next_page: GetSnapshot = serde_json::from_value(frame_payload(
-        &frames,
-        "snapshot_page_request",
-        "get_snapshot",
-    ))
-    .expect("snapshot_page_request must match Request::GetSnapshot");
-    let token = next_page
-        .page_token
-        .expect("snapshot_page_request must carry a page_token");
-    let (seq, id) = token
-        .split_once(':')
-        .expect("page_token is <snapshot_seq>:<doc_id>");
-    assert!(seq.parse::<Seq>().is_ok());
-    assert!(Uuid::parse_str(id).is_ok());
-
-    let document: GetDocument =
-        serde_json::from_value(frame_payload(&frames, "document_request", "get_document"))
-            .expect("document_request must match Request::GetDocument");
-    assert_eq!(document.doc_id, Uuid::nil());
+    let mut codec = joined_codec();
+    assert_eq!(
+        encode(&mut codec, 2, &changes_request()),
+        frames["changes_request"]
+    );
+    assert_eq!(
+        encode(&mut codec, 2, &snapshot_request()),
+        frames["snapshot_request"]
+    );
+    let next_page = Request::GetSnapshot {
+        scope: "own".into(),
+        page_token: Some(format!("3:{}", Uuid::nil())),
+    };
+    assert_eq!(
+        encode(&mut codec, 2, &next_page),
+        frames["snapshot_page_request"]
+    );
+    assert_eq!(
+        encode(&mut codec, 2, &document_request()),
+        frames["document_request"]
+    );
 }
 
 #[test]
-fn upload_requests_match_request_upload_per_kind() {
+fn upload_requests_match_the_recorded_frames_per_kind() {
     let frames = load_frames();
+    let mut codec = joined_codec();
+    assert_eq!(
+        encode(&mut codec, 2, &create_upload()),
+        frames["upload_create_request"]
+    );
+    let recorded_update = &frames["upload_update_request"][4];
+    let update = upload(
+        UploadKind::Update,
+        recorded_update["base_hash"].as_str().map(String::from),
+        recorded_update["payload"].clone(),
+    );
+    assert_eq!(
+        encode(&mut codec, 2, &update),
+        frames["upload_update_request"]
+    );
+    assert_eq!(
+        encode(
+            &mut codec,
+            2,
+            &upload(UploadKind::Delete, None, Value::Null)
+        ),
+        frames["upload_delete_request"]
+    );
+}
 
-    let (raw, create) = upload_request(&frames, "upload_create_request");
-    assert_eq!(upload_kind(&create.kind), UploadKind::Create);
-    assert!(raw.get("base_hash").is_none());
-    assert!(create.payload.is_object());
-
-    let (_raw, update) = upload_request(&frames, "upload_update_request");
-    assert_eq!(upload_kind(&update.kind), UploadKind::Update);
-    assert!(update.base_hash.is_some());
-    assert!(update.payload.is_array());
-
-    let (raw, delete) = upload_request(&frames, "upload_delete_request");
-    assert_eq!(upload_kind(&delete.kind), UploadKind::Delete);
-    assert!(raw.get("base_hash").is_none());
-    assert!(delete.payload.is_null());
+#[test]
+fn publish_requests_carry_their_ids() {
+    let frames = load_frames();
+    for (name, event, key) in [
+        ("publish_request", "publish", "source_doc_id"),
+        ("publish_update_request", "publish_update", "publication_id"),
+        ("unpublish_request", "unpublish", "publication_id"),
+    ] {
+        assert_eq!(frames[name][2], "sync:v2", "{name}");
+        assert_eq!(frames[name][3], event, "{name}");
+        assert!(frames[name][4][key].is_string(), "{name}");
+    }
 }
 
 /// Never compare a client-computed hash to a server hash: the server hash is authoritative.
 #[test]
-fn float_content_deserializes_but_client_hash_is_not_the_server_hash() {
+fn float_content_decodes_but_client_hash_is_not_the_server_hash() {
     let frames = load_frames();
-
-    let upload_response = reply_response(&frames, "float_upload_reply", "ok");
-    let upload_doc: DocEnvelope =
-        serde_json::from_value(upload_response).expect("float_upload_reply must be a DocEnvelope");
+    let Ok(Response::Uploaded(upload_doc)) =
+        reply_to(&frames, "float_upload_reply", &create_upload())
+    else {
+        panic!("float_upload_reply must decode as an upload reply");
+    };
     assert_eq!(upload_doc.seq, 5);
-
-    let document_response = reply_response(&frames, "float_document_reply", "ok");
-    let document_doc: DocEnvelope = serde_json::from_value(document_response)
-        .expect("float_document_reply must be a DocEnvelope");
+    let Ok(Response::Document(document_doc)) =
+        reply_to(&frames, "float_document_reply", &document_request())
+    else {
+        panic!("float_document_reply must decode as a document reply");
+    };
 
     assert_eq!(
         upload_doc.hash, document_doc.hash,
