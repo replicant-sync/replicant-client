@@ -59,11 +59,21 @@ fn next_input(rng: &mut Jitter, outstanding: &mut Vec<(u64, Request)>, socket_ge
     } else {
         socket_gen.saturating_sub(1)
     };
+    let mut refused = super::types::ServerError::new(if rng.next_unit() < 0.2 {
+        "update_required"
+    } else {
+        "rate_limited"
+    });
+    refused.is_fatal = refused.code == "update_required";
     pick(
         rng,
         &[
             Input::SocketOpened { gen: socket_gen },
             Input::SocketClosed { gen: closed_gen },
+            Input::ConnectRefused {
+                gen: closed_gen,
+                error: refused,
+            },
             Input::Reconnect,
             Input::OutboxChanged,
             Input::Timer(TimerId::Reconnect),
@@ -106,11 +116,13 @@ impl Harness {
     fn feed(&mut self, input: Input) {
         let mut queue = std::collections::VecDeque::from([input]);
         while let Some(input) = queue.pop_front() {
-            if input
-                == (Input::SocketClosed {
-                    gen: self.socket_gen,
-                })
-            {
+            let closes_current = match &input {
+                Input::SocketClosed { gen } | Input::ConnectRefused { gen, .. } => {
+                    *gen == self.socket_gen
+                }
+                _ => false,
+            };
+            if closes_current {
                 self.socket_open = false;
             }
             for e in self.core.step(input) {

@@ -157,6 +157,11 @@ pub enum Input {
     SocketClosed {
         gen: u64,
     },
+    /// The server refused the websocket upgrade (HTTP 426 → `update_required`).
+    ConnectRefused {
+        gen: u64,
+        error: ServerError,
+    },
     Reply {
         req: u64,
         result: Result<Response, ServerError>,
@@ -473,6 +478,18 @@ impl Core {
                 Conn::Connected(_) => self.lose_connection(fx),
                 _ => {}
             },
+            Input::ConnectRefused { gen, .. } if gen != self.socket_gen => {}
+            Input::ConnectRefused { error, .. } => {
+                if let Conn::Connecting { .. } = self.conn {
+                    match Self::halt_reason_for(&error) {
+                        Some(reason) => {
+                            fx.push(Effect::Cancel(TimerId::ConnectTimeout));
+                            self.halt(reason, fx);
+                        }
+                        None => self.fail_connect(error.retry_after_ms, fx),
+                    }
+                }
+            }
             Input::Reply { req, result } => self.on_reply(req, result, fx),
             Input::Timer(timer) => self.on_timer(timer, fx),
             Input::Cursors(list) => self.on_cursors(list, fx),
@@ -1404,6 +1421,76 @@ mod connection_tests {
         assert_eq!(c.state().connection, ConnectionView::Connecting);
         let fx = c.step(Input::SocketOpened { gen: 2 });
         assert_eq!(sends(&fx).pop().map(|(_, r)| r), Some(Request::Join));
+    }
+
+    fn update_required() -> ServerError {
+        let mut error = ServerError::new("update_required");
+        error.is_fatal = true;
+        error
+    }
+
+    #[test]
+    fn connect_refused_update_required_halts_without_retry() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let fx = c.step(Input::ConnectRefused {
+            gen: c.socket_gen,
+            error: update_required(),
+        });
+        assert_eq!(
+            c.state().connection,
+            ConnectionView::Halted(HaltReason::UpdateRequired)
+        );
+        assert!(fx.contains(&Effect::Cancel(TimerId::ConnectTimeout)));
+        assert!(!fx.iter().any(|e| matches!(
+            e,
+            Effect::Schedule {
+                timer: TimerId::HaltRetry | TimerId::Reconnect,
+                ..
+            }
+        )));
+        assert!(emitted(&fx).iter().any(|l| matches!(
+            l,
+            Lifecycle::SyncError { fatal: true, code, .. } if code == "update_required"
+        )));
+    }
+
+    #[test]
+    fn connect_refused_transient_backs_off_with_retry_after() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let mut error = ServerError::new("rate_limited");
+        error.retry_after_ms = Some(4_000);
+        let fx = c.step(Input::ConnectRefused {
+            gen: c.socket_gen,
+            error,
+        });
+        assert_eq!(c.state().connection, ConnectionView::Disconnected);
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::Reconnect,
+            after: Duration::from_millis(4_000)
+        }));
+    }
+
+    #[test]
+    fn stale_connect_refused_is_ignored() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        c.step(Input::Timer(TimerId::ConnectTimeout));
+        c.step(Input::Timer(TimerId::Reconnect));
+        assert!(c
+            .step(Input::ConnectRefused {
+                gen: 1,
+                error: update_required(),
+            })
+            .is_empty());
+        assert_eq!(c.state().connection, ConnectionView::Connecting);
     }
 
     #[test]
