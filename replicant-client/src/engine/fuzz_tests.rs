@@ -69,6 +69,9 @@ fn next_input(rng: &mut Jitter, outstanding: &mut Vec<(u64, Request)>, socket_ge
         rng,
         &[
             Input::SocketOpened { gen: socket_gen },
+            Input::SocketOpened {
+                gen: socket_gen.saturating_sub(1),
+            },
             Input::SocketClosed { gen: closed_gen },
             Input::ConnectRefused {
                 gen: closed_gen,

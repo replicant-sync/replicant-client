@@ -343,6 +343,9 @@ struct Session {
     mismatch_attempts: HashMap<Uuid, u32>,
     catch_up_failures: HashMap<Scope, u32>,
     unreadable_pushes: HashMap<Option<Scope>, u32>,
+    /// Scopes that took an unreadable push while not `Live`; the push may be the one change
+    /// `finish_scope` would otherwise seal past, so it rechecks once more before going `Live`.
+    recheck_before_live: HashSet<Scope>,
     pump_scheduled: bool,
     pump_deferred: bool,
 }
@@ -1047,11 +1050,19 @@ impl Core {
                 fatal: false,
             }));
         }
-        let live: Vec<Scope> = names
-            .into_iter()
-            .filter(|name| scope.as_ref().is_none_or(|wanted| wanted == name))
-            .filter(|name| s.scopes.get(name) == Some(&ScopeSync::Live))
-            .collect();
+        let mut live = Vec::new();
+        for name in names {
+            if scope.as_ref().is_some_and(|wanted| wanted != &name) {
+                continue;
+            }
+            match s.scopes.get(&name) {
+                Some(ScopeSync::Live) => live.push(name),
+                Some(ScopeSync::Dropped) | None => {}
+                Some(_) => {
+                    s.recheck_before_live.insert(name);
+                }
+            }
+        }
         for name in live {
             self.start_catch_up(&name, fx);
         }
@@ -1102,6 +1113,16 @@ impl Core {
     }
 
     fn finish_scope(&mut self, scope: &str, fx: &mut Vec<Effect>) {
+        let owes_recheck = {
+            let Some(s) = self.session() else { return };
+            s.recheck_before_live.remove(scope)
+        };
+        if owes_recheck {
+            // An unreadable push arrived before this page sealed; it may be the change that
+            // page missed, so check once more instead of declaring the scope live.
+            self.start_catch_up(scope, fx);
+            return;
+        }
         let Some(s) = self.session() else { return };
         s.scopes.insert(scope.to_string(), ScopeSync::Live);
         s.catch_up_failures.remove(scope);
@@ -1395,6 +1416,11 @@ pub(crate) mod harness {
                 _ => None,
             })
             .collect()
+    }
+
+    pub fn scope_is_live(c: &mut Core, scope: &str) -> bool {
+        c.session()
+            .is_some_and(|s| s.scopes.get(scope) == Some(&ScopeSync::Live))
     }
 }
 
@@ -2209,6 +2235,150 @@ mod catch_up_tests {
                 assert!(errors.is_empty(), "push {push}: {errors:?}");
             }
         }
+    }
+
+    #[test]
+    fn unreadable_push_before_the_final_page_defers_going_live() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        let own = changes_req(&fx, "own");
+        c.step(Input::Reply {
+            req: own,
+            result: Ok(Response::Changes {
+                changes: vec![],
+                next_cursor: 5,
+                has_more: false,
+            }),
+        });
+        // The push arrives while the page is still `Applying`, before it seals the scope live.
+        let fx = c.step(Input::UnreadablePush {
+            scope: Some("own".into()),
+        });
+        assert!(sends(&fx).is_empty());
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::Page(own),
+        });
+        assert!(sends(&fx).iter().any(|(_, r)| *r
+            == Request::GetChangesSince {
+                scope: "own".into(),
+                cursor: 5,
+                limit: PAGE_LIMIT
+            }));
+        assert!(!scope_is_live(&mut c, "own"));
+    }
+
+    #[test]
+    fn unreadable_push_during_snapshot_finishing_defers_going_live() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 0),
+            ("collection:curated".into(), 5),
+        ]));
+        let (snap_req, _) = sends(&fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetSnapshot { .. }))
+            .unwrap();
+        c.step(Input::Reply {
+            req: snap_req,
+            result: Ok(Response::SnapshotPage {
+                docs: vec![],
+                snapshot_seq: 40,
+                next_page_token: None,
+            }),
+        });
+        c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::SnapshotPage(snap_req),
+        });
+        // The push arrives while the scope is `SnapshotFinishing`, before it reaches a page
+        // that could seal it live.
+        c.step(Input::UnreadablePush {
+            scope: Some("own".into()),
+        });
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::SnapshotFinish(snap_req),
+        });
+        let changes_req_id = sends(&fx)
+            .into_iter()
+            .find(|(_, r)| {
+                *r == Request::GetChangesSince {
+                    scope: "own".into(),
+                    cursor: 40,
+                    limit: PAGE_LIMIT,
+                }
+            })
+            .map(|(req, _)| req)
+            .expect("catch-up from the snapshot sequence");
+        // That page is the first one reached since the push arrived; the mark it left on the
+        // scope forces one more round instead of sealing the scope live here.
+        c.step(Input::Reply {
+            req: changes_req_id,
+            result: Ok(Response::Changes {
+                changes: vec![],
+                next_cursor: 40,
+                has_more: false,
+            }),
+        });
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::Page(changes_req_id),
+        });
+        assert!(sends(&fx).iter().any(|(_, r)| *r
+            == Request::GetChangesSince {
+                scope: "own".into(),
+                cursor: 40,
+                limit: PAGE_LIMIT
+            }));
+        assert!(!scope_is_live(&mut c, "own"));
+    }
+
+    #[test]
+    fn recheck_that_finds_nothing_then_goes_live() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        let own = changes_req(&fx, "own");
+        c.step(Input::Reply {
+            req: own,
+            result: Ok(Response::Changes {
+                changes: vec![],
+                next_cursor: 5,
+                has_more: false,
+            }),
+        });
+        c.step(Input::UnreadablePush {
+            scope: Some("own".into()),
+        });
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::Page(own),
+        });
+        let recheck_req = changes_req(&fx, "own");
+        assert!(!scope_is_live(&mut c, "own"));
+        c.step(Input::Reply {
+            req: recheck_req,
+            result: Ok(Response::Changes {
+                changes: vec![],
+                next_cursor: 5,
+                has_more: false,
+            }),
+        });
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::Page(recheck_req),
+        });
+        assert!(sends(&fx).is_empty());
+        assert!(scope_is_live(&mut c, "own"));
     }
 
     #[test]
