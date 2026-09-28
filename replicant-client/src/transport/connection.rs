@@ -23,45 +23,65 @@ pub enum Received {
 
 pub struct Connection {
     url: String,
-    auth: JoinAuth,
+    auth: Option<JoinAuth>,
+    user_agent: String,
     current: Option<(SocketHandle, Codec)>,
     events_tx: mpsc::Sender<SocketEvent>,
     events_rx: mpsc::Receiver<SocketEvent>,
 }
 
 impl Connection {
-    pub fn new(url: String, auth: JoinAuth) -> Connection {
+    pub fn new(url: String, auth: Option<JoinAuth>, user_agent: String) -> Connection {
         let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER);
         Connection {
             url,
             auth,
+            user_agent,
             current: None,
             events_tx,
             events_rx,
         }
     }
 
+    /// The credentials the next `Request::Join` is signed with; an open socket is untouched.
+    pub fn set_auth(&mut self, auth: JoinAuth) {
+        self.auth = Some(auth);
+    }
+
     /// `Effect::OpenSocket`. Replaces (and so aborts) any current socket.
     pub fn open(&mut self, gen: u64) {
-        let socket = SocketHandle::open(self.url.clone(), gen, self.events_tx.clone());
+        let socket = SocketHandle::open(
+            self.url.clone(),
+            self.user_agent.clone(),
+            gen,
+            self.events_tx.clone(),
+        );
         self.current = Some((socket, Codec::new()));
     }
 
-    /// `Effect::CloseSocket`. Later events from that socket are dropped by `receive`.
+    /// `Effect::CloseSocket`: sends a Close frame; later events from that socket are dropped.
     pub fn close(&mut self, gen: u64) {
         if self.current_gen() == Some(gen) {
-            self.current = None;
+            if let Some((socket, _)) = self.current.take() {
+                let _detached = socket.close();
+            }
         }
     }
 
-    /// `Effect::Send`. Returns the input to feed back when the frame could not be queued.
+    /// `Effect::Send`. Returns the input to feed back when the frame could not be queued. With
+    /// no current socket the frame is dropped and `None` is returned: the core has been, or is
+    /// about to be, told `SocketClosed` for that socket.
     pub fn send(&mut self, req: u64, request: &Request, now_unix: i64) -> Option<Input> {
         let (socket, codec) = self.current.as_mut()?;
-        let text = codec.encode(req, request, &self.auth, now_unix);
-        if socket.send(text) {
+        let gen = socket.gen();
+        let queued = match &self.auth {
+            Some(auth) => socket.send(codec.encode(req, request, auth, now_unix)),
+            // Nothing can be signed without credentials, so the socket is of no use.
+            None => false,
+        };
+        if queued {
             return None;
         }
-        let gen = socket.gen();
         self.current = None;
         Some(Input::SocketClosed { gen })
     }
@@ -125,6 +145,9 @@ mod tests {
     use serde_json::json;
     use std::time::Duration;
     use tokio::time::timeout;
+    use tokio_tungstenite::tungstenite::Message;
+
+    const UA: &str = "replicant-client/test";
 
     fn auth() -> JoinAuth {
         JoinAuth {
@@ -149,7 +172,7 @@ mod tests {
     }
 
     async fn opened(server: &mut FakeServer) -> (Connection, FakeConnection) {
-        let mut connection = Connection::new(server.url.clone(), auth());
+        let mut connection = Connection::new(server.url.clone(), Some(auth()), UA.into());
         connection.open(1);
         assert_eq!(
             received(&mut connection).await,
@@ -163,7 +186,11 @@ mod tests {
     async fn joins_requests_pushes_and_heartbeats_over_one_socket() {
         let mut server = FakeServer::start().await;
         let client_id = Uuid::from_u128(9);
-        let mut connection = Connection::new(socket_url(&server.url, client_id).unwrap(), auth());
+        let mut connection = Connection::new(
+            socket_url(&server.url, client_id).unwrap(),
+            Some(auth()),
+            UA.into(),
+        );
         connection.open(1);
         assert_eq!(
             received(&mut connection).await,
@@ -241,7 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_from_other_generations_are_dropped() {
-        let mut connection = Connection::new("ws://127.0.0.1:9".into(), auth());
+        let mut connection = Connection::new("ws://127.0.0.1:9".into(), Some(auth()), UA.into());
         connection.open(1);
         connection.open(2);
         assert_eq!(connection.receive(SocketEvent::Opened { gen: 1 }), None);
@@ -265,7 +292,7 @@ mod tests {
     #[tokio::test]
     async fn http_426_becomes_connect_refused() {
         let url = refusing_server("426 Upgrade Required").await;
-        let mut connection = Connection::new(url, auth());
+        let mut connection = Connection::new(url, Some(auth()), UA.into());
         connection.open(4);
         let Received::Input(Input::ConnectRefused { gen: 4, error }) =
             received(&mut connection).await
@@ -363,5 +390,55 @@ mod tests {
         let (connection, mut conn) = opened(&mut server).await;
         drop(connection);
         conn.wait_closed().await;
+    }
+
+    #[tokio::test]
+    async fn set_auth_applies_to_the_next_join_only() {
+        let mut server = FakeServer::start().await;
+        let (mut connection, mut conn) = opened(&mut server).await;
+        assert_eq!(connection.send(1, &Request::Join, 0), None);
+        assert_eq!(conn.recv_json().await[4]["api_key"], json!("rpa_k"));
+        connection.set_auth(JoinAuth {
+            email: "a@b.c".into(),
+            api_key: "rpa_new".into(),
+            api_secret: "rps_new".into(),
+        });
+        assert_eq!(connection.send(2, &Request::Join, 0), None);
+        assert_eq!(
+            conn.recv_json().await[4]["api_key"],
+            json!("rpa_new"),
+            "same socket, new credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_without_credentials_reports_socket_closed() {
+        let mut server = FakeServer::start().await;
+        let mut connection = Connection::new(server.url.clone(), None, UA.into());
+        connection.open(1);
+        assert_eq!(
+            received(&mut connection).await,
+            Received::Input(Input::SocketOpened { gen: 1 })
+        );
+        let mut conn = server.accept().await;
+        assert_eq!(
+            connection.send(1, &Request::Join, 0),
+            Some(Input::SocketClosed { gen: 1 })
+        );
+        conn.wait_closed().await;
+    }
+
+    #[tokio::test]
+    async fn close_sends_a_close_frame_and_reports_nothing() {
+        let mut server = FakeServer::start().await;
+        let (mut connection, mut conn) = opened(&mut server).await;
+        connection.close(1);
+        assert!(matches!(conn.next_message().await, Some(Message::Close(_))));
+        assert!(
+            timeout(Duration::from_millis(300), connection.next_event())
+                .await
+                .is_err(),
+            "an explicit close reports no event"
+        );
     }
 }

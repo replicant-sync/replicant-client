@@ -1,11 +1,19 @@
 //! One websocket connection, run in its own task and tagged with the core's socket generation.
 
+use std::time::Duration;
+
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::header::USER_AGENT;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::{self, Message};
 
 use crate::engine::types::ServerError;
+
+/// How long an explicitly closed socket may take to send its Close frame before it is aborted.
+pub const CLOSE_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SocketEvent {
@@ -27,17 +35,40 @@ pub enum SocketEvent {
     },
 }
 
+enum Outgoing {
+    Text(String),
+    Close,
+}
+
 pub struct SocketHandle {
     gen: u64,
-    outgoing: mpsc::UnboundedSender<String>,
-    task: JoinHandle<()>,
+    outgoing: mpsc::UnboundedSender<Outgoing>,
+    /// `None` once `close` has detached the task.
+    task: Option<JoinHandle<()>>,
 }
 
 impl SocketHandle {
-    pub fn open(url: String, gen: u64, events: mpsc::Sender<SocketEvent>) -> SocketHandle {
-        let (outgoing, mut outgoing_rx) = mpsc::unbounded_channel::<String>();
+    pub fn open(
+        url: String,
+        user_agent: String,
+        gen: u64,
+        events: mpsc::Sender<SocketEvent>,
+    ) -> SocketHandle {
+        let (outgoing, mut outgoing_rx) = mpsc::unbounded_channel::<Outgoing>();
         let task = tokio::spawn(async move {
-            let ws = match tokio_tungstenite::connect_async(url.as_str()).await {
+            let Ok(mut request) = url.into_client_request() else {
+                let _ = events.send(SocketEvent::Closed { gen }).await;
+                return;
+            };
+            if let Ok(value) = HeaderValue::from_str(&user_agent) {
+                request.headers_mut().insert(USER_AGENT, value);
+            }
+            let dialed = tokio::select! {
+                dialed = tokio_tungstenite::connect_async(request) => dialed,
+                // Nothing but a close can be queued before the socket opens.
+                _ = outgoing_rx.recv() => return,
+            };
+            let ws = match dialed {
                 Ok((ws, _response)) => ws,
                 Err(error) => {
                     let event = match refusal(&error) {
@@ -54,11 +85,15 @@ impl SocketHandle {
             let (mut sink, mut stream) = ws.split();
             loop {
                 tokio::select! {
-                    text = outgoing_rx.recv() => match text {
-                        Some(text) => {
+                    outgoing = outgoing_rx.recv() => match outgoing {
+                        Some(Outgoing::Text(text)) => {
                             if sink.send(Message::Text(text)).await.is_err() {
                                 break;
                             }
+                        }
+                        Some(Outgoing::Close) => {
+                            let _ = sink.send(Message::Close(None)).await;
+                            return;
                         }
                         None => break,
                     },
@@ -78,7 +113,7 @@ impl SocketHandle {
         SocketHandle {
             gen,
             outgoing,
-            task,
+            task: Some(task),
         }
     }
 
@@ -88,17 +123,35 @@ impl SocketHandle {
 
     /// Queues a text frame; false once the socket task has ended.
     pub fn send(&self, text: String) -> bool {
-        self.outgoing.send(text).is_ok()
+        self.outgoing.send(Outgoing::Text(text)).is_ok()
     }
 
     pub fn is_finished(&self) -> bool {
-        self.task.is_finished()
+        self.task.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    /// Sends a Close frame and detaches the task: it ends on its own, reporting no event, or is
+    /// aborted after `CLOSE_GRACE`. The returned handle only lets a caller await that end.
+    pub fn close(mut self) -> JoinHandle<()> {
+        let task = self
+            .task
+            .take()
+            .expect("the task is only taken by close or drop");
+        let _ = self.outgoing.send(Outgoing::Close);
+        let abort = task.abort_handle();
+        tokio::spawn(async move {
+            tokio::time::sleep(CLOSE_GRACE).await;
+            abort.abort();
+        });
+        task
     }
 }
 
 impl Drop for SocketHandle {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
     }
 }
 
@@ -121,6 +174,8 @@ mod tests {
     use std::time::Duration;
     use tokio::time::timeout;
 
+    const UA: &str = "replicant-client/test";
+
     async fn next(events: &mut mpsc::Receiver<SocketEvent>) -> SocketEvent {
         timeout(Duration::from_secs(5), events.recv())
             .await
@@ -142,7 +197,7 @@ mod tests {
     async fn opens_and_exchanges_text_frames() {
         let mut server = FakeServer::start().await;
         let (events_tx, mut events) = mpsc::channel(16);
-        let socket = SocketHandle::open(server.url.clone(), 1, events_tx);
+        let socket = SocketHandle::open(server.url.clone(), UA.into(), 1, events_tx);
         assert_eq!(next(&mut events).await, SocketEvent::Opened { gen: 1 });
         let mut conn = server.accept().await;
         assert_eq!(conn.query, "");
@@ -165,7 +220,7 @@ mod tests {
     async fn peer_close_reports_closed_and_later_sends_fail() {
         let mut server = FakeServer::start().await;
         let (events_tx, mut events) = mpsc::channel(16);
-        let socket = SocketHandle::open(server.url.clone(), 3, events_tx);
+        let socket = SocketHandle::open(server.url.clone(), UA.into(), 3, events_tx);
         assert_eq!(next(&mut events).await, SocketEvent::Opened { gen: 3 });
         server.accept().await.close().await;
         assert_eq!(next(&mut events).await, SocketEvent::Closed { gen: 3 });
@@ -177,7 +232,7 @@ mod tests {
     async fn http_426_is_refused_with_update_required() {
         let url = refusing_server("426 Upgrade Required").await;
         let (events_tx, mut events) = mpsc::channel(16);
-        let _socket = SocketHandle::open(url, 2, events_tx);
+        let _socket = SocketHandle::open(url, UA.into(), 2, events_tx);
         let SocketEvent::Refused { gen: 2, error } = next(&mut events).await else {
             panic!("expected Refused for gen 2");
         };
@@ -189,13 +244,13 @@ mod tests {
     async fn other_http_errors_and_dial_failures_are_plain_closes() {
         let url = refusing_server("403 Forbidden").await;
         let (events_tx, mut events) = mpsc::channel(16);
-        let _forbidden = SocketHandle::open(url, 1, events_tx.clone());
+        let _forbidden = SocketHandle::open(url, UA.into(), 1, events_tx.clone());
         assert_eq!(next(&mut events).await, SocketEvent::Closed { gen: 1 });
 
         let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let dead_url = format!("ws://{}", unused.local_addr().unwrap());
         drop(unused);
-        let _dial = SocketHandle::open(dead_url, 2, events_tx);
+        let _dial = SocketHandle::open(dead_url, UA.into(), 2, events_tx);
         assert_eq!(next(&mut events).await, SocketEvent::Closed { gen: 2 });
     }
 
@@ -203,7 +258,7 @@ mod tests {
     async fn dropping_the_handle_ends_a_stalled_dial_without_events() {
         let url = silent_server().await;
         let (events_tx, mut events) = mpsc::channel(16);
-        let socket = SocketHandle::open(url, 1, events_tx);
+        let socket = SocketHandle::open(url, UA.into(), 1, events_tx);
         tokio::time::sleep(Duration::from_millis(50)).await;
         drop(socket);
         let after_drop = timeout(Duration::from_secs(5), events.recv())
@@ -216,7 +271,7 @@ mod tests {
     async fn dropping_an_open_handle_ends_the_task_without_events() {
         let mut server = FakeServer::start().await;
         let (events_tx, mut events) = mpsc::channel(16);
-        let socket = SocketHandle::open(server.url.clone(), 1, events_tx);
+        let socket = SocketHandle::open(server.url.clone(), UA.into(), 1, events_tx);
         assert_eq!(next(&mut events).await, SocketEvent::Opened { gen: 1 });
         let mut conn = server.accept().await;
         drop(socket);
@@ -225,5 +280,82 @@ mod tests {
             .expect("aborted task drops its sender");
         assert_eq!(after_drop, None);
         conn.wait_closed().await;
+    }
+
+    #[tokio::test]
+    async fn dial_sends_the_user_agent() {
+        let mut server = FakeServer::start().await;
+        let (events_tx, mut events) = mpsc::channel(16);
+        let _socket = SocketHandle::open(
+            server.url.clone(),
+            "replicant-client/9.9 (Test 1.0)".into(),
+            1,
+            events_tx,
+        );
+        assert_eq!(next(&mut events).await, SocketEvent::Opened { gen: 1 });
+        assert_eq!(
+            server.accept().await.user_agent.as_deref(),
+            Some("replicant-client/9.9 (Test 1.0)")
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_close_sends_a_close_frame() {
+        let mut server = FakeServer::start().await;
+        let (events_tx, mut events) = mpsc::channel(16);
+        let socket = SocketHandle::open(server.url.clone(), UA.into(), 1, events_tx);
+        assert_eq!(next(&mut events).await, SocketEvent::Opened { gen: 1 });
+        let mut conn = server.accept().await;
+        let task = socket.close();
+        assert!(matches!(conn.next_message().await, Some(Message::Close(_))));
+        let _ = timeout(Duration::from_secs(5), task)
+            .await
+            .expect("a closed socket's task ends");
+        let after_close = timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("the ended task drops its sender");
+        assert_eq!(after_close, None, "an explicit close reports no event");
+    }
+
+    #[tokio::test]
+    async fn close_ends_within_the_grace_period_when_the_peer_never_reads() {
+        let mut server = FakeServer::start().await;
+        let (events_tx, mut events) = mpsc::channel(16);
+        let socket = SocketHandle::open(server.url.clone(), UA.into(), 1, events_tx);
+        assert_eq!(next(&mut events).await, SocketEvent::Opened { gen: 1 });
+        let _never_read = server.accept().await;
+        let megabyte = "x".repeat(1 << 20);
+        for _ in 0..64 {
+            assert!(socket.send(megabyte.clone()));
+        }
+        // Let the task block in a text write against the full TCP buffers.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let started = std::time::Instant::now();
+        let task = socket.close();
+        let _ = timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the grace watchdog ends the task");
+        assert!(
+            started.elapsed() < CLOSE_GRACE + Duration::from_millis(500),
+            "close took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn close_during_a_stalled_dial_ends_the_task() {
+        let url = silent_server().await;
+        let (events_tx, mut events) = mpsc::channel(16);
+        let socket = SocketHandle::open(url, UA.into(), 1, events_tx);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let started = std::time::Instant::now();
+        let _ = timeout(Duration::from_secs(5), socket.close())
+            .await
+            .expect("a stalled dial ends on close");
+        assert!(started.elapsed() < CLOSE_GRACE);
+        let after_close = timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("the ended task drops its sender");
+        assert_eq!(after_close, None);
     }
 }

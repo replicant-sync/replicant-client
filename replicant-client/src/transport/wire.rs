@@ -125,6 +125,29 @@ pub fn socket_url(server_url: &str, client_id: Uuid) -> Result<String, String> {
     Ok(url.into())
 }
 
+/// `replicant-client/<version> (<host app> <host version>)`, the host part omitted when unset.
+/// Characters a header value cannot carry become `?`.
+pub fn user_agent(host_app: &str, host_version: &str) -> String {
+    let crate_part = format!("replicant-client/{}", env!("CARGO_PKG_VERSION"));
+    let host = format!("{host_app} {host_version}");
+    let host = host.trim();
+    let agent = if host.is_empty() {
+        crate_part
+    } else {
+        format!("{crate_part} ({host})")
+    };
+    agent
+        .chars()
+        .map(|c| {
+            if c == ' ' || c.is_ascii_graphic() {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +220,20 @@ mod tests {
                 "kind": "create",
                 "payload": {"title": "t"}
             })
+        );
+    }
+
+    #[test]
+    fn user_agent_names_the_crate_and_the_host() {
+        let version = env!("CARGO_PKG_VERSION");
+        assert_eq!(
+            user_agent("Entonal Studio", "2.0.1"),
+            format!("replicant-client/{version} (Entonal Studio 2.0.1)")
+        );
+        assert_eq!(user_agent("", ""), format!("replicant-client/{version}"));
+        assert_eq!(
+            user_agent("Entonal\u{e9}", "1\n"),
+            format!("replicant-client/{version} (Entonal? 1)")
         );
     }
 

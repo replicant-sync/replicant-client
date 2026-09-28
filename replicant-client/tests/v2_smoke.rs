@@ -52,7 +52,7 @@ async fn received(connection: &mut Connection) -> Received {
 }
 
 async fn opened(url: String, auth: JoinAuth) -> Connection {
-    let mut connection = Connection::new(url, auth);
+    let mut connection = Connection::new(url, Some(auth), "replicant-client/smoke".into());
     connection.open(1);
     assert_eq!(
         received(&mut connection).await,
@@ -113,7 +113,7 @@ async fn joins_requests_heartbeats_and_closes() {
 #[ignore = "needs a v2 server: run through test/run_phoenix_interop_local.sh"]
 async fn unsupported_protocol_version_is_refused_with_update_required() {
     let url = server_socket_url().replace("protocol_version=2", "protocol_version=1");
-    let mut connection = Connection::new(url, seeded_auth());
+    let mut connection = Connection::new(url, Some(seeded_auth()), "replicant-client/smoke".into());
     connection.open(1);
     let refused = received(&mut connection).await;
     let Received::Input(Input::ConnectRefused { gen: 1, error }) = refused else {

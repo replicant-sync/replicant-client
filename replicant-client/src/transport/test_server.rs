@@ -21,6 +21,7 @@ pub struct FakeServer {
 
 pub struct FakeConnection {
     pub query: String,
+    pub user_agent: Option<String>,
     ws: WebSocketStream<TcpStream>,
 }
 
@@ -32,16 +33,26 @@ impl FakeServer {
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
                 let mut query = String::new();
+                let mut user_agent = None;
                 let accepted = tokio_tungstenite::accept_hdr_async(
                     tcp,
                     |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
                         query = request.uri().query().unwrap_or_default().to_string();
+                        user_agent = request
+                            .headers()
+                            .get("user-agent")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string);
                         Ok(response)
                     },
                 )
                 .await;
                 if let Ok(ws) = accepted {
-                    let _ = connection_tx.send(FakeConnection { query, ws });
+                    let _ = connection_tx.send(FakeConnection {
+                        query,
+                        user_agent,
+                        ws,
+                    });
                 }
             }
         });
@@ -79,6 +90,14 @@ impl FakeConnection {
 
     pub async fn close(mut self) {
         let _ = self.ws.close(None).await;
+    }
+
+    /// The next websocket message of any kind; `None` once the client has gone.
+    pub async fn next_message(&mut self) -> Option<Message> {
+        timeout(WAIT, self.ws.next())
+            .await
+            .expect("message within 5 s")
+            .and_then(Result::ok)
     }
 
     /// Resolves once the client side has gone away.
