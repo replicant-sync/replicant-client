@@ -191,6 +191,7 @@ pub(crate) fn now_rfc3339() -> String {
 
 mod docs;
 mod feed;
+mod uploads;
 mod writes;
 
 #[cfg(test)]
