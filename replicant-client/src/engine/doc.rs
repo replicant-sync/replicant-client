@@ -389,6 +389,57 @@ pub fn apply_server_missing(snap: &DocSnapshot) -> Vec<DocOp> {
     }
 }
 
+/// Full resync: a local member of `scope` that the snapshot did not list has left it. A
+/// document with outbox rows, or whose membership is newer than the snapshot, is kept.
+pub fn sweep_doc(snap: &DocSnapshot, scope: &str, snapshot_seq: Seq) -> Vec<DocOp> {
+    if !snap.rows.is_empty() || membership_seq(snap, scope) > snapshot_seq {
+        return Vec::new();
+    }
+    let mut ops = vec![DocOp::SetMembership(Membership {
+        scope: scope.to_string(),
+        member: false,
+        seq: snapshot_seq,
+    })];
+    let after = snap.project(&ops);
+    if after.exists && !after.memberships.iter().any(|m| m.member) {
+        ops.push(DocOp::HardDelete);
+    }
+    ops
+}
+
+/// A full-resync snapshot document. It carries no `upload_id`, so it may already contain a v2
+/// upload of ours; array patch ops are index-based, so pending edits made against a
+/// v2-acknowledged shadow are never rebased onto it: they go to `recovered`. A shadow never
+/// acknowledged in v2 (seq 0 or none) cannot be in the snapshot, so those edits rebase.
+pub fn apply_snapshot_doc(
+    snap: &DocSnapshot,
+    scope: &str,
+    doc: &DocEnvelope,
+    me: Uuid,
+) -> Vec<DocOp> {
+    let mut ops = Vec::new();
+    if doc.seq > membership_seq(snap, scope) {
+        ops.push(DocOp::SetMembership(Membership {
+            scope: scope.to_string(),
+            member: true,
+            seq: doc.seq,
+        }));
+    }
+    if doc.seq <= snap.server_seq() {
+        return ops;
+    }
+    let member = snap
+        .project(&ops)
+        .memberships
+        .iter()
+        .any(|m| m.scope == scope && m.member);
+    if member {
+        let base_never_acknowledged = snap.shadow.as_ref().is_none_or(|s| s.seq == 0);
+        ops.extend(apply_upsert(snap, doc, doc.seq, base_never_acknowledged));
+    }
+    with_settle_invariant(snap, ops, me)
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Rebased {
     Clean(Value),
@@ -1392,6 +1443,41 @@ mod property_tests {
             self.must_catch_up = false;
         }
 
+        /// A full resync: the current envelope as a snapshot document; the cursor jumps past
+        /// every committed change.
+        fn snapshot(&mut self, server: &Server) {
+            let doc = server.envelope(server.seq());
+            // A pending delete wins unconditionally (shadow only); it is not a conflict.
+            let pending_delete = self
+                .snap
+                .rows
+                .last()
+                .is_some_and(|r| r.kind == RowKind::Delete);
+            let recovers = !self.snap.rows.is_empty()
+                && !pending_delete
+                && self.snap.shadow.as_ref().is_some_and(|s| s.seq > 0)
+                && doc.seq > self.snap.server_seq();
+            let pre_content = self.snap.content.clone();
+
+            let ops = apply_snapshot_doc(&self.snap, "own", &doc, ME);
+            if recovers {
+                assert!(
+                    ops.contains(&DocOp::Recover {
+                        content: pre_content,
+                        reason: RecoverReason::Conflict,
+                    }),
+                    "a v2-era doc with pending rows must recover its exact local content"
+                );
+                assert!(
+                    !ops.iter().any(|op| matches!(op, DocOp::InsertMarker(_))),
+                    "a v2-era doc with pending rows must never rebase onto a snapshot"
+                );
+            }
+            self.apply(&ops);
+            self.delivered = server.changes.len();
+            self.must_catch_up = false;
+        }
+
         fn build(&mut self, server: &mut Server, rng: &mut Jitter) {
             if self.in_flight.is_some() {
                 return;
@@ -1485,14 +1571,15 @@ mod property_tests {
             let mut server = Server::new(start.clone());
             let mut client = Client::new(start);
             for _ in 0..STEPS {
-                match (rng.next_unit() * 7.0) as u32 {
+                match (rng.next_unit() * 8.0) as u32 {
                     0 => client.edit(),
                     1 => client.build(&mut server, &mut rng),
                     2 => server.other_device_edit(),
                     3 => client.deliver(&server, false),
                     4 => client.deliver(&server, true),
                     5 => client.reply(&server),
-                    _ => client.lose_reply(),
+                    6 => client.lose_reply(),
+                    _ => client.snapshot(&server),
                 }
                 check_invariants(seed, &client);
             }
@@ -1514,5 +1601,146 @@ mod property_tests {
                 assert!(kept, "seed {seed}: t{n} lost");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::fixtures::*;
+    use super::*;
+    use serde_json::json;
+
+    const CURATED: &str = "collection:curated";
+
+    fn curated_doc(membership_seq: Seq) -> DocSnapshot {
+        let mut s = synced(json!({"v": 1}), 3);
+        s.owner_id = None;
+        s.memberships = vec![Membership {
+            scope: CURATED.into(),
+            member: true,
+            seq: membership_seq,
+        }];
+        s
+    }
+
+    fn left(seq: Seq) -> DocOp {
+        DocOp::SetMembership(Membership {
+            scope: CURATED.into(),
+            member: false,
+            seq,
+        })
+    }
+
+    #[test]
+    fn sweep_leaves_the_scope_and_deletes_an_orphan() {
+        let ops = sweep_doc(&curated_doc(3), CURATED, 30);
+        assert_eq!(ops, vec![left(30), DocOp::HardDelete]);
+    }
+
+    #[test]
+    fn sweep_never_touches_docs_with_rows() {
+        let mut s = curated_doc(3);
+        s.rows = vec![row(1, RowKind::Update)];
+        assert!(sweep_doc(&s, CURATED, 30).is_empty());
+    }
+
+    #[test]
+    fn sweep_keeps_membership_newer_than_the_snapshot() {
+        assert!(sweep_doc(&curated_doc(40), CURATED, 30).is_empty());
+    }
+
+    #[test]
+    fn sweep_keeps_a_doc_that_is_a_member_elsewhere() {
+        let mut s = curated_doc(3);
+        s.memberships.push(Membership {
+            scope: "own".into(),
+            member: true,
+            seq: 4,
+        });
+        assert_eq!(sweep_doc(&s, CURATED, 30), vec![left(30)]);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_doc_tests {
+    use super::change_fixtures::env;
+    use super::fixtures::*;
+    use super::*;
+    use serde_json::json;
+
+    /// Local copy at seq 1 with one pending append; the snapshot (seq 5) already contains it,
+    /// as it does when the upload landed but its reply was lost.
+    fn pending_append() -> (DocSnapshot, DocEnvelope) {
+        let mut s = synced(json!({"items": ["a"]}), 1);
+        s.content = json!({"items": ["a", "b"]});
+        s.rows = vec![row(1, RowKind::Update)];
+        (s, env(json!({"items": ["a", "b"], "theirs": 1}), 5))
+    }
+
+    #[test]
+    fn snapshot_doc_with_pending_rows_recovers_exact_local_content() {
+        let (s, doc) = pending_append();
+        let ops = apply_snapshot_doc(&s, "own", &doc, ME);
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"items": ["a", "b"]}),
+            reason: RecoverReason::Conflict,
+        }));
+        assert!(ops.contains(&DocOp::Emit(DocEvent::ConflictDetected)));
+        assert!(!ops.iter().any(|op| matches!(op, DocOp::InsertMarker(_))));
+        let after = s.project(&ops);
+        assert_eq!(after.content, json!({"items": ["a", "b"], "theirs": 1}));
+        assert!(after.rows.is_empty());
+        assert_eq!(after.shadow.unwrap().seq, 5);
+    }
+
+    #[test]
+    fn snapshot_doc_without_pending_rows_is_adopted_as_is() {
+        let s = synced(json!({"items": ["a"]}), 1);
+        let doc = env(json!({"items": ["x"]}), 5);
+        let ops = apply_snapshot_doc(&s, "own", &doc, ME);
+        assert!(!ops
+            .iter()
+            .any(|op| matches!(op, DocOp::Recover { .. } | DocOp::Emit(_))));
+        let after = s.project(&ops);
+        assert_eq!(after.content, json!({"items": ["x"]}));
+        assert_eq!(after.shadow.unwrap().seq, 5);
+    }
+
+    #[test]
+    fn snapshot_doc_with_pending_delete_keeps_the_delete() {
+        let (mut s, doc) = pending_append();
+        s.rows.push(row(2, RowKind::Delete));
+        let after = s.project(&apply_snapshot_doc(&s, "own", &doc, ME));
+        assert_eq!(after.rows.len(), 2);
+        assert_eq!(after.content, json!({"items": ["a", "b"]}));
+        assert_eq!(after.shadow.unwrap().seq, 5);
+    }
+
+    #[test]
+    fn snapshot_doc_rebases_migrated_pending_edits() {
+        // Migrated from v1: shadow from base_content at server_seq 0, one pending append.
+        let mut s = synced(json!({"items": ["a"]}), 0);
+        s.content = json!({"items": ["a", "b"]});
+        s.rows = vec![row(1, RowKind::Update)];
+        let doc = env(json!({"items": ["a"], "theirs": 1}), 5);
+        let ops = apply_snapshot_doc(&s, "own", &doc, ME);
+        assert!(!ops
+            .iter()
+            .any(|op| matches!(op, DocOp::Recover { .. } | DocOp::Emit(_))));
+        let after = s.project(&ops);
+        assert_eq!(after.content, json!({"items": ["a", "b"], "theirs": 1}));
+        assert_eq!(after.rows.len(), 1, "the edit is still pending");
+        assert_eq!(after.shadow.unwrap().seq, 5);
+    }
+
+    #[test]
+    fn snapshot_doc_is_skipped_by_the_content_guard() {
+        let (s, _) = pending_append();
+        let older = env(json!({"items": []}), 1);
+        let ops = apply_snapshot_doc(&s, "own", &older, ME);
+        assert!(!ops.iter().any(|op| matches!(
+            op,
+            DocOp::SetShadow(_) | DocOp::SetContent(_) | DocOp::Recover { .. }
+        )));
     }
 }

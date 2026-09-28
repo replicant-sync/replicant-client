@@ -164,3 +164,16 @@ pub(crate) fn upsert_change(scope: &str, doc: DocEnvelope) -> Change {
         upload_id: None,
     }
 }
+
+pub(crate) fn delete_change(scope: &str, doc_id: Uuid, seq: Seq) -> Change {
+    Change {
+        scope: scope.to_string(),
+        seq,
+        prev_seq: seq - 1,
+        doc_id,
+        kind: ChangeKind::Delete,
+        doc: None,
+        client_id: None,
+        upload_id: None,
+    }
+}
