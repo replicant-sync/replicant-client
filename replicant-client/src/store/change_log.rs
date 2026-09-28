@@ -70,7 +70,10 @@ impl ChangeLogReader {
             }
             return Ok(LogRead::Docs(Vec::new()));
         }
-        self.data_version = version;
+        // `self.data_version`/`self.position` are advanced only once the whole read has
+        // fully succeeded (just before returning): if a decode fails partway, or the
+        // transaction fails to commit, the reader must retry the same rows next time
+        // instead of silently skipping them.
 
         // Deferred transaction: the head, the trim floor and the rows are one consistent
         // snapshot, so a concurrent trim between these selects cannot make us miss rows
@@ -84,8 +87,9 @@ impl ChangeLogReader {
         // when it is empty) is gone.
         let trimmed_through = lowest.map_or(head, |lowest| lowest - 1);
         if self.position < trimmed_through {
-            self.position = head;
             tx.commit().await?;
+            self.position = head;
+            self.data_version = version;
             self.save(now_unix).await?;
             return Ok(LogRead::DatabaseChanged);
         }
@@ -102,8 +106,9 @@ impl ChangeLogReader {
         let me = self.instance_id.to_string();
         let mut order = Vec::new();
         let mut latest: HashMap<Uuid, DocChange> = HashMap::new();
+        let mut position = self.position;
         for row in &rows {
-            self.position = row.try_get("local_seq")?;
+            position = row.try_get("local_seq")?;
             let doc_id = Uuid::parse_str(&row.try_get::<String, _>("doc_id")?)?;
             let origin = match row.try_get::<String, _>("origin")?.as_str() {
                 "server" => ChangeOrigin::Server,
@@ -119,6 +124,8 @@ impl ChangeLogReader {
                 order.push(doc_id);
             }
         }
+        self.position = position;
+        self.data_version = version;
         if now_unix - self.heartbeat_at >= HEARTBEAT_EVERY_SECS {
             self.save(now_unix).await?;
         }
@@ -289,6 +296,48 @@ mod tests {
         .unwrap();
 
         assert_eq!(reader.read(T0).await.unwrap(), LogRead::Docs(vec![]));
+    }
+
+    /// A read that fails partway through decoding must not advance `data_version` or
+    /// `position`, so the same rows are retried (not silently skipped) once whatever made
+    /// decoding fail is fixed.
+    #[tokio::test]
+    async fn a_read_that_fails_partway_leaves_position_and_version_unchanged() {
+        let t = temp_store().await;
+        let mut reader = ChangeLogReader::open(&t.store, T0).await.unwrap();
+        let good_id = t
+            .store
+            .create_document(ME, None, json!({"a": 1}))
+            .await
+            .unwrap();
+        // An undecodable row after the good one: `read` must fail without losing `good_id`.
+        sqlx::query(
+            "INSERT INTO change_log (doc_id, kind, origin_instance, origin) \
+             VALUES ('not-a-uuid', 'upsert', ?, 'local')",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .execute(&t.store.pool)
+        .await
+        .unwrap();
+
+        assert!(reader.read(T0).await.is_err());
+
+        // Repair via the reader's own connection: `data_version` does not count a
+        // connection's own writes, so this does not mask whether the failed `read` had
+        // already (wrongly) advanced past the version that made the bad row visible.
+        sqlx::query("DELETE FROM change_log WHERE doc_id = 'not-a-uuid'")
+            .execute(&mut reader.conn)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            reader.read(T0).await.unwrap(),
+            LogRead::Docs(vec![DocChange {
+                doc_id: good_id,
+                deleted: false,
+                origin: ChangeOrigin::Local,
+            }])
+        );
     }
 
     /// A commit landing between two `read` calls must never be swallowed by the version check.
