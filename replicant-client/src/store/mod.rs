@@ -7,6 +7,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, Sqlite, SqlitePool, Transaction};
 use uuid::Uuid;
 
+use docs::{LogOrigin, Writer};
+
 use crate::engine::doc::DocEvent;
 use crate::engine::types::{SCOPE_CURATED, SCOPE_OWN};
 use crate::queries::Queries;
@@ -98,6 +100,13 @@ impl Store {
         self.instance_id
     }
 
+    pub(crate) fn writer(&self, origin: LogOrigin) -> Writer {
+        Writer {
+            instance_id: self.instance_id,
+            origin,
+        }
+    }
+
     pub async fn user_id(&self) -> StoreResult<Uuid> {
         let user_id: Option<String> = sqlx::query_scalar("SELECT user_id FROM user_config LIMIT 1")
             .fetch_optional(&self.pool)
@@ -174,6 +183,13 @@ async fn prepare(pool: &SqlitePool) -> StoreResult<()> {
 pub(crate) fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
 }
+
+/// `documents` timestamps stay RFC 3339: v1 readers parse them.
+pub(crate) fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+mod docs;
 
 #[cfg(test)]
 pub(crate) mod test_support;
