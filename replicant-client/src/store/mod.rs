@@ -190,6 +190,7 @@ pub(crate) fn now_rfc3339() -> String {
 }
 
 mod docs;
+mod writes;
 
 #[cfg(test)]
 pub(crate) mod test_support;

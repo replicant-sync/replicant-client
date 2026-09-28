@@ -147,6 +147,11 @@ pub(crate) fn envelope(
     }
 }
 
+/// Another engine on the same file, as a second process opens it.
+pub(crate) async fn open_again(path: &std::path::Path) -> Store {
+    Store::open(path).await.unwrap()
+}
+
 pub(crate) fn upsert_change(scope: &str, doc: DocEnvelope) -> Change {
     Change {
         scope: scope.to_string(),

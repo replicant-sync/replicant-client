@@ -14,15 +14,17 @@ use crate::queries::Queries;
 
 const TITLE_MAX_CHARS: usize = 128;
 
-/// Change-log `origin`: anything the sync engine wrote. (`Local` arrives with the write API.)
+/// Change-log `origin`: this data dir's host, or anything the sync engine wrote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LogOrigin {
+    Local,
     Server,
 }
 
 impl LogOrigin {
     fn as_str(self) -> &'static str {
         match self {
+            LogOrigin::Local => "local",
             LogOrigin::Server => "server",
         }
     }
