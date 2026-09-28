@@ -10,7 +10,7 @@ use super::backoff::{
     catch_up_retry_delay, connect_delay, doc_retry_delay, Jitter, MIN_CONNECT_DELAY,
 };
 use super::doc::InFlight;
-use super::types::{Change, DocEnvelope, Scope, Seq, ServerError, Upload};
+use super::types::{Change, DocEnvelope, Scope, Seq, ServerError, Upload, SCOPE_OWN};
 
 pub const MAX_IN_FLIGHT: usize = 8;
 pub const PAGE_LIMIT: u32 = 500;
@@ -116,7 +116,8 @@ pub enum Response {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApplyTag {
     Page(u64),
-    Push,
+    /// Carries the pushed change's seq, which the apply commits as the scope's cursor.
+    Push(Seq),
     SnapshotPage(u64),
     /// Carries the req of the scope's last snapshot page.
     SnapshotFinish(u64),
@@ -346,6 +347,11 @@ struct Session {
     /// Scopes that took an unreadable push while not `Live`; the push may be the one change
     /// `finish_scope` would otherwise seal past, so it rechecks once more before going `Live`.
     recheck_before_live: HashSet<Scope>,
+    /// Per scope, the cursor whose changes the store has committed.
+    applied: HashMap<Scope, Seq>,
+    /// Documents whose server copy is newer than the committed `own` changes: the copy's seq,
+    /// and the first request id a catch-up round begun after the wait can have.
+    awaiting: HashMap<Uuid, (Seq, u64)>,
     pump_scheduled: bool,
     pump_deferred: bool,
 }
@@ -693,6 +699,7 @@ impl Core {
         for name in &self.scope_names {
             let cursor = list.iter().find(|(n, _)| n == name).map_or(0, |(_, c)| *c);
             s.cursors.insert(name.clone(), cursor);
+            s.applied.insert(name.clone(), cursor);
         }
         s.phase = Some(Phase::CatchingUp);
         fx.push(Effect::Emit(Lifecycle::SyncStarted));
@@ -955,10 +962,14 @@ impl Core {
                 }
                 // The doc stays in `fetching` until `ServerCopyApplied` unless we back off.
                 match result {
-                    Ok(Response::Document(doc)) => fx.push(Effect::ApplyServerCopy {
-                        doc_id,
-                        doc: Some(doc),
-                    }),
+                    Ok(Response::Document(doc)) => {
+                        if !self.wait_for_stream(doc_id, doc.seq, fx) {
+                            fx.push(Effect::ApplyServerCopy {
+                                doc_id,
+                                doc: Some(doc),
+                            });
+                        }
+                    }
                     Err(e) if e.code == "deleted" => fx.push(Effect::ApplyServerDeleted {
                         doc_id,
                         seq: e.current_seq.unwrap_or(0),
@@ -1039,7 +1050,7 @@ impl Core {
                 scope,
                 changes: vec![change],
                 new_cursor,
-                tag: ApplyTag::Push,
+                tag: ApplyTag::Push(new_cursor),
             });
         } else {
             self.start_catch_up(&scope, fx);
@@ -1080,6 +1091,27 @@ impl Core {
     fn on_applied(&mut self, scope: Scope, tag: ApplyTag, fx: &mut Vec<Effect>) {
         let Some(s) = self.session() else { return };
         let state = s.scopes.get(&scope).cloned();
+        let mut finished_round = None;
+        let committed = match (&state, &tag) {
+            (_, ApplyTag::Push(seq)) => Some(*seq),
+            (Some(ScopeSync::Applying { req, has_more }), ApplyTag::Page(t)) if req == t => {
+                if !*has_more {
+                    finished_round = Some(*req);
+                }
+                s.cursors.get(&scope).copied()
+            }
+            (
+                Some(ScopeSync::SnapshotFinishing { req, snapshot_seq }),
+                ApplyTag::SnapshotFinish(t),
+            ) if req == t => Some(*snapshot_seq),
+            _ => None,
+        };
+        if let Some(seq) = committed {
+            let applied = s.applied.entry(scope.clone()).or_insert(0);
+            *applied = (*applied).max(seq);
+        }
+        // `scope` moves into `Effect::FinishSnapshot` below, so decide this before the match.
+        let is_own = scope == SCOPE_OWN;
         match (state, tag) {
             (Some(ScopeSync::Applying { req, has_more }), ApplyTag::Page(t)) if req == t => {
                 if has_more {
@@ -1117,6 +1149,9 @@ impl Core {
                 self.request_changes(&scope, snapshot_seq, fx);
             }
             _ => {} // push applies and stale tags
+        }
+        if is_own {
+            self.release_awaiting(finished_round, fx);
         }
         self.request_pump(fx);
     }
@@ -1191,7 +1226,8 @@ impl Core {
             || s.building.contains(&doc_id)
             || s.backing_off.contains(&doc_id)
             || s.fetching.contains(&doc_id)
-            || s.settling.contains(&doc_id);
+            || s.settling.contains(&doc_id)
+            || s.awaiting.contains_key(&doc_id);
         if busy {
             return;
         }
@@ -1247,6 +1283,57 @@ impl Core {
             timer: TimerId::Request(req),
             after: REQUEST_TIMEOUT,
         });
+    }
+
+    /// A server copy newer than the committed `own` changes may already contain an upload of
+    /// ours whose reply was lost. Its echo must settle our rows before anything is rebased onto
+    /// the copy, so the document waits for the change stream and is rebuilt instead.
+    fn wait_for_stream(&mut self, doc_id: Uuid, seq: Seq, fx: &mut Vec<Effect>) -> bool {
+        let first_req = self.next_req;
+        let Some(s) = self.session() else {
+            return false;
+        };
+        let own = s.scopes.get(SCOPE_OWN).cloned();
+        let applied = s.applied.get(SCOPE_OWN).copied().unwrap_or(0);
+        if matches!(own, None | Some(ScopeSync::Dropped)) || seq <= applied {
+            return false;
+        }
+        s.fetching.remove(&doc_id);
+        s.awaiting.insert(doc_id, (seq, first_req));
+        if own == Some(ScopeSync::Live) {
+            let cursor = s.cursors.get(SCOPE_OWN).copied().unwrap_or(0);
+            // Changes even at cursor 0: a snapshot carries no upload ids to recognise the echo.
+            self.request_changes(SCOPE_OWN, cursor, fx);
+        }
+        true
+    }
+
+    /// Rebuilds waiting documents once `own` has committed their copy's seq, or once a catch-up
+    /// round requested after their wait began has finished.
+    fn release_awaiting(&mut self, finished_round: Option<u64>, fx: &mut Vec<Effect>) {
+        let Some(s) = self.session() else { return };
+        let applied = s.applied.get(SCOPE_OWN).copied().unwrap_or(0);
+        let ready: Vec<Uuid> = s
+            .awaiting
+            .iter()
+            .filter(|(_, (seq, first_req))| {
+                *seq <= applied || finished_round.is_some_and(|req| req >= *first_req)
+            })
+            .map(|(doc_id, _)| *doc_id)
+            .collect();
+        for doc_id in &ready {
+            s.awaiting.remove(doc_id);
+        }
+        let another_round = finished_round.is_some()
+            && !s.awaiting.is_empty()
+            && s.scopes.get(SCOPE_OWN) == Some(&ScopeSync::Live);
+        let cursor = s.cursors.get(SCOPE_OWN).copied().unwrap_or(0);
+        for doc_id in ready {
+            self.try_build(doc_id, fx);
+        }
+        if another_round {
+            self.request_changes(SCOPE_OWN, cursor, fx);
+        }
     }
 
     fn on_upload_input(&mut self, input: Input, fx: &mut Vec<Effect>) {
@@ -2189,7 +2276,7 @@ mod catch_up_tests {
             e,
             Effect::ApplyChanges {
                 new_cursor: 6,
-                tag: ApplyTag::Push,
+                tag: ApplyTag::Push(6),
                 ..
             }
         )));
@@ -2450,7 +2537,7 @@ mod catch_up_tests {
             e,
             Effect::ApplyChanges {
                 new_cursor: 8,
-                tag: ApplyTag::Push,
+                tag: ApplyTag::Push(8),
                 ..
             }
         )));
@@ -2464,7 +2551,7 @@ mod catch_up_tests {
         c.step(Input::Push(change("own", 12, 11))); // gap → catch-up requesting
         let fx = c.step(Input::Applied {
             scope: "own".into(),
-            tag: ApplyTag::Push,
+            tag: ApplyTag::Push(6),
         });
         assert!(sends(&fx).is_empty());
     }
@@ -3352,5 +3439,279 @@ mod upload_orchestration_tests {
                 ..
             }
         )));
+    }
+}
+
+#[cfg(test)]
+mod server_copy_tests {
+    use super::harness::*;
+    use super::*;
+    use crate::engine::types::{ChangeKind, DocEnvelope};
+    use serde_json::json;
+
+    fn doc(n: u128) -> Uuid {
+        Uuid::from_u128(0x2000 + n)
+    }
+
+    fn envelope(d: Uuid, seq: i64) -> DocEnvelope {
+        DocEnvelope {
+            doc_id: d,
+            owner_id: Some(ME),
+            author_id: None,
+            read_only: false,
+            source_doc_id: None,
+            derived_from: None,
+            title: None,
+            content: json!({}),
+            hash: "h".into(),
+            seq,
+        }
+    }
+
+    fn push(d: Uuid, seq: i64, prev_seq: i64) -> Change {
+        Change {
+            scope: "own".into(),
+            seq,
+            prev_seq,
+            doc_id: d,
+            kind: ChangeKind::Upsert,
+            doc: Some(envelope(d, seq)),
+            client_id: None,
+            upload_id: None,
+        }
+    }
+
+    fn changes_req(fx: &[Effect], scope: &str) -> u64 {
+        sends(fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetChangesSince { scope: s, .. } if s == scope))
+            .map(|(req, _)| req)
+            .expect("changes request")
+    }
+
+    fn joined(c: &mut Core) {
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (req, _) = sends(&c.step(opened(c))).pop().unwrap();
+        c.step(Input::Reply {
+            req,
+            result: Ok(Response::Joined),
+        });
+    }
+
+    fn empty_page(c: &mut Core, scope: &str, req: u64, next_cursor: i64) -> Vec<Effect> {
+        c.step(Input::Reply {
+            req,
+            result: Ok(Response::Changes {
+                changes: vec![],
+                next_cursor,
+                has_more: false,
+            }),
+        });
+        c.step(Input::Applied {
+            scope: scope.into(),
+            tag: ApplyTag::Page(req),
+        })
+    }
+
+    /// Connected with both scopes caught up to seq 5.
+    fn live(c: &mut Core) {
+        joined(c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        for scope in ["own", "collection:curated"] {
+            empty_page(c, scope, changes_req(&fx, scope), 5);
+        }
+    }
+
+    /// Connected with both scopes empty: snapshot at seq 0, then an empty page.
+    fn live_empty(c: &mut Core) {
+        joined(c);
+        let cursors_fx = c.step(Input::Cursors(vec![]));
+        for scope in ["own", "collection:curated"] {
+            let (req, _) = sends(&cursors_fx)
+                .into_iter()
+                .find(|(_, r)| matches!(r, Request::GetSnapshot { scope: s, .. } if s == scope))
+                .expect("snapshot request");
+            c.step(Input::Reply {
+                req,
+                result: Ok(Response::SnapshotPage {
+                    docs: vec![],
+                    snapshot_seq: 0,
+                    next_page_token: None,
+                }),
+            });
+            let page_fx = c.step(Input::Applied {
+                scope: scope.into(),
+                tag: ApplyTag::SnapshotPage(req),
+            });
+            let finish = page_fx
+                .iter()
+                .find_map(|e| match e {
+                    Effect::FinishSnapshot { tag, .. } => Some(tag.clone()),
+                    _ => None,
+                })
+                .expect("finish snapshot");
+            let finish_fx = c.step(Input::Applied {
+                scope: scope.into(),
+                tag: finish,
+            });
+            empty_page(c, scope, changes_req(&finish_fx, scope), 0);
+        }
+    }
+
+    /// Settles `d` with `FetchServerCopy` and answers its `get_document` with a copy at `seq`.
+    fn fetch_copy(c: &mut Core, d: Uuid, seq: i64) -> Vec<Effect> {
+        let fx = c.step(Input::Settled {
+            doc_id: d,
+            outcome: SettleOutcome::FetchServerCopy,
+        });
+        let (req, request) = sends(&fx).pop().expect("get_document sent");
+        assert_eq!(request, Request::GetDocument { doc_id: d });
+        c.step(Input::Reply {
+            req,
+            result: Ok(Response::Document(envelope(d, seq))),
+        })
+    }
+
+    fn applies_copy(fx: &[Effect]) -> bool {
+        fx.iter()
+            .any(|e| matches!(e, Effect::ApplyServerCopy { .. }))
+    }
+
+    fn builds(fx: &[Effect], d: Uuid) -> bool {
+        fx.contains(&Effect::BuildUpload { doc_id: d })
+    }
+
+    #[test]
+    fn lost_reply_then_mismatch_waits_for_the_echo_instead_of_fetching() {
+        let mut c = core();
+        live(&mut c);
+        let fx = fetch_copy(&mut c, doc(1), 9);
+        assert!(
+            !applies_copy(&fx),
+            "a copy past the committed own changes may hold our lost upload"
+        );
+        let own = changes_req(&fx, "own");
+        assert!(sends(&fx).contains(&(
+            own,
+            Request::GetChangesSince {
+                scope: "own".into(),
+                cursor: 5,
+                limit: PAGE_LIMIT
+            }
+        )));
+        let fx = empty_page(&mut c, "own", own, 9);
+        assert!(builds(&fx, doc(1)), "rebuilt once the echo is committed");
+        assert!(!applies_copy(&fx));
+    }
+
+    #[test]
+    fn mismatch_at_or_below_the_cursor_fetches_at_once() {
+        let mut c = core();
+        live(&mut c);
+        let fx = fetch_copy(&mut c, doc(1), 5);
+        assert!(fx.contains(&Effect::ApplyServerCopy {
+            doc_id: doc(1),
+            doc: Some(envelope(doc(1), 5))
+        }));
+    }
+
+    #[test]
+    fn copy_at_a_pushed_seq_is_applied_at_once() {
+        let mut c = core();
+        live(&mut c);
+        let fx = c.step(Input::Push(push(doc(7), 6, 5)));
+        assert!(fx.iter().any(|e| matches!(
+            e,
+            Effect::ApplyChanges {
+                tag: ApplyTag::Push(6),
+                ..
+            }
+        )));
+        c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::Push(6),
+        });
+        assert!(applies_copy(&fetch_copy(&mut c, doc(1), 6)));
+    }
+
+    #[test]
+    fn waiting_doc_is_not_rebuilt_by_the_pump() {
+        let mut c = core();
+        live(&mut c);
+        fetch_copy(&mut c, doc(1), 9);
+        let fx = c.step(Input::PendingDocs(vec![doc(1), doc(2)]));
+        assert!(!builds(&fx, doc(1)));
+        assert!(builds(&fx, doc(2)));
+    }
+
+    #[test]
+    fn catch_up_in_progress_at_the_wait_gets_one_more_round() {
+        let mut c = core();
+        live(&mut c);
+        let fx = c.step(Input::UnreadablePush {
+            scope: Some("own".into()),
+        });
+        let early = changes_req(&fx, "own");
+        let fx = fetch_copy(&mut c, doc(1), 9);
+        assert!(!applies_copy(&fx));
+        assert!(
+            sends(&fx)
+                .iter()
+                .all(|(_, r)| !matches!(r, Request::GetChangesSince { .. })),
+            "a round is already out"
+        );
+        let fx = empty_page(&mut c, "own", early, 8);
+        assert!(!builds(&fx, doc(1)), "that round began before the wait");
+        let again = changes_req(&fx, "own");
+        let fx = empty_page(&mut c, "own", again, 8);
+        assert!(
+            builds(&fx, doc(1)),
+            "a round requested after the wait releases the doc even below its seq"
+        );
+    }
+
+    #[test]
+    fn exists_mine_server_copy_also_waits_for_the_stream() {
+        // `exists` with our own id settles as FetchServerCopy too. With no shadow yet, applying
+        // the copy before the lost create's echo would send all local content to `recovered`.
+        let mut c = core();
+        live_empty(&mut c);
+        let fx = fetch_copy(&mut c, doc(1), 1);
+        assert!(!applies_copy(&fx));
+        assert!(
+            sends(&fx).iter().any(|(_, r)| *r
+                == Request::GetChangesSince {
+                    scope: "own".into(),
+                    cursor: 0,
+                    limit: PAGE_LIMIT
+                }),
+            "a snapshot would carry no upload id to echo"
+        );
+    }
+
+    #[test]
+    fn copy_is_applied_at_once_when_own_is_dropped() {
+        let mut c = core();
+        joined(&mut c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        c.step(Input::Reply {
+            req: changes_req(&fx, "own"),
+            result: Err(ServerError::new("subscription_forbidden")),
+        });
+        empty_page(
+            &mut c,
+            "collection:curated",
+            changes_req(&fx, "collection:curated"),
+            5,
+        );
+        assert!(applies_copy(&fetch_copy(&mut c, doc(1), 9)));
     }
 }

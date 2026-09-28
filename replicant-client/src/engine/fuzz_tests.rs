@@ -95,7 +95,7 @@ fn next_input(rng: &mut Jitter, outstanding: &mut Vec<(u64, Request)>, socket_ge
             Input::Cursors(vec![("own".into(), 3), ("collection:curated".into(), 0)]),
             Input::Applied {
                 scope: "own".into(),
-                tag: ApplyTag::Push,
+                tag: ApplyTag::Push(6),
             },
             Input::Applied {
                 scope: "own".into(),
