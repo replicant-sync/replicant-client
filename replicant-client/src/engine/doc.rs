@@ -1205,3 +1205,314 @@ mod rebase_tests {
         assert_eq!(r, Rebased::Conflict);
     }
 }
+
+#[cfg(test)]
+mod property_tests {
+    //! One writable document against a model server that applies uploads (deduplicated by
+    //! `(upload_id, base_hash)`). Changes reach the client as pushes (envelope at the change's
+    //! seq) or catch-up pages (current envelope). A lost reply is a reconnect: every committed
+    //! change is delivered before the next build.
+    use std::collections::HashMap;
+
+    use super::change_fixtures::env;
+    use super::fixtures::*;
+    use super::*;
+    use crate::engine::backoff::Jitter;
+    use crate::engine::types::{ServerError, Upload};
+    use serde_json::json;
+
+    const SEEDS: u64 = 500;
+    const STEPS: usize = 80;
+    const MAX_LOCAL_EDITS: u32 = 12;
+    const MAX_OTHER_EDITS: u32 = 8;
+
+    struct Server {
+        /// Index = seq; seq 1 is the content both sides start from.
+        history: Vec<Value>,
+        changes: Vec<(Seq, Option<Uuid>)>,
+        stored: HashMap<(Uuid, String), Seq>,
+        other_edits: u32,
+    }
+
+    impl Server {
+        fn new(content: Value) -> Server {
+            Server {
+                history: vec![Value::Null, content],
+                changes: Vec::new(),
+                stored: HashMap::new(),
+                other_edits: 0,
+            }
+        }
+
+        fn seq(&self) -> Seq {
+            self.history.len() as Seq - 1
+        }
+
+        fn current(&self) -> &Value {
+            &self.history[self.history.len() - 1]
+        }
+
+        fn envelope(&self, seq: Seq) -> DocEnvelope {
+            env(self.history[seq as usize].clone(), seq)
+        }
+
+        fn commit(&mut self, content: Value, upload_id: Option<Uuid>) -> Seq {
+            self.history.push(content);
+            let seq = self.seq();
+            self.changes.push((seq, upload_id));
+            seq
+        }
+
+        fn other_device_edit(&mut self) {
+            if self.other_edits == MAX_OTHER_EDITS {
+                return;
+            }
+            self.other_edits += 1;
+            let mut next = self.current().clone();
+            next["theirs"] = json!(self.other_edits);
+            self.commit(next, None);
+        }
+
+        fn upload(&mut self, upload: &Upload) -> Result<DocEnvelope, ServerError> {
+            let base_hash = upload
+                .base_hash
+                .clone()
+                .expect("the model only uploads updates");
+            if let Some(seq) = self.stored.get(&(upload.upload_id, base_hash.clone())) {
+                return Ok(self.envelope(*seq));
+            }
+            let current_hash = content_hash(self.current());
+            if base_hash != current_hash {
+                let mut error = ServerError::new("hash_mismatch");
+                error.current_hash = Some(current_hash);
+                error.current_seq = Some(self.seq());
+                return Err(error);
+            }
+            let patch: json_patch::Patch = serde_json::from_value(upload.payload.clone()).unwrap();
+            let mut next = self.current().clone();
+            json_patch::patch(&mut next, &patch).unwrap();
+            let seq = self.commit(next, Some(upload.upload_id));
+            self.stored.insert((upload.upload_id, base_hash), seq);
+            Ok(self.envelope(seq))
+        }
+    }
+
+    struct Client {
+        snap: DocSnapshot,
+        next_row: u128,
+        in_flight: Option<(InFlight, Result<DocEnvelope, ServerError>)>,
+        mismatches: u32,
+        delivered: usize,
+        must_catch_up: bool,
+        local_edits: u32,
+        recovered: Vec<Value>,
+    }
+
+    impl Client {
+        fn new(content: Value) -> Client {
+            Client {
+                snap: synced(content, 1),
+                next_row: 0,
+                in_flight: None,
+                mismatches: 0,
+                delivered: 0,
+                must_catch_up: false,
+                local_edits: 0,
+                recovered: Vec::new(),
+            }
+        }
+
+        fn push_row(&mut self, kind: RowKind) {
+            self.next_row += 1;
+            self.snap.rows.push(OutboxRow {
+                mutation_id: m(self.next_row),
+                kind,
+                parked: false,
+            });
+        }
+
+        /// Applies ops the way the store does: markers get fresh increasing ids.
+        fn apply(&mut self, ops: &[DocOp]) {
+            let seq_before = self.snap.server_seq();
+            for op in ops {
+                match op {
+                    DocOp::InsertMarker(kind) => self.push_row(*kind),
+                    DocOp::Recover { content, .. } => self.recovered.push(content.clone()),
+                    other => self.snap = self.snap.project(std::slice::from_ref(other)),
+                }
+            }
+            assert!(
+                self.snap.server_seq() >= seq_before,
+                "shadow seq went backwards"
+            );
+        }
+
+        fn edit(&mut self) {
+            if self.local_edits == MAX_LOCAL_EDITS {
+                return;
+            }
+            self.local_edits += 1;
+            let token = json!(format!("t{}", self.local_edits));
+            self.snap.content["items"]
+                .as_array_mut()
+                .expect("items array")
+                .push(token);
+            self.push_row(RowKind::Update);
+        }
+
+        fn deliver(&mut self, server: &Server, as_page: bool) {
+            let Some(&(seq, upload_id)) = server.changes.get(self.delivered) else {
+                return;
+            };
+            self.delivered += 1;
+            let doc = if as_page {
+                server.envelope(server.seq())
+            } else {
+                server.envelope(seq)
+            };
+            let change = Change {
+                scope: "own".into(),
+                seq,
+                prev_seq: seq - 1,
+                doc_id: DOC,
+                kind: ChangeKind::Upsert,
+                doc: Some(doc),
+                client_id: None,
+                upload_id,
+            };
+            let ops = apply_change(&self.snap, &change, ME);
+            self.apply(&ops);
+        }
+
+        fn catch_up(&mut self, server: &Server, rng: &mut Jitter) {
+            while self.delivered < server.changes.len() {
+                let as_page = rng.next_unit() < 0.5;
+                self.deliver(server, as_page);
+            }
+            self.must_catch_up = false;
+        }
+
+        fn build(&mut self, server: &mut Server, rng: &mut Jitter) {
+            if self.in_flight.is_some() {
+                return;
+            }
+            if self.must_catch_up {
+                self.catch_up(server, rng);
+            }
+            match build_upload(&self.snap, ME) {
+                BuildResult::Send { upload, inflight } => {
+                    let reply = server.upload(&upload);
+                    self.in_flight = Some((inflight, reply));
+                }
+                BuildResult::SettleLocally(ops) => self.apply(&ops),
+                BuildResult::Nothing => {}
+                BuildResult::NeedsServerCopy => panic!("the model document always has a shadow"),
+            }
+        }
+
+        fn reply(&mut self, server: &Server) {
+            let Some((inflight, reply)) = self.in_flight.take() else {
+                return;
+            };
+            match settle(&self.snap, &inflight, &reply, ME, self.mismatches) {
+                SettleResult::Ops(ops) => {
+                    self.mismatches = 0;
+                    self.apply(&ops);
+                }
+                SettleResult::FetchServerCopy => {
+                    self.mismatches += 1;
+                    let ops = apply_server_copy(&self.snap, &server.envelope(server.seq()), ME);
+                    self.apply(&ops);
+                }
+                SettleResult::Retry { mismatch, .. } => {
+                    if mismatch {
+                        self.mismatches += 1;
+                    }
+                }
+            }
+        }
+
+        fn lose_reply(&mut self) {
+            if self.in_flight.take().is_some() {
+                self.must_catch_up = true;
+            }
+        }
+    }
+
+    fn token(n: u32) -> Value {
+        json!(format!("t{n}"))
+    }
+
+    fn check_invariants(seed: u64, client: &Client) {
+        let items = client.snap.content["items"]
+            .as_array()
+            .expect("items array");
+        for n in 1..=client.local_edits {
+            let copies = items.iter().filter(|item| **item == token(n)).count();
+            assert!(
+                copies <= 1,
+                "seed {seed}: t{n} applied {copies} times: {items:?}"
+            );
+        }
+        if client.snap.rows.is_empty() {
+            let shadow = client.snap.shadow.as_ref().expect("shadow");
+            assert_eq!(
+                content_hash(&shadow.content),
+                content_hash(&client.snap.content),
+                "seed {seed}: local edit left without an outbox row"
+            );
+        }
+    }
+
+    fn drain(seed: u64, server: &mut Server, client: &mut Client, rng: &mut Jitter) {
+        for _ in 0..50 {
+            client.reply(server);
+            client.catch_up(server, rng);
+            check_invariants(seed, client);
+            if client.snap.rows.is_empty() {
+                return;
+            }
+            client.build(server, rng);
+        }
+        panic!("seed {seed}: rows never settled: {:?}", client.snap.rows);
+    }
+
+    #[test]
+    fn random_echo_rebase_and_page_sequences_lose_and_duplicate_nothing() {
+        for seed in 1..=SEEDS {
+            let mut rng = Jitter::new(seed * 104_729);
+            let start = json!({"items": [], "theirs": 0});
+            let mut server = Server::new(start.clone());
+            let mut client = Client::new(start);
+            for _ in 0..STEPS {
+                match (rng.next_unit() * 7.0) as u32 {
+                    0 => client.edit(),
+                    1 => client.build(&mut server, &mut rng),
+                    2 => server.other_device_edit(),
+                    3 => client.deliver(&server, false),
+                    4 => client.deliver(&server, true),
+                    5 => client.reply(&server),
+                    _ => client.lose_reply(),
+                }
+                check_invariants(seed, &client);
+            }
+            drain(seed, &mut server, &mut client, &mut rng);
+
+            assert_eq!(
+                &client.snap.content,
+                server.current(),
+                "seed {seed}: client and server differ"
+            );
+            let final_items = server.current()["items"].as_array().unwrap();
+            for n in 1..=client.local_edits {
+                let kept = final_items.contains(&token(n))
+                    || client.recovered.iter().any(|content| {
+                        content["items"]
+                            .as_array()
+                            .is_some_and(|items| items.contains(&token(n)))
+                    });
+                assert!(kept, "seed {seed}: t{n} lost");
+            }
+        }
+    }
+}
