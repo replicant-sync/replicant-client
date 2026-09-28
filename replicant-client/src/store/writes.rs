@@ -237,6 +237,66 @@ mod tests {
         assert!(rows.iter().all(|r| !r.parked));
     }
 
+    /// A mutation_id far ahead of any real `now_v7()` output for a long time, so a planted
+    /// row simulates a clock step or a race from another process.
+    fn far_future_marker() -> Uuid {
+        Uuid::from_u128(Uuid::now_v7().as_u128() + (1u128 << 96))
+    }
+
+    async fn plant_marker(store: &Store, doc_id: Uuid, mutation_id: Uuid) {
+        sqlx::query(
+            "INSERT INTO outbox (mutation_id, doc_id, kind, created_at) VALUES (?, ?, 'update', 0)",
+        )
+        .bind(mutation_id.to_string())
+        .bind(doc_id.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn new_marker_stays_ahead_of_a_planted_future_mutation_id() {
+        let t = temp_store().await;
+        seed_synced(&t.store, doc(1), SCOPE_OWN, Some(ME), json!({"n": 0}), 1).await;
+        let planted = far_future_marker();
+        plant_marker(&t.store, doc(1), planted).await;
+
+        t.store
+            .update_document(ME, doc(1), json!({"n": 1}))
+            .await
+            .unwrap();
+
+        let rows = snapshot(&t.store, doc(1)).await.rows;
+        let newest = rows.last().unwrap();
+        assert!(newest.mutation_id > planted);
+        assert_eq!(newest.kind, RowKind::Update);
+
+        t.store.delete_document(ME, doc(1)).await.unwrap();
+        let rows = snapshot(&t.store, doc(1)).await.rows;
+        let newest = rows.last().unwrap();
+        assert!(newest.mutation_id > planted);
+        assert_eq!(newest.kind, RowKind::Delete);
+    }
+
+    #[tokio::test]
+    async fn a_second_store_also_stays_ahead_of_a_planted_future_mutation_id() {
+        let t = temp_store().await;
+        seed_synced(&t.store, doc(1), SCOPE_OWN, Some(ME), json!({"n": 0}), 1).await;
+        let planted = far_future_marker();
+        plant_marker(&t.store, doc(1), planted).await;
+
+        let other = open_again(&t.path()).await;
+        other
+            .update_document(ME, doc(1), json!({"n": 1}))
+            .await
+            .unwrap();
+
+        let rows = snapshot(&t.store, doc(1)).await.rows;
+        let newest = rows.last().unwrap();
+        assert!(newest.mutation_id > planted);
+        assert_eq!(newest.kind, RowKind::Update);
+    }
+
     #[tokio::test]
     async fn delete_is_soft_and_keeps_the_shadow() {
         let t = temp_store().await;

@@ -291,10 +291,25 @@ pub(crate) async fn insert_marker(
     doc_id: Uuid,
     kind: RowKind,
 ) -> StoreResult<Uuid> {
-    let mutation_id = Uuid::now_v7();
+    let id = doc_id.to_string();
+    let max: Option<String> = sqlx::query_scalar(
+        "SELECT mutation_id FROM outbox WHERE doc_id = ? ORDER BY mutation_id DESC LIMIT 1",
+    )
+    .bind(&id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let max = max.map(|m| Uuid::parse_str(&m)).transpose()?;
+    let candidate = Uuid::now_v7();
+    // Two Stores on one file can race or a clock can step backwards: per-doc ids must stay
+    // strictly increasing, so a non-advancing candidate is bumped past the max instead
+    // (it stops looking like a real v7 timestamp, but strict ordering is what callers need).
+    let mutation_id = match max {
+        Some(max) if candidate <= max => Uuid::from_u128(max.as_u128() + 1),
+        _ => candidate,
+    };
     sqlx::query("INSERT INTO outbox (mutation_id, doc_id, kind, created_at) VALUES (?, ?, ?, ?)")
         .bind(mutation_id.to_string())
-        .bind(doc_id.to_string())
+        .bind(&id)
         .bind(row_kind_str(kind))
         .bind(now_unix())
         .execute(&mut *conn)
