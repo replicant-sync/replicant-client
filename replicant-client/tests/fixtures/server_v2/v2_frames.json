@@ -443,6 +443,20 @@
       "status": "ok"
     }
   ],
+  "clock_skew_join_reply": [
+    "1",
+    "1",
+    "sync:v2",
+    "phx_reply",
+    {
+      "response": {
+        "code": "clock_skew",
+        "is_fatal": false,
+        "server_time": 1767225600
+      },
+      "status": "error"
+    }
+  ],
   "change_push_delete": [
     "1",
     null,

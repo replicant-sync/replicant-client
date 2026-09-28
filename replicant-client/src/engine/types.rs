@@ -119,6 +119,8 @@ pub struct ServerError {
     pub current_seq: Option<Seq>,
     /// Set on a rejected create (`exists`).
     pub existing_owner: Option<Uuid>,
+    /// Set on `clock_skew`: the server's clock, unix seconds.
+    pub server_time: Option<i64>,
 }
 
 impl ServerError {
@@ -130,6 +132,7 @@ impl ServerError {
             current_hash: None,
             current_seq: None,
             existing_owner: None,
+            server_time: None,
         }
     }
 }

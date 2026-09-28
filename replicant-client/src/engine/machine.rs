@@ -618,6 +618,15 @@ impl Core {
                             self.halt(reason, fx);
                         }
                         None => {
+                            // The host can tell the user to fix the device clock.
+                            if e.code == "clock_skew" {
+                                fx.push(Effect::Emit(Lifecycle::SyncError {
+                                    code: e.code.clone(),
+                                    scope: None,
+                                    doc_id: None,
+                                    fatal: false,
+                                }));
+                            }
                             self.close_socket(fx);
                             self.fail_connect(e.retry_after_ms, fx);
                         }
@@ -1617,6 +1626,39 @@ mod connection_tests {
         assert!(fx.iter().any(|e| matches!(e, Effect::Schedule { timer: TimerId::Reconnect, after } if *after == Duration::from_secs(1))));
         let fx = c.step(Input::Timer(TimerId::Reconnect));
         assert!(opens(&fx));
+    }
+
+    #[test]
+    fn clock_skew_join_error_backs_off_and_reports_without_halting() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        let mut skew = ServerError::new("clock_skew");
+        skew.server_time = Some(1_767_225_600);
+        let fx = c.step(Input::Reply {
+            req,
+            result: Err(skew),
+        });
+        assert_eq!(c.state().connection, ConnectionView::Disconnected);
+        assert!(closes(&fx));
+        assert!(fx.iter().any(|e| matches!(
+            e,
+            Effect::Schedule {
+                timer: TimerId::Reconnect,
+                ..
+            }
+        )));
+        assert_eq!(
+            emitted(&fx),
+            vec![Lifecycle::SyncError {
+                code: "clock_skew".into(),
+                scope: None,
+                doc_id: None,
+                fatal: false
+            }]
+        );
     }
 
     #[test]

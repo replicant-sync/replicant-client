@@ -23,6 +23,7 @@ const EXPECTED_FRAME_NAMES: &[&str] = &[
     "changes_reply",
     "changes_reply_populated",
     "changes_request",
+    "clock_skew_join_reply",
     "cursor_too_old_reply",
     "deleted_reply",
     "document_reply",
@@ -326,6 +327,21 @@ fn join_errors_and_socket_refusal_are_fatal_server_errors() {
         .expect("socket_refusal must parse as ServerError");
     assert_eq!(refusal.code, "update_required");
     assert!(refusal.is_fatal);
+}
+
+#[test]
+fn clock_skew_join_reply_is_a_transient_error_with_the_server_time() {
+    let frames = load_frames();
+    let mut codec = joined_codec();
+    let Some(Incoming::Reply { req: 1, result }) =
+        codec.decode(&frames["clock_skew_join_reply"].to_string())
+    else {
+        panic!("clock_skew_join_reply must decode as a reply to the join");
+    };
+    let skew = expect_error("clock_skew_join_reply", result);
+    assert_eq!(skew.code, "clock_skew");
+    assert!(!skew.is_fatal);
+    assert_eq!(skew.server_time, Some(1_767_225_600));
 }
 
 #[test]
