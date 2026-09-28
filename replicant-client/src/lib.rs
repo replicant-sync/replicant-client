@@ -1,5 +1,6 @@
 pub mod client;
 pub mod database;
+pub mod driver;
 pub mod engine;
 pub mod enrollment;
 pub mod error_code;
