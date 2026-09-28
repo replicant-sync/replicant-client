@@ -205,6 +205,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settling_the_same_reply_twice_is_a_noop_the_second_time() {
+        let t = temp_store().await;
+        seed_synced(&t.store, DOC, SCOPE_OWN, Some(ME), json!({"n": 0}), 1).await;
+        t.store
+            .update_document(ME, DOC, json!({"n": 1}))
+            .await
+            .unwrap();
+        let (_, inflight) = sent(&t.store, DOC).await;
+
+        let mut reply = envelope(DOC, Some(ME), json!({"n": 1}), 2);
+        reply.hash = "server-hash-2".into();
+
+        let (first_outcome, _) = t
+            .store
+            .settle_upload(ME, DOC, &inflight, &Ok(reply.clone()), 0)
+            .await
+            .unwrap();
+        assert_eq!(first_outcome, SettleOutcome::Done { rows_remain: false });
+        let before = snapshot(&t.store, DOC).await;
+
+        // Two processes (or an ack retried after a dropped ack) settling the same upload_id
+        // with the same reply: the second settle must be a no-op, not a second write.
+        let (second_outcome, second_notices) = t
+            .store
+            .settle_upload(ME, DOC, &inflight, &Ok(reply), 0)
+            .await
+            .unwrap();
+
+        assert_eq!(second_outcome, SettleOutcome::Done { rows_remain: false });
+        assert!(second_notices.is_empty());
+        let after = snapshot(&t.store, DOC).await;
+        assert_eq!(after.shadow, before.shadow);
+        assert!(after.rows.is_empty());
+    }
+
+    #[tokio::test]
     async fn build_is_stable_across_reopen() {
         let t = temp_store().await;
         let doc_id = t
@@ -412,5 +448,6 @@ mod tests {
         let after = snapshot(&t.store, DOC).await;
         assert_eq!(after.content, json!({"n": 1}));
         assert!(after.rows.is_empty());
+        assert_eq!(after.shadow.as_ref().unwrap().hash, server.hash);
     }
 }

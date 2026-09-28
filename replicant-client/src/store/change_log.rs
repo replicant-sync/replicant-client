@@ -66,7 +66,9 @@ impl ChangeLogReader {
         let version = data_version(&mut self.conn).await?;
         if version == self.data_version {
             if now_unix - self.heartbeat_at >= HEARTBEAT_EVERY_SECS {
-                self.save(now_unix).await?;
+                if let Err(err) = self.save(now_unix).await {
+                    tracing::warn!("change log heartbeat save failed, will retry: {err}");
+                }
             }
             return Ok(LogRead::Docs(Vec::new()));
         }
@@ -90,7 +92,9 @@ impl ChangeLogReader {
             tx.commit().await?;
             self.position = head;
             self.data_version = version;
-            self.save(now_unix).await?;
+            if let Err(err) = self.save(now_unix).await {
+                tracing::warn!("change log heartbeat save failed, will retry: {err}");
+            }
             return Ok(LogRead::DatabaseChanged);
         }
 
@@ -127,7 +131,9 @@ impl ChangeLogReader {
         self.position = position;
         self.data_version = version;
         if now_unix - self.heartbeat_at >= HEARTBEAT_EVERY_SECS {
-            self.save(now_unix).await?;
+            if let Err(err) = self.save(now_unix).await {
+                tracing::warn!("change log heartbeat save failed, will retry: {err}");
+            }
         }
         Ok(LogRead::Docs(
             order
@@ -385,6 +391,62 @@ mod tests {
             suspended.read(T0 + 102).await.unwrap(),
             LogRead::Docs(vec![])
         );
+    }
+
+    /// A heartbeat save failure inside `read` must not drop the docs/DatabaseChanged result it
+    /// already computed; the heartbeat is simply retried on the next tick.
+    #[tokio::test]
+    async fn heartbeat_save_failure_does_not_drop_the_read_result() {
+        let t = temp_store().await;
+        let other = open_again(&t.path()).await;
+        let mut reader = ChangeLogReader::open(&t.store, T0).await.unwrap();
+
+        sqlx::query("DROP TABLE change_log_readers")
+            .execute(&mut reader.conn)
+            .await
+            .unwrap();
+
+        let doc_id = other
+            .create_document(ME, None, json!({"a": 1}))
+            .await
+            .unwrap();
+
+        // now_unix is far enough past `heartbeat_at` that `read` attempts the heartbeat save,
+        // which fails because the table is gone; the doc change must still come back.
+        assert_eq!(
+            reader.read(T0 + HEARTBEAT_EVERY_SECS + 1).await.unwrap(),
+            LogRead::Docs(vec![DocChange {
+                doc_id,
+                deleted: false,
+                origin: ChangeOrigin::OtherProcess,
+            }])
+        );
+
+        sqlx::query(
+            "CREATE TABLE change_log_readers (\
+             instance_id TEXT PRIMARY KEY, \
+             position INTEGER NOT NULL, \
+             heartbeat_at INTEGER NOT NULL)",
+        )
+        .execute(&mut reader.conn)
+        .await
+        .unwrap();
+
+        // heartbeat_at was never advanced by the failed save, so the next tick retries it.
+        assert_eq!(
+            reader
+                .read(T0 + 2 * HEARTBEAT_EVERY_SECS + 2)
+                .await
+                .unwrap(),
+            LogRead::Docs(vec![])
+        );
+        let saved_position: i64 =
+            sqlx::query_scalar("SELECT position FROM change_log_readers WHERE instance_id = ?")
+                .bind(reader.instance_id.to_string())
+                .fetch_one(&t.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(saved_position, reader.position);
     }
 
     #[tokio::test]
