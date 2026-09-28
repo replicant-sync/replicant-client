@@ -96,6 +96,10 @@ impl Connection {
                     }
                     Incoming::Joined { req, user_id } => Some(Received::Joined { req, user_id }),
                     Incoming::Push(change) => Some(Received::Input(Input::Push(change))),
+                    Incoming::UnreadablePush { scope } => {
+                        tracing::warn!(?scope, "unreadable change push");
+                        Some(Received::Input(Input::UnreadablePush { scope }))
+                    }
                     Incoming::ChannelClosed => {
                         self.current = None;
                         Some(Received::Input(Input::SocketClosed { gen }))
@@ -288,6 +292,20 @@ mod tests {
             None
         );
         assert_eq!(connection.send(5, &Request::Heartbeat, 0), None);
+    }
+
+    #[tokio::test]
+    async fn unreadable_push_becomes_an_input_with_its_scope() {
+        let mut server = FakeServer::start().await;
+        let (mut connection, mut conn) = opened(&mut server).await;
+        conn.send_json(json!(["1", null, "sync:v2", "change", {"scope": "own", "seq": "x"}]))
+            .await;
+        assert_eq!(
+            received(&mut connection).await,
+            Received::Input(Input::UnreadablePush {
+                scope: Some("own".into())
+            })
+        );
     }
 
     #[tokio::test]

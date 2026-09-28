@@ -24,6 +24,7 @@ const QUIET: Duration = Duration::from_millis(200);
 const QUIET_CAP: Duration = Duration::from_secs(1);
 const HALT_RETRY: Duration = Duration::from_secs(300);
 const MAX_CATCH_UP_FAILURES: u32 = 3;
+const UNREADABLE_PUSHES_BEFORE_ERROR: u32 = 3;
 
 /// Why the connection is halted and will not retry on its own schedule.
 #[derive(Debug, Clone, PartialEq)]
@@ -169,6 +170,10 @@ pub enum Input {
         result: Result<Response, ServerError>,
     },
     Push(Change),
+    /// A push that did not decode; it may have been a change, so its scope catches up.
+    UnreadablePush {
+        scope: Option<Scope>,
+    },
     Timer(TimerId),
     Cursors(Vec<(Scope, Seq)>),
     Applied {
@@ -337,6 +342,7 @@ struct Session {
     doc_failures: HashMap<Uuid, u32>,
     mismatch_attempts: HashMap<Uuid, u32>,
     catch_up_failures: HashMap<Scope, u32>,
+    unreadable_pushes: HashMap<Option<Scope>, u32>,
     pump_scheduled: bool,
     pump_deferred: bool,
 }
@@ -992,6 +998,7 @@ impl Core {
         }
         match input {
             Input::Push(change) => self.on_push(change, fx),
+            Input::UnreadablePush { scope } => self.on_unreadable_push(scope, fx),
             Input::Applied { scope, tag } => self.on_applied(scope, tag, fx),
             other => self.on_upload_input(other, fx),
         }
@@ -1024,6 +1031,29 @@ impl Core {
             });
         } else {
             self.start_catch_up(&scope, fx);
+        }
+    }
+
+    fn on_unreadable_push(&mut self, scope: Option<Scope>, fx: &mut Vec<Effect>) {
+        let names = self.scope_names.clone();
+        let Some(s) = self.session() else { return };
+        let count = s.unreadable_pushes.entry(scope.clone()).or_insert(0);
+        *count += 1;
+        if *count == UNREADABLE_PUSHES_BEFORE_ERROR {
+            fx.push(Effect::Emit(Lifecycle::SyncError {
+                code: "protocol_error".into(),
+                scope: scope.clone(),
+                doc_id: None,
+                fatal: false,
+            }));
+        }
+        let live: Vec<Scope> = names
+            .into_iter()
+            .filter(|name| scope.as_ref().is_none_or(|wanted| wanted == name))
+            .filter(|name| s.scopes.get(name) == Some(&ScopeSync::Live))
+            .collect();
+        for name in live {
+            self.start_catch_up(&name, fx);
         }
     }
 
@@ -2124,6 +2154,61 @@ mod catch_up_tests {
                 limit: 500
             }));
         assert!(emitted(&fx).is_empty());
+    }
+
+    #[test]
+    fn unreadable_push_starts_catch_up_for_its_scope() {
+        let mut c = core();
+        live(&mut c);
+        let fx = c.step(Input::UnreadablePush {
+            scope: Some("own".into()),
+        });
+        assert_eq!(
+            sends(&fx),
+            vec![(
+                changes_req(&fx, "own"),
+                Request::GetChangesSince {
+                    scope: "own".into(),
+                    cursor: 5,
+                    limit: PAGE_LIMIT
+                }
+            )]
+        );
+        assert!(emitted(&fx).is_empty());
+    }
+
+    #[test]
+    fn unreadable_push_without_a_scope_catches_up_every_live_scope() {
+        let mut c = core();
+        live(&mut c);
+        let fx = c.step(Input::UnreadablePush { scope: None });
+        changes_req(&fx, "own");
+        changes_req(&fx, "collection:curated");
+    }
+
+    #[test]
+    fn third_unreadable_push_on_a_scope_emits_one_sync_error() {
+        let mut c = core();
+        live(&mut c);
+        for push in 1..=5 {
+            let fx = c.step(Input::UnreadablePush {
+                scope: Some("own".into()),
+            });
+            let errors = emitted(&fx);
+            if push == 3 {
+                assert_eq!(
+                    errors,
+                    vec![Lifecycle::SyncError {
+                        code: "protocol_error".into(),
+                        scope: Some("own".into()),
+                        doc_id: None,
+                        fatal: false
+                    }]
+                );
+            } else {
+                assert!(errors.is_empty(), "push {push}: {errors:?}");
+            }
+        }
     }
 
     #[test]

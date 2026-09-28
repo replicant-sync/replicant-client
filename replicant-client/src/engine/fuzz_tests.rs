@@ -76,6 +76,10 @@ fn next_input(rng: &mut Jitter, outstanding: &mut Vec<(u64, Request)>, socket_ge
             },
             Input::Reconnect,
             Input::OutboxChanged,
+            Input::UnreadablePush {
+                scope: Some("own".into()),
+            },
+            Input::UnreadablePush { scope: None },
             Input::Timer(TimerId::Reconnect),
             Input::Timer(TimerId::ConnectTimeout),
             Input::Timer(TimerId::Heartbeat),
@@ -107,6 +111,8 @@ struct Harness {
     seed: u64,
     outstanding: Vec<(u64, Request)>,
     socket_open: bool,
+    /// The current socket has reported `SocketOpened`; only then may frames be sent on it.
+    socket_ready: bool,
     socket_gen: u64,
     events: Vec<Lifecycle>,
 }
@@ -125,8 +131,13 @@ impl Harness {
             };
             if closes_current {
                 self.socket_open = false;
+                self.socket_ready = false;
             }
-            let answers_open = matches!(input, Input::SocketOpened { .. });
+            let answers_open =
+                matches!(input, Input::SocketOpened { gen } if gen == self.socket_gen);
+            if answers_open && self.socket_open {
+                self.socket_ready = true;
+            }
             let effects = self.core.step(input);
             let connecting_after = self.core.state().connection == ConnectionView::Connecting;
             for e in effects {
@@ -139,15 +150,22 @@ impl Harness {
                         );
                         assert!(gen > self.socket_gen, "seed {}: gen reused", self.seed);
                         self.socket_open = true;
+                        self.socket_ready = false;
                         self.socket_gen = gen;
                     }
                     Effect::CloseSocket { gen } => {
                         assert_eq!(gen, self.socket_gen, "seed {}: close gen", self.seed);
                         self.socket_open = false;
+                        self.socket_ready = false;
                     }
                     Effect::Send { req, request } => {
-                        // Frames queue in an unbounded channel until the socket opens: only
-                        // the join may be sent while connecting, and only once it has opened.
+                        assert!(
+                            self.socket_ready,
+                            "seed {}: {request:?} sent with no opened socket",
+                            self.seed
+                        );
+                        // Frames queue in an unbounded channel: while connecting, only the join
+                        // may be sent, in answer to the current socket's `SocketOpened`.
                         if connecting_after {
                             assert!(
                                 request == Request::Join && answers_open,
@@ -185,6 +203,7 @@ fn random_sequences_preserve_connection_and_ordering_invariants() {
             seed,
             outstanding: Vec::new(),
             socket_open: false,
+            socket_ready: false,
             socket_gen: 0,
             events: Vec::new(),
         };
