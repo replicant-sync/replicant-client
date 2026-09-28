@@ -58,15 +58,20 @@ impl ChangeLogReader {
         Ok(reader)
     }
 
-    /// True once per batch of commits made by other connections since the last call.
-    pub async fn has_new_commits(&mut self) -> StoreResult<bool> {
-        let version = data_version(&mut self.conn).await?;
-        let changed = version != self.data_version;
-        self.data_version = version;
-        Ok(changed)
-    }
-
+    /// Call on every driver tick. Cheap when nothing changed: it checks `PRAGMA data_version`
+    /// first and only opens a transaction when another connection has committed since the
+    /// last call, but it still heartbeats on schedule either way, so an idle reader is never
+    /// trimmed past.
     pub async fn read(&mut self, now_unix: i64) -> StoreResult<LogRead> {
+        let version = data_version(&mut self.conn).await?;
+        if version == self.data_version {
+            if now_unix - self.heartbeat_at >= HEARTBEAT_EVERY_SECS {
+                self.save(now_unix).await?;
+            }
+            return Ok(LogRead::Docs(Vec::new()));
+        }
+        self.data_version = version;
+
         // Deferred transaction: the head, the trim floor and the rows are one consistent
         // snapshot, so a concurrent trim between these selects cannot make us miss rows
         // that were still present when we computed `trimmed_through`.
@@ -114,9 +119,6 @@ impl ChangeLogReader {
                 order.push(doc_id);
             }
         }
-        // Heartbeat/trim run on their own 10 s schedule, never on every tick: gating this
-        // on `!rows.is_empty()` would keep resetting the timer during sustained activity
-        // and trimming would never run while busy.
         if now_unix - self.heartbeat_at >= HEARTBEAT_EVERY_SECS {
             self.save(now_unix).await?;
         }
@@ -138,8 +140,9 @@ impl ChangeLogReader {
         Ok(())
     }
 
-    /// Persists position and heartbeat, then trims rows at or below the lowest position
-    /// among readers whose heartbeat is still fresh. Called at most every `HEARTBEAT_EVERY_SECS`.
+    /// Persists position and heartbeat, drops reader rows that have gone stale (a crashed
+    /// instance must not hold back trimming forever), then trims change-log rows at or below
+    /// the lowest position among the readers that are left.
     async fn save(&mut self, now_unix: i64) -> StoreResult<()> {
         sqlx::query(
             "INSERT INTO change_log_readers (instance_id, position, heartbeat_at) VALUES (?, ?, ?) \
@@ -152,11 +155,16 @@ impl ChangeLogReader {
         .execute(&mut self.conn)
         .await?;
         self.heartbeat_at = now_unix;
+        let stale_before = now_unix - READER_STALE_SECS;
+        sqlx::query("DELETE FROM change_log_readers WHERE heartbeat_at < ?")
+            .bind(stale_before)
+            .execute(&mut self.conn)
+            .await?;
         sqlx::query(
             "DELETE FROM change_log WHERE local_seq <= \
              (SELECT MIN(position) FROM change_log_readers WHERE heartbeat_at >= ?)",
         )
-        .bind(now_unix - READER_STALE_SECS)
+        .bind(stale_before)
         .execute(&mut self.conn)
         .await?;
         Ok(())
@@ -263,14 +271,46 @@ mod tests {
         );
     }
 
+    /// SQLite's `data_version` does not change for writes made by the same connection that
+    /// reads it, so a row inserted through the reader's own connection proves the version
+    /// looked unchanged and `read` skipped the transaction that would otherwise have seen it.
     #[tokio::test]
-    async fn data_version_reports_each_commit_from_another_connection_once() {
+    async fn unchanged_data_version_skips_the_read_transaction() {
         let t = temp_store().await;
         let mut reader = ChangeLogReader::open(&t.store, T0).await.unwrap();
-        assert!(!reader.has_new_commits().await.unwrap());
-        t.store.create_document(ME, None, json!({})).await.unwrap();
-        assert!(reader.has_new_commits().await.unwrap());
-        assert!(!reader.has_new_commits().await.unwrap());
+        sqlx::query(
+            "INSERT INTO change_log (doc_id, kind, origin_instance, origin) \
+             VALUES (?, 'upsert', ?, 'local')",
+        )
+        .bind(Uuid::from_u128(0xF00D).to_string())
+        .bind(reader.instance_id.to_string())
+        .execute(&mut reader.conn)
+        .await
+        .unwrap();
+
+        assert_eq!(reader.read(T0).await.unwrap(), LogRead::Docs(vec![]));
+    }
+
+    /// A commit landing between two `read` calls must never be swallowed by the version check.
+    #[tokio::test]
+    async fn version_change_between_reads_is_never_missed() {
+        let t = temp_store().await;
+        let other = open_again(&t.path()).await;
+        let mut reader = ChangeLogReader::open(&t.store, T0).await.unwrap();
+        assert_eq!(reader.read(T0).await.unwrap(), LogRead::Docs(vec![]));
+
+        let doc_id = other
+            .create_document(ME, None, json!({"x": 1}))
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.read(T0).await.unwrap(),
+            LogRead::Docs(vec![DocChange {
+                doc_id,
+                deleted: false,
+                origin: ChangeOrigin::OtherProcess,
+            }])
+        );
     }
 
     #[tokio::test]
@@ -312,9 +352,6 @@ mod tests {
         assert_eq!(count(&t.store, "SELECT COUNT(*) FROM change_log").await, 0);
     }
 
-    /// F6: gating the heartbeat/trim write on "rows were returned" (instead of purely on
-    /// elapsed time) means a reader that keeps getting new rows every tick never lets 10 s
-    /// of *its own* heartbeat age pass, so trimming never runs while the log stays busy.
     #[tokio::test]
     async fn sustained_activity_still_trims_old_rows() {
         let t = temp_store().await;
@@ -329,33 +366,30 @@ mod tests {
         assert_eq!(count(&t.store, "SELECT COUNT(*) FROM change_log").await, 0);
     }
 
-    /// F7: a reader with no local writes (e.g. a DAW plugin idling) must still heartbeat on
-    /// every `read` call so another process's trim never passes it; it keeps seeing per-doc
-    /// events instead of falling behind into `DatabaseChanged`.
+    /// A reader driven only through `read` (the real driver contract: one tick, no other
+    /// method) with no local writes of its own must still heartbeat often enough that another
+    /// process's trim, run well past the 60 s stale window, never passes it.
     #[tokio::test]
-    async fn idle_reader_keeps_heartbeat_fresh_so_it_is_not_trimmed_past() {
+    async fn idle_reader_driven_by_read_alone_stays_fresh_past_the_stale_window() {
         let t = temp_store().await;
         let other = open_again(&t.path()).await;
         let mut idle = ChangeLogReader::open(&t.store, T0).await.unwrap();
         let mut active = ChangeLogReader::open(&other, T0).await.unwrap();
 
-        // Idle has no local writes but keeps ticking, well past the 60 s stale window.
-        for tick in 1..=7 {
-            assert_eq!(
-                idle.read(T0 + tick * 10).await.unwrap(),
-                LogRead::Docs(vec![])
-            );
+        let mut now = T0;
+        for _tick in 0..65 {
+            now += 1;
+            assert_eq!(idle.read(now).await.unwrap(), LogRead::Docs(vec![]));
         }
 
-        let now = T0 + 70;
         let doc_id = other
             .create_document(ME, None, json!({"a": 1}))
             .await
             .unwrap();
-        active.read(now).await.unwrap();
+        active.read(now + 1).await.unwrap();
 
         assert_eq!(
-            idle.read(now + 1).await.unwrap(),
+            idle.read(now + 2).await.unwrap(),
             LogRead::Docs(vec![DocChange {
                 doc_id,
                 deleted: false,
