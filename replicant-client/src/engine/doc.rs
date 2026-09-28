@@ -408,9 +408,11 @@ pub fn sweep_doc(snap: &DocSnapshot, scope: &str, snapshot_seq: Seq) -> Vec<DocO
 }
 
 /// A full-resync snapshot document. It carries no `upload_id`, so it may already contain a v2
-/// upload of ours; array patch ops are index-based, so pending edits made against a
-/// v2-acknowledged shadow are never rebased onto it: they go to `recovered`. A shadow never
-/// acknowledged in v2 (seq 0 or none) cannot be in the snapshot, so those edits rebase.
+/// upload of ours; array patch ops are index-based, so pending edits are never rebased onto it
+/// unless the local shadow is a migrated v1 base (`seq == 0`): they go to `recovered` instead.
+/// A doc with no shadow at all (a v2 create whose reply was lost, or a migrated v1 create never
+/// synced) cannot tell whether the snapshot already holds its pending content, so it also takes
+/// the conflict path.
 pub fn apply_snapshot_doc(
     snap: &DocSnapshot,
     scope: &str,
@@ -434,8 +436,8 @@ pub fn apply_snapshot_doc(
         .iter()
         .any(|m| m.scope == scope && m.member);
     if member {
-        let base_never_acknowledged = snap.shadow.as_ref().is_none_or(|s| s.seq == 0);
-        ops.extend(apply_upsert(snap, doc, doc.seq, base_never_acknowledged));
+        let migrated_v1_base = snap.shadow.as_ref().is_some_and(|s| s.seq == 0);
+        ops.extend(apply_upsert(snap, doc, doc.seq, migrated_v1_base));
     }
     with_settle_invariant(snap, ops, me)
 }
@@ -1373,6 +1375,20 @@ mod property_tests {
             }
         }
 
+        /// A v2 create whose upload landed but the reply was lost: no shadow yet, one pending
+        /// `Create` row. Fuzzes the no-shadow branch of `apply_snapshot_doc` and `apply_change`.
+        fn new_lost_create(content: Value) -> Client {
+            let mut c = Client::new(content);
+            c.snap.shadow = None;
+            c.next_row = 1;
+            c.snap.rows = vec![OutboxRow {
+                mutation_id: m(1),
+                kind: RowKind::Create,
+                parked: false,
+            }];
+            c
+        }
+
         fn push_row(&mut self, kind: RowKind) {
             self.next_row += 1;
             self.snap.rows.push(OutboxRow {
@@ -1453,9 +1469,12 @@ mod property_tests {
                 .rows
                 .last()
                 .is_some_and(|r| r.kind == RowKind::Delete);
+            // Only a migrated v1 base (shadow seq 0) rebases; no shadow at all is also a
+            // conflict (a create whose reply was lost cannot tell what the snapshot already has).
+            let migrated_v1_base = self.snap.shadow.as_ref().is_some_and(|s| s.seq == 0);
             let recovers = !self.snap.rows.is_empty()
                 && !pending_delete
-                && self.snap.shadow.as_ref().is_some_and(|s| s.seq > 0)
+                && !migrated_v1_base
                 && doc.seq > self.snap.server_seq();
             let pre_content = self.snap.content.clone();
 
@@ -1466,11 +1485,11 @@ mod property_tests {
                         content: pre_content,
                         reason: RecoverReason::Conflict,
                     }),
-                    "a v2-era doc with pending rows must recover its exact local content"
+                    "a doc with pending rows and no migrated base must recover its exact local content"
                 );
                 assert!(
                     !ops.iter().any(|op| matches!(op, DocOp::InsertMarker(_))),
-                    "a v2-era doc with pending rows must never rebase onto a snapshot"
+                    "a doc with pending rows and no migrated base must never rebase onto a snapshot"
                 );
             }
             self.apply(&ops);
@@ -1479,7 +1498,9 @@ mod property_tests {
         }
 
         fn build(&mut self, server: &mut Server, rng: &mut Jitter) {
-            if self.in_flight.is_some() {
+            // The model server only accepts updates against an existing document: a client with
+            // no shadow yet (a pending create) waits for a page or snapshot to give it one.
+            if self.in_flight.is_some() || self.snap.shadow.is_none() {
                 return;
             }
             if self.must_catch_up {
@@ -1569,7 +1590,13 @@ mod property_tests {
             let mut rng = Jitter::new(seed * 104_729);
             let start = json!({"items": [], "theirs": 0});
             let mut server = Server::new(start.clone());
-            let mut client = Client::new(start);
+            // Half the seeds start as a lost-create client (no shadow, one pending Create row)
+            // to fuzz that branch of apply_snapshot_doc and apply_change.
+            let mut client = if seed % 2 == 0 {
+                Client::new_lost_create(start)
+            } else {
+                Client::new(start)
+            };
             for _ in 0..STEPS {
                 match (rng.next_unit() * 8.0) as u32 {
                     0 => client.edit(),
@@ -1731,6 +1758,27 @@ mod snapshot_doc_tests {
         assert_eq!(after.content, json!({"items": ["a", "b"], "theirs": 1}));
         assert_eq!(after.rows.len(), 1, "the edit is still pending");
         assert_eq!(after.shadow.unwrap().seq, 5);
+    }
+
+    #[test]
+    fn snapshot_doc_with_no_shadow_and_pending_create_recovers_exact_local_content() {
+        // v2 local create: create upload landed, its reply was lost (no shadow yet). A snapshot
+        // arrives holding both our create and another device's edit; this must never rebase.
+        let mut s = synced(json!({"items": ["a"]}), 0);
+        s.shadow = None;
+        s.rows = vec![row(1, RowKind::Create)];
+        let doc = env(json!({"items": ["a", "x"]}), 4);
+        let ops = apply_snapshot_doc(&s, "own", &doc, ME);
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"items": ["a"]}),
+            reason: RecoverReason::Conflict,
+        }));
+        assert!(ops.contains(&DocOp::Emit(DocEvent::ConflictDetected)));
+        assert!(!ops.iter().any(|op| matches!(op, DocOp::InsertMarker(_))));
+        let after = s.project(&ops);
+        assert_eq!(after.content, json!({"items": ["a", "x"]}));
+        assert!(after.rows.is_empty());
+        assert_eq!(after.shadow.unwrap().seq, 4);
     }
 
     #[test]
