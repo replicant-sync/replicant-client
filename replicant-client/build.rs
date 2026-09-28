@@ -18,6 +18,7 @@ fn main() {
         .write_to_file(&output_file);
 
     println!("cargo:rerun-if-changed=src/");
+    println!("cargo:rerun-if-changed=migrations");
     println!("cargo:rerun-if-changed=cbindgen.toml");
     println!("Generated C header: {}", output_file.display());
 }
