@@ -1284,17 +1284,20 @@ mod rebase_tests {
 
 #[cfg(test)]
 mod property_tests {
-    //! One writable document against a model server that applies uploads (deduplicated by
-    //! `(upload_id, base_hash)`). Changes reach the client as pushes (envelope at the change's
-    //! seq) or catch-up pages (current envelope). A lost reply is a reconnect: every committed
-    //! change is delivered before the next build.
+    //! One writable document against a model server that applies updates and deletes
+    //! (deduplicated by `(upload_id, base_hash)`) and that another device edits or deletes.
+    //! Changes reach the client as pushes (envelope at the change's seq) or catch-up pages
+    //! (current envelope). A lost reply is either a reconnect (every committed change is
+    //! delivered before the next build) or silent (the client learns of it only through
+    //! `hash_mismatch`). Like the machine, the client applies a server copy only once it has
+    //! been delivered every change up to the copy's seq; otherwise it catches up and rebuilds.
     use std::collections::HashMap;
 
     use super::change_fixtures::env;
     use super::fixtures::*;
     use super::*;
     use crate::engine::backoff::Jitter;
-    use crate::engine::types::{ServerError, Upload};
+    use crate::engine::types::{ServerError, Upload, UploadKind};
     use serde_json::json;
 
     const SEEDS: u64 = 500;
@@ -1302,12 +1305,42 @@ mod property_tests {
     const MAX_LOCAL_EDITS: u32 = 12;
     const MAX_OTHER_EDITS: u32 = 8;
 
+    #[derive(Debug, Clone, Copy)]
+    struct Committed {
+        seq: Seq,
+        upload_id: Option<Uuid>,
+        deleted: bool,
+    }
+
+    /// How often each rarely reached branch ran.
+    #[derive(Debug, Default)]
+    struct Hits {
+        rebase_conflicts: u32,
+        server_copy_fetches: u32,
+        server_copy_waits: u32,
+        mismatch_retries: u32,
+        delete_wins: u32,
+        local_deletes_settled: u32,
+    }
+
+    impl Hits {
+        fn add(&mut self, other: &Hits) {
+            self.rebase_conflicts += other.rebase_conflicts;
+            self.server_copy_fetches += other.server_copy_fetches;
+            self.server_copy_waits += other.server_copy_waits;
+            self.mismatch_retries += other.mismatch_retries;
+            self.delete_wins += other.delete_wins;
+            self.local_deletes_settled += other.local_deletes_settled;
+        }
+    }
+
     struct Server {
         /// Index = seq; seq 1 is the content both sides start from.
         history: Vec<Value>,
-        changes: Vec<(Seq, Option<Uuid>)>,
-        stored: HashMap<(Uuid, String), Seq>,
+        changes: Vec<Committed>,
+        stored: HashMap<(Uuid, Option<String>), Seq>,
         other_edits: u32,
+        deleted: bool,
     }
 
     impl Server {
@@ -1317,6 +1350,7 @@ mod property_tests {
                 changes: Vec::new(),
                 stored: HashMap::new(),
                 other_edits: 0,
+                deleted: false,
             }
         }
 
@@ -1332,43 +1366,72 @@ mod property_tests {
             env(self.history[seq as usize].clone(), seq)
         }
 
-        fn commit(&mut self, content: Value, upload_id: Option<Uuid>) -> Seq {
+        fn commit(&mut self, content: Value, upload_id: Option<Uuid>, deleted: bool) -> Seq {
             self.history.push(content);
             let seq = self.seq();
-            self.changes.push((seq, upload_id));
+            self.changes.push(Committed {
+                seq,
+                upload_id,
+                deleted,
+            });
             seq
         }
 
-        fn other_device_edit(&mut self) {
-            if self.other_edits == MAX_OTHER_EDITS {
+        /// Bumps `theirs` and sets or removes `shared`: a removed key makes a local replace of
+        /// it fail to rebase (`Rebased::Conflict`).
+        fn other_device_edit(&mut self, rng: &mut Jitter) {
+            if self.deleted || self.other_edits == MAX_OTHER_EDITS {
                 return;
             }
             self.other_edits += 1;
             let mut next = self.current().clone();
             next["theirs"] = json!(self.other_edits);
-            self.commit(next, None);
+            if rng.next_unit() < 0.5 {
+                next["shared"] = json!(format!("theirs{}", self.other_edits));
+            } else if let Some(fields) = next.as_object_mut() {
+                fields.remove("shared");
+            }
+            self.commit(next, None, false);
+        }
+
+        fn other_device_delete(&mut self) {
+            if self.deleted {
+                return;
+            }
+            self.deleted = true;
+            self.commit(self.current().clone(), None, true);
         }
 
         fn upload(&mut self, upload: &Upload) -> Result<DocEnvelope, ServerError> {
-            let base_hash = upload
-                .base_hash
-                .clone()
-                .expect("the model only uploads updates");
-            if let Some(seq) = self.stored.get(&(upload.upload_id, base_hash.clone())) {
+            let key = (upload.upload_id, upload.base_hash.clone());
+            if let Some(seq) = self.stored.get(&key) {
                 return Ok(self.envelope(*seq));
             }
-            let current_hash = content_hash(self.current());
-            if base_hash != current_hash {
-                let mut error = ServerError::new("hash_mismatch");
-                error.current_hash = Some(current_hash);
-                error.current_seq = Some(self.seq());
-                return Err(error);
+            if self.deleted {
+                return Err(ServerError::new("not_found"));
             }
-            let patch: json_patch::Patch = serde_json::from_value(upload.payload.clone()).unwrap();
-            let mut next = self.current().clone();
-            json_patch::patch(&mut next, &patch).unwrap();
-            let seq = self.commit(next, Some(upload.upload_id));
-            self.stored.insert((upload.upload_id, base_hash), seq);
+            let seq = match upload.kind {
+                UploadKind::Delete => {
+                    self.deleted = true;
+                    self.commit(self.current().clone(), Some(upload.upload_id), true)
+                }
+                UploadKind::Update => {
+                    let current_hash = content_hash(self.current());
+                    if upload.base_hash.as_deref() != Some(current_hash.as_str()) {
+                        let mut error = ServerError::new("hash_mismatch");
+                        error.current_hash = Some(current_hash);
+                        error.current_seq = Some(self.seq());
+                        return Err(error);
+                    }
+                    let patch: json_patch::Patch =
+                        serde_json::from_value(upload.payload.clone()).unwrap();
+                    let mut next = self.current().clone();
+                    json_patch::patch(&mut next, &patch).unwrap();
+                    self.commit(next, Some(upload.upload_id), false)
+                }
+                UploadKind::Create => panic!("the model document always exists on the server"),
+            };
+            self.stored.insert(key, seq);
             Ok(self.envelope(seq))
         }
     }
@@ -1379,9 +1442,15 @@ mod property_tests {
         in_flight: Option<(InFlight, Result<DocEnvelope, ServerError>)>,
         mismatches: u32,
         delivered: usize,
+        /// Highest seq delivered: the model's committed `own` cursor.
+        cursor: Seq,
         must_catch_up: bool,
         local_edits: u32,
+        /// `n` of every `t{n}` appended to `items`.
+        tokens: Vec<u32>,
+        deleted_locally: bool,
         recovered: Vec<Value>,
+        hits: Hits,
     }
 
     impl Client {
@@ -1392,21 +1461,24 @@ mod property_tests {
                 in_flight: None,
                 mismatches: 0,
                 delivered: 0,
+                cursor: 1,
                 must_catch_up: false,
                 local_edits: 0,
+                tokens: Vec::new(),
+                deleted_locally: false,
                 recovered: Vec::new(),
+                hits: Hits::default(),
             }
         }
 
-        /// A v2 create whose upload landed but the reply was lost: no shadow yet, one pending
-        /// `Create` row. Fuzzes the no-shadow branch of `apply_snapshot_doc` and `apply_change`'s
-        /// non-echo arm (every push or page delivered before this client's create resolves),
-        /// plus its echo arm on the seeds where `server.changes` carries a matching entry.
-        /// `apply_server_copy`'s no-shadow branch is not reached here: `build` never sends while
-        /// the shadow is still unset.
+        /// A v2 create whose upload landed but whose reply was lost: no shadow yet, one pending
+        /// `Create` row. Fuzzes the no-shadow branch of `apply_snapshot_doc` and of
+        /// `apply_change`'s non-echo arm, plus its echo arm on the seeds where `server.changes`
+        /// carries a matching entry.
         fn new_lost_create(content: Value) -> Client {
             let mut c = Client::new(content);
             c.snap.shadow = None;
+            c.cursor = 0;
             c.next_row = 1;
             c.snap.rows = vec![OutboxRow {
                 mutation_id: m(1),
@@ -1431,66 +1503,114 @@ mod property_tests {
             for op in ops {
                 match op {
                     DocOp::InsertMarker(kind) => self.push_row(*kind),
-                    DocOp::Recover { content, .. } => self.recovered.push(content.clone()),
+                    DocOp::Recover { content, reason } => {
+                        if *reason == RecoverReason::DeleteWins {
+                            self.hits.delete_wins += 1;
+                        }
+                        self.recovered.push(content.clone());
+                    }
                     other => self.snap = self.snap.project(std::slice::from_ref(other)),
                 }
             }
-            assert!(
-                self.snap.server_seq() >= seq_before,
-                "shadow seq went backwards"
-            );
+            // A hard delete without a tombstone (sweep, `not_found`) drops the shadow on purpose.
+            if self.snap.exists {
+                assert!(
+                    self.snap.server_seq() >= seq_before,
+                    "shadow seq went backwards"
+                );
+            }
         }
 
-        fn edit(&mut self) {
-            if self.local_edits == MAX_LOCAL_EDITS {
+        /// A local edit as the store accepts it: never on a deleted document.
+        fn edit(&mut self, rng: &mut Jitter) {
+            if !self.snap.exists || self.snap.soft_deleted || self.local_edits == MAX_LOCAL_EDITS {
                 return;
             }
             self.local_edits += 1;
-            let token = json!(format!("t{}", self.local_edits));
-            self.snap.content["items"]
-                .as_array_mut()
-                .expect("items array")
-                .push(token);
+            let n = self.local_edits;
+            if rng.next_unit() < 0.3 {
+                self.snap.content["shared"] = json!(format!("mine{n}"));
+            } else {
+                self.snap.content["items"]
+                    .as_array_mut()
+                    .expect("items array")
+                    .push(token(n));
+                self.tokens.push(n);
+            }
             self.push_row(RowKind::Update);
         }
 
+        /// A local delete as the store writes it: soft delete plus a `Delete` row.
+        fn delete(&mut self) {
+            if !self.snap.exists || self.snap.soft_deleted {
+                return;
+            }
+            self.snap.soft_deleted = true;
+            self.push_row(RowKind::Delete);
+            self.deleted_locally = true;
+        }
+
+        /// A non-echo delivery or server copy onto a shadow with pending rows that recovers as
+        /// a conflict is a rebase that failed.
+        fn count_rebase_conflict(&mut self, rebase_possible: bool, ops: &[DocOp]) {
+            let conflicted = ops.iter().any(|op| {
+                matches!(
+                    op,
+                    DocOp::Recover {
+                        reason: RecoverReason::Conflict,
+                        ..
+                    }
+                )
+            });
+            if rebase_possible && conflicted {
+                self.hits.rebase_conflicts += 1;
+            }
+        }
+
         fn deliver(&mut self, server: &Server, as_page: bool) {
-            let Some(&(seq, upload_id)) = server.changes.get(self.delivered) else {
+            let Some(&committed) = server.changes.get(self.delivered) else {
                 return;
             };
             self.delivered += 1;
-            let doc = if as_page {
-                server.envelope(server.seq())
-            } else {
-                server.envelope(seq)
-            };
-            let is_echo_for_us = upload_id.is_some_and(|u| self.rows_contain(u));
-            let pending_delete_before = self
-                .snap
-                .rows
-                .last()
-                .is_some_and(|r| r.kind == RowKind::Delete);
-            let before_server_seq = self.snap.server_seq();
+            // A page carries the current envelope, which a deleted document no longer has.
+            let as_page = as_page && !server.deleted;
+            let doc = (!committed.deleted).then(|| {
+                if as_page {
+                    server.envelope(server.seq())
+                } else {
+                    server.envelope(committed.seq)
+                }
+            });
             let change = Change {
                 scope: "own".into(),
-                seq,
-                prev_seq: seq - 1,
+                seq: committed.seq,
+                prev_seq: committed.seq - 1,
                 doc_id: DOC,
-                kind: ChangeKind::Upsert,
-                doc: Some(doc.clone()),
+                kind: if committed.deleted {
+                    ChangeKind::Delete
+                } else {
+                    ChangeKind::Upsert
+                },
+                doc: doc.clone(),
                 client_id: None,
-                upload_id,
+                upload_id: committed.upload_id,
             };
+            let is_echo_for_us = committed.upload_id.is_some_and(|u| self.rows_contain(u));
+            let pending_delete_before = delete_pending(&self.snap);
+            let rebase_possible = self.snap.shadow.is_some() && !self.snap.rows.is_empty();
+            let before_server_seq = self.snap.server_seq();
             let ops = apply_change(&self.snap, &change, ME);
+            self.count_rebase_conflict(rebase_possible && !is_echo_for_us, &ops);
             self.apply(&ops);
-            if !is_echo_for_us {
-                // apply_change's content guard gates on the change's own seq, not the envelope's
-                // (a page can carry a newer envelope than the change it is delivering).
+            self.cursor = self.cursor.max(committed.seq);
+            if let (false, Some(doc)) = (is_echo_for_us, &doc) {
+                // apply_change's content guard gates on the change's own seq, not the
+                // envelope's (a page can carry a newer envelope than the change it delivers).
                 assert_other_device_edit_preserved(
                     before_server_seq,
-                    seq,
+                    committed.seq,
                     pending_delete_before,
-                    &doc,
+                    doc,
                     self,
                     &ops,
                     "deliver",
@@ -1510,52 +1630,61 @@ mod property_tests {
             self.must_catch_up = false;
         }
 
-        /// A full resync: the current envelope as a snapshot document; the cursor jumps past
-        /// every committed change.
+        /// A full resync: the current envelope as a snapshot document, or the sweep when the
+        /// server no longer lists the document; the cursor jumps past every committed change.
         fn snapshot(&mut self, server: &Server) {
-            let doc = server.envelope(server.seq());
-            // A pending delete wins unconditionally (shadow only); it is not a conflict.
-            let pending_delete = self
-                .snap
-                .rows
-                .last()
-                .is_some_and(|r| r.kind == RowKind::Delete);
-            // Only a migrated v1 base (shadow seq 0) rebases; no shadow at all is also a
-            // conflict (a create whose reply was lost cannot tell what the snapshot already has).
-            let migrated_v1_base = self.snap.shadow.as_ref().is_some_and(|s| s.seq == 0);
-            let recovers = !self.snap.rows.is_empty()
-                && !pending_delete
-                && !migrated_v1_base
-                && doc.seq > self.snap.server_seq();
-            let pre_content = self.snap.content.clone();
-
-            let ops = apply_snapshot_doc(&self.snap, "own", &doc, ME);
-            if recovers {
-                assert!(
-                    ops.contains(&DocOp::Recover {
-                        content: pre_content,
-                        reason: RecoverReason::Conflict,
-                    }),
-                    "a doc with pending rows and no migrated base must recover its exact local content"
-                );
-                assert!(
-                    !ops.iter().any(|op| matches!(op, DocOp::InsertMarker(_))),
-                    "a doc with pending rows and no migrated base must never rebase onto a snapshot"
-                );
+            if server.deleted {
+                let ops = sweep_doc(&self.snap, "own", server.seq());
+                self.apply(&ops);
+            } else {
+                let doc = server.envelope(server.seq());
+                // Only a migrated v1 base (shadow seq 0) rebases; no shadow at all is also a
+                // conflict (a create whose reply was lost cannot tell what the snapshot has).
+                let migrated_v1_base = self.snap.shadow.as_ref().is_some_and(|s| s.seq == 0);
+                let recovers = self.snap.exists
+                    && !self.snap.rows.is_empty()
+                    && !delete_pending(&self.snap)
+                    && !doc.read_only
+                    && !migrated_v1_base
+                    && doc.seq > self.snap.server_seq();
+                let pre_content = self.snap.content.clone();
+                let ops = apply_snapshot_doc(&self.snap, "own", &doc, ME);
+                if recovers {
+                    assert!(
+                        ops.contains(&DocOp::Recover {
+                            content: pre_content,
+                            reason: RecoverReason::Conflict,
+                        }),
+                        "a doc with pending rows and no migrated base must recover its exact local content"
+                    );
+                    assert!(
+                        !ops.iter().any(|op| matches!(op, DocOp::InsertMarker(_))),
+                        "a doc with pending rows and no migrated base must never rebase onto a snapshot"
+                    );
+                }
+                self.apply(&ops);
             }
-            self.apply(&ops);
             self.delivered = server.changes.len();
+            self.cursor = server.seq();
             self.must_catch_up = false;
         }
 
         fn build(&mut self, server: &mut Server, rng: &mut Jitter) {
-            // The model server only accepts updates against an existing document: a client with
-            // no shadow yet (a pending create) waits for a page or snapshot to give it one.
-            if self.in_flight.is_some() || self.snap.shadow.is_none() {
+            if self.in_flight.is_some() {
                 return;
             }
             if self.must_catch_up {
                 self.catch_up(server, rng);
+            }
+            let ends_in_delete = self
+                .snap
+                .rows
+                .last()
+                .is_some_and(|r| r.kind == RowKind::Delete);
+            // The model server takes updates and deletes only: a pending create waits for a
+            // page or snapshot to give it a shadow.
+            if !self.snap.exists || (self.snap.shadow.is_none() && !ends_in_delete) {
+                return;
             }
             match build_upload(&self.snap, ME) {
                 BuildResult::Send { upload, inflight } => {
@@ -1568,25 +1697,39 @@ mod property_tests {
             }
         }
 
-        fn reply(&mut self, server: &Server) {
+        fn reply(&mut self, server: &Server, rng: &mut Jitter) {
             let Some((inflight, reply)) = self.in_flight.take() else {
                 return;
             };
             match settle(&self.snap, &inflight, &reply, ME, self.mismatches) {
                 SettleResult::Ops(ops) => {
+                    if inflight.kind == UploadKind::Delete {
+                        self.hits.local_deletes_settled += 1;
+                    }
                     self.mismatches = 0;
                     self.apply(&ops);
                 }
                 SettleResult::FetchServerCopy => {
+                    self.hits.server_copy_fetches += 1;
                     self.mismatches += 1;
-                    let pending_delete_before = self
-                        .snap
-                        .rows
-                        .last()
-                        .is_some_and(|r| r.kind == RowKind::Delete);
-                    let before_server_seq = self.snap.server_seq();
+                    if server.deleted {
+                        let ops = apply_server_deleted(&self.snap, server.seq());
+                        self.apply(&ops);
+                        return;
+                    }
                     let doc = server.envelope(server.seq());
+                    if doc.seq > self.cursor {
+                        // Decision 1: the copy may hold an upload of ours whose reply was lost;
+                        // catching up lets its echo settle our rows first, then we rebuild.
+                        self.hits.server_copy_waits += 1;
+                        self.catch_up(server, rng);
+                        return;
+                    }
+                    let pending_delete_before = delete_pending(&self.snap);
+                    let rebase_possible = self.snap.shadow.is_some() && !self.snap.rows.is_empty();
+                    let before_server_seq = self.snap.server_seq();
                     let ops = apply_server_copy(&self.snap, &doc, ME);
+                    self.count_rebase_conflict(rebase_possible, &ops);
                     self.apply(&ops);
                     // apply_server_copy's content guard gates on the envelope's own seq.
                     assert_other_device_edit_preserved(
@@ -1601,16 +1744,23 @@ mod property_tests {
                 }
                 SettleResult::Retry { mismatch, .. } => {
                     if mismatch {
+                        self.hits.mismatch_retries += 1;
                         self.mismatches += 1;
                     }
                 }
             }
         }
 
+        /// The reply is lost with the connection: the next one catches up before building.
         fn lose_reply(&mut self) {
             if self.in_flight.take().is_some() {
                 self.must_catch_up = true;
             }
+        }
+
+        /// The reply is lost but the connection stays: nothing is delivered before the rebuild.
+        fn lose_reply_silently(&mut self) {
+            self.in_flight = None;
         }
     }
 
@@ -1629,9 +1779,7 @@ mod property_tests {
     /// recover the pre-delivery local content instead (tracked in `client.recovered`, not
     /// discarded). A stale or pending-delete delivery is exempt: it is spec-correct for those to
     /// leave content untouched. `guard_seq` is whatever seq the caller's own content guard
-    /// compares against `before_server_seq` — the change's seq for a delivery (a page can carry
-    /// a newer envelope than the change it is delivering), the envelope's own seq for a server
-    /// copy.
+    /// compares against `before_server_seq`.
     fn assert_other_device_edit_preserved(
         before_server_seq: Seq,
         guard_seq: Seq,
@@ -1655,10 +1803,17 @@ mod property_tests {
     }
 
     fn check_invariants(seed: u64, client: &Client) {
+        if !client.snap.exists {
+            assert!(
+                client.snap.rows.is_empty(),
+                "seed {seed}: rows left on a hard-deleted document"
+            );
+            return;
+        }
         let items = client.snap.content["items"]
             .as_array()
             .expect("items array");
-        for n in 1..=client.local_edits {
+        for &n in &client.tokens {
             let copies = items.iter().filter(|item| **item == token(n)).count();
             assert!(
                 copies <= 1,
@@ -1677,11 +1832,20 @@ mod property_tests {
 
     fn drain(seed: u64, server: &mut Server, client: &mut Client, rng: &mut Jitter) {
         for _ in 0..50 {
-            client.reply(server);
+            client.reply(server, rng);
             client.catch_up(server, rng);
             check_invariants(seed, client);
             if client.snap.rows.is_empty() {
                 return;
+            }
+            let ends_in_delete = client
+                .snap
+                .rows
+                .last()
+                .is_some_and(|r| r.kind == RowKind::Delete);
+            if client.snap.shadow.is_none() && !ends_in_delete {
+                // A pending create no delivered change resolved: a later connection's resync.
+                client.snapshot(server);
             }
             client.build(server, rng);
         }
@@ -1690,12 +1854,12 @@ mod property_tests {
 
     #[test]
     fn random_echo_rebase_and_page_sequences_lose_and_duplicate_nothing() {
+        let mut totals = Hits::default();
         for seed in 1..=SEEDS {
             let mut rng = Jitter::new(seed * 104_729);
             let start = json!({"items": [], "theirs": 0});
             let mut server = Server::new(start.clone());
-            // Half the seeds start as a lost-create client (no shadow, one pending Create row)
-            // to fuzz that branch of apply_snapshot_doc and apply_change.
+            // Half the seeds start as a lost-create client (no shadow, one pending Create row).
             let lost_create = seed % 2 == 0;
             let mut client = if lost_create {
                 Client::new_lost_create(start)
@@ -1703,41 +1867,72 @@ mod property_tests {
                 Client::new(start)
             };
             if lost_create && seed % 4 == 0 {
-                // The create landed on the server as the doc's starting content, but our reply
-                // was lost; deliver it back as a change too, fuzzing the echo arm with no shadow.
-                server.changes.push((1, Some(m(1))));
+                // The create landed as the doc's starting content but our reply was lost;
+                // deliver it back as a change too, fuzzing the echo arm with no shadow.
+                server.changes.push(Committed {
+                    seq: 1,
+                    upload_id: Some(m(1)),
+                    deleted: false,
+                });
             }
+            // A delete ends the document's life, so only some seeds allow one.
+            let local_deletes = seed % 5 == 0;
+            // The lost-create model can't upload a create, so a lost-create client can never
+            // build the delete-triggering upload the model server would apply.
+            let other_deletes = !lost_create && seed % 7 == 0;
             for _ in 0..STEPS {
-                match (rng.next_unit() * 8.0) as u32 {
-                    0 => client.edit(),
+                match (rng.next_unit() * 11.0) as u32 {
+                    0 => client.edit(&mut rng),
                     1 => client.build(&mut server, &mut rng),
-                    2 => server.other_device_edit(),
+                    2 => server.other_device_edit(&mut rng),
                     3 => client.deliver(&server, false),
                     4 => client.deliver(&server, true),
-                    5 => client.reply(&server),
+                    5 => client.reply(&server, &mut rng),
                     6 => client.lose_reply(),
+                    7 => client.lose_reply_silently(),
+                    8 if local_deletes => client.delete(),
+                    9 if other_deletes => server.other_device_delete(),
+                    8 | 9 => client.edit(&mut rng),
                     _ => client.snapshot(&server),
                 }
                 check_invariants(seed, &client);
             }
             drain(seed, &mut server, &mut client, &mut rng);
 
-            assert_eq!(
-                &client.snap.content,
-                server.current(),
-                "seed {seed}: client and server differ"
-            );
-            let final_items = server.current()["items"].as_array().unwrap();
-            for n in 1..=client.local_edits {
-                let kept = final_items.contains(&token(n))
-                    || client.recovered.iter().any(|content| {
-                        content["items"]
-                            .as_array()
-                            .is_some_and(|items| items.contains(&token(n)))
-                    });
-                assert!(kept, "seed {seed}: t{n} lost");
+            if server.deleted {
+                assert!(
+                    !client.snap.exists,
+                    "seed {seed}: the server deleted the document but the client kept it"
+                );
+            } else {
+                assert_eq!(
+                    &client.snap.content,
+                    server.current(),
+                    "seed {seed}: client and server differ"
+                );
             }
+            // A local delete intentionally discards local edits.
+            if !client.deleted_locally {
+                let final_items = server.current()["items"].as_array().unwrap();
+                for &n in &client.tokens {
+                    let kept = final_items.contains(&token(n))
+                        || client.recovered.iter().any(|content| {
+                            content["items"]
+                                .as_array()
+                                .is_some_and(|items| items.contains(&token(n)))
+                        });
+                    assert!(kept, "seed {seed}: t{n} lost");
+                }
+            }
+            totals.add(&client.hits);
         }
+        // Each branch must actually run, or the model has stopped testing it.
+        assert!(totals.rebase_conflicts > 0, "{totals:?}");
+        assert!(totals.server_copy_fetches > 0, "{totals:?}");
+        assert!(totals.server_copy_waits > 0, "{totals:?}");
+        assert!(totals.mismatch_retries > 0, "{totals:?}");
+        assert!(totals.delete_wins > 0, "{totals:?}");
+        assert!(totals.local_deletes_settled > 0, "{totals:?}");
     }
 }
 
