@@ -17,6 +17,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::timers::Timers;
+use crate::engine::list_merge::ListMergeConfig;
 use crate::engine::machine::{
     BuildOutcome, ConnectionView, Core, Effect, EngineState, HaltReason, Input, Lifecycle, Request,
     Response, SettleOutcome, TimerId,
@@ -56,6 +57,8 @@ pub struct EngineConfig {
     pub host_version: String,
     pub credentials: CredentialLoader,
     pub jitter_seed: u64,
+    /// How lists that both this device and another changed are merged. Local to this device.
+    pub list_merge: ListMergeConfig,
 }
 
 /// Idempotent, so a full command queue loses nothing.
@@ -197,7 +200,10 @@ impl Owner {
         events: mpsc::UnboundedSender<EngineEvent>,
     ) -> Result<(Owner, Controls), EngineError> {
         let url = socket_url(&config.server_url, config.client_id).map_err(EngineError::Config)?;
-        let store = Arc::new(retry_migrate_once(|| Store::open(db_path)).await?);
+        config.list_merge.validate().map_err(EngineError::Config)?;
+        let mut store = retry_migrate_once(|| Store::open(db_path)).await?;
+        store.list_merge = config.list_merge;
+        let store = Arc::new(store);
         let me = store.user_id().await?;
         let scopes = store.subscribed_scopes().await?;
         let reader = ChangeLogReader::open(&store, now_unix()).await?;

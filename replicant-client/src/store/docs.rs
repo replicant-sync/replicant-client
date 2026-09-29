@@ -411,7 +411,7 @@ mod tests {
 
     use super::*;
     use crate::engine::doc::change_fixtures::{env, upsert, with_upload};
-    use crate::engine::doc::fixtures::{synced, DOC};
+    use crate::engine::doc::fixtures::{synced, APPEND, DOC};
     use crate::engine::doc::{apply_change, DocEvent};
     use crate::engine::types::{SCOPE_CURATED, SCOPE_OWN};
     use crate::store::test_support::*;
@@ -444,7 +444,10 @@ mod tests {
         let mut page_echo = with_upload(upsert(SCOPE_OWN, json!({}), 2), uploaded);
         page_echo.doc = Some(env(json!({"a": 1, "mine": true, "theirs": true}), 4));
 
-        let notices = apply(&t.store, DOC, |snap| apply_change(snap, &page_echo, ME)).await;
+        let notices = apply(&t.store, DOC, |snap| {
+            apply_change(snap, &page_echo, ME, &APPEND)
+        })
+        .await;
 
         assert_eq!(
             notices,
@@ -603,7 +606,7 @@ mod tests {
         let change = upsert_change(SCOPE_CURATED, doc.clone());
 
         apply_with_envelope(&t.store, DOC, Some(&doc), |snap| {
-            apply_change(snap, &change, ME)
+            apply_change(snap, &change, ME, &APPEND)
         })
         .await;
 

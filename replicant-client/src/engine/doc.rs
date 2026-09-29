@@ -1,9 +1,10 @@
-use json_patch::{AddOperation, PatchOperation};
+use json_patch::PatchOperation;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
 use super::hash::content_hash;
+use super::list_merge::{ListMergeConfig, ListMergePolicy};
 use super::types::{Change, ChangeKind, DocEnvelope, Scope, Seq};
 
 pub use super::doc_upload::{
@@ -241,6 +242,7 @@ fn apply_upsert(
     doc: &DocEnvelope,
     seq: Seq,
     local_base_known: bool,
+    lists: &ListMergeConfig,
 ) -> Vec<DocOp> {
     let new_shadow = Shadow {
         content: doc.content.clone(),
@@ -284,7 +286,7 @@ fn apply_upsert(
         return ops;
     }
     let rebased = match &snap.shadow {
-        Some(old) if local_base_known => rebase(&old.content, &doc.content, &snap.content),
+        Some(old) if local_base_known => rebase(&old.content, &doc.content, &snap.content, lists),
         _ => Rebased::Conflict,
     };
     match rebased {
@@ -313,7 +315,12 @@ fn apply_upsert(
     ops
 }
 
-pub fn apply_change(snap: &DocSnapshot, change: &Change, me: Uuid) -> Vec<DocOp> {
+pub fn apply_change(
+    snap: &DocSnapshot,
+    change: &Change,
+    me: Uuid,
+    lists: &ListMergeConfig,
+) -> Vec<DocOp> {
     let mut ops = Vec::new();
     let membership_applies = change.seq > membership_seq(snap, &change.scope);
     if membership_applies {
@@ -368,7 +375,7 @@ pub fn apply_change(snap: &DocSnapshot, change: &Change, me: Uuid) -> Vec<DocOp>
                 if doc.seq != change.seq {
                     ops.push(DocOp::DeleteRows(covered));
                     let acked = snap.project(&ops);
-                    ops.extend(apply_upsert(&acked, doc, doc.seq, false));
+                    ops.extend(apply_upsert(&acked, doc, doc.seq, false, lists));
                     return with_settle_invariant(snap, ops, me);
                 }
                 ops.push(DocOp::SetMeta {
@@ -389,7 +396,13 @@ pub fn apply_change(snap: &DocSnapshot, change: &Change, me: Uuid) -> Vec<DocOp>
             if is_member(&ops) {
                 if let Some(doc) = &change.doc {
                     // Pages carry the current envelope; the shadow holds that version, not the change's.
-                    ops.extend(apply_upsert(snap, doc, doc.seq.max(change.seq), true));
+                    ops.extend(apply_upsert(
+                        snap,
+                        doc,
+                        doc.seq.max(change.seq),
+                        true,
+                        lists,
+                    ));
                 }
             }
         }
@@ -422,11 +435,16 @@ pub fn apply_server_deleted(snap: &DocSnapshot, seq: Seq) -> Vec<DocOp> {
     apply_delete(snap, seq.max(snap.server_seq()), false)
 }
 
-pub fn apply_server_copy(snap: &DocSnapshot, doc: &DocEnvelope, _me: Uuid) -> Vec<DocOp> {
+pub fn apply_server_copy(
+    snap: &DocSnapshot,
+    doc: &DocEnvelope,
+    _me: Uuid,
+    lists: &ListMergeConfig,
+) -> Vec<DocOp> {
     if doc.seq <= snap.server_seq() {
         return Vec::new();
     }
-    apply_upsert(snap, doc, doc.seq, true)
+    apply_upsert(snap, doc, doc.seq, true, lists)
 }
 
 /// `get_document` said the document does not exist on the server: not_found means the server
@@ -469,6 +487,7 @@ pub fn apply_snapshot_doc(
     scope: &str,
     doc: &DocEnvelope,
     me: Uuid,
+    lists: &ListMergeConfig,
 ) -> Vec<DocOp> {
     let mut ops = Vec::new();
     if doc.seq > membership_seq(snap, scope) {
@@ -491,7 +510,7 @@ pub fn apply_snapshot_doc(
         // sent, unacknowledged upload may already be applied there, so its rows conflict.
         let migrated_v1_base = snap.shadow.as_ref().is_some_and(|s| s.seq == 0);
         let base_known = migrated_v1_base || snap.unacked_upload.is_none();
-        ops.extend(apply_upsert(snap, doc, doc.seq, base_known));
+        ops.extend(apply_upsert(snap, doc, doc.seq, base_known, lists));
     }
     with_settle_invariant(snap, ops, me)
 }
@@ -520,34 +539,40 @@ pub enum Rebased {
 }
 
 /// Replays the local change (`old_base` → `local`) onto `new_base` field by field. A local
-/// operation collides with a server one when their paths are equal or one contains the other
-/// and the two sides end with different values there; the collision is recorded at the shorter
-/// path. `json_patch::diff` compares arrays position by position, so an element path is a field
-/// like any other; local appends never collide and are re-appended after the server's.
-pub fn rebase(old_base: &Value, new_base: &Value, local: &Value) -> Rebased {
+/// operation collides with a server one when their `collision_path`s are equal or one contains
+/// the other and the two sides end with different values there; the collision is recorded at
+/// the shorter path. A list that `lists` makes one value collides whole: the server's list is
+/// kept and the local one set aside.
+pub fn rebase(
+    old_base: &Value,
+    new_base: &Value,
+    local: &Value,
+    lists: &ListMergeConfig,
+) -> Rebased {
     let local_ops = json_patch::diff(old_base, local).0;
+    let lift = |path: &str| collision_path(old_base, local, new_base, path, lists);
     let their_paths: Vec<String> = json_patch::diff(old_base, new_base)
         .0
         .iter()
-        .map(|op| op_path(op).to_string())
+        .map(|op| lift(op_path(op)))
         .collect();
     let mut contested: Vec<String> = Vec::new();
-    for op in local_ops.iter().filter(|op| !is_append(old_base, op)) {
-        let path = op_path(op);
+    for op in &local_ops {
+        let path = lift(op_path(op));
         let shortest = their_paths
             .iter()
-            .filter(|theirs| contains(theirs, path) || contains(path, theirs))
+            .filter(|theirs| contains(theirs, &path) || contains(&path, theirs))
             .map(|theirs| {
                 if theirs.len() < path.len() {
-                    theirs.as_str()
+                    theirs.clone()
                 } else {
-                    path
+                    path.clone()
                 }
             })
             .min_by_key(|p| p.len());
         if let Some(p) = shortest {
-            if !contested.iter().any(|c| c == p) {
-                contested.push(p.to_string());
+            if !contested.contains(&p) {
+                contested.push(p);
             }
         }
     }
@@ -568,20 +593,10 @@ pub fn rebase(old_base: &Value, new_base: &Value, local: &Value) -> Rebased {
             local_removed: local.pointer(p).is_none(),
         })
         .collect();
-    let mut kept = Vec::new();
-    let mut appends = Vec::new();
-    for op in local_ops {
-        if is_append(old_base, &op) {
-            // `<parent>/-` on an object would add a key named "-".
-            if !matches!(new_base.pointer(append_parent(&op)), Some(Value::Array(_))) {
-                return Rebased::Conflict;
-            }
-            appends.push(to_end(op));
-        } else if !outermost.iter().any(|p| contains(p, op_path(&op))) {
-            kept.push(op);
-        }
-    }
-    kept.extend(appends);
+    let kept: Vec<PatchOperation> = local_ops
+        .into_iter()
+        .filter(|op| !outermost.iter().any(|p| contains(p, op_path(op))))
+        .collect();
     let mut out = new_base.clone();
     if json_patch::patch(&mut out, &kept).is_err() {
         return Rebased::Conflict;
@@ -615,35 +630,75 @@ fn contains(ancestor: &str, path: &str) -> bool {
             && path.as_bytes()[ancestor.len()] == b'/')
 }
 
-/// An `add` at or past the end of an array the old base already had.
-fn is_append(old_base: &Value, op: &PatchOperation) -> bool {
-    let PatchOperation::Add(add) = op else {
-        return false;
-    };
-    let Some((parent, index)) = add.path.rsplit_once('/') else {
-        return false;
-    };
-    match (old_base.pointer(parent), index.parse::<usize>()) {
-        (Some(Value::Array(items)), Ok(index)) => index >= items.len(),
-        _ => false,
+/// How one side left a list the old base had.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListShape {
+    SameLength,
+    /// The old list is a prefix: elements were only added at the end.
+    Appended,
+    /// An insert or a removal, or the value is gone or no longer a list.
+    Moved,
+}
+
+fn list_shape(old: &[Value], side: Option<&Value>) -> ListShape {
+    match side {
+        Some(Value::Array(now)) if now.len() == old.len() => ListShape::SameLength,
+        Some(Value::Array(now)) if now.len() > old.len() && now[..old.len()] == old[..] => {
+            ListShape::Appended
+        }
+        _ => ListShape::Moved,
     }
 }
 
-fn append_parent(op: &PatchOperation) -> &str {
-    op_path(op)
-        .rsplit_once('/')
-        .map_or("", |(parent, _)| parent)
+/// Whether the list at `path` collides as one value: always under `Atomic`; under `Append`
+/// once positions stop lining up (anything but same-length edits on both sides, or one side
+/// only appending while the other keeps the length).
+fn merges_as_one_value(
+    old_base: &Value,
+    local: &Value,
+    new_base: &Value,
+    path: &str,
+    lists: &ListMergeConfig,
+) -> bool {
+    let Some(Value::Array(old)) = old_base.pointer(path) else {
+        return false;
+    };
+    match lists.policy_for(path) {
+        ListMergePolicy::Atomic => true,
+        ListMergePolicy::Append => !matches!(
+            (
+                list_shape(old, local.pointer(path)),
+                list_shape(old, new_base.pointer(path))
+            ),
+            (ListShape::SameLength, ListShape::SameLength)
+                | (ListShape::SameLength, ListShape::Appended)
+                | (ListShape::Appended, ListShape::SameLength)
+        ),
+        ListMergePolicy::Full => unreachable!("Engine::start refuses the Full list merge policy"),
+    }
 }
 
-fn to_end(op: PatchOperation) -> PatchOperation {
-    let path = format!("{}/-", append_parent(&op));
-    match op {
-        PatchOperation::Add(add) => PatchOperation::Add(AddOperation {
-            path,
-            value: add.value,
-        }),
-        other => other,
+/// The path a change at `path` collides at: the outermost list holding it that collides as
+/// one value, else `path` itself.
+fn collision_path(
+    old_base: &Value,
+    local: &Value,
+    new_base: &Value,
+    path: &str,
+    lists: &ListMergeConfig,
+) -> String {
+    let mut prefix = String::new();
+    if merges_as_one_value(old_base, local, new_base, &prefix, lists) {
+        return prefix;
     }
+    for token in path.split('/').skip(1) {
+        prefix.push('/');
+        prefix.push_str(token);
+        if merges_as_one_value(old_base, local, new_base, &prefix, lists) {
+            return prefix;
+        }
+    }
+    path.to_string()
 }
 
 #[cfg(test)]
@@ -654,6 +709,12 @@ pub(crate) mod fixtures {
     pub const ME: Uuid = Uuid::from_u128(0xA);
     pub const OTHER: Uuid = Uuid::from_u128(0xB);
     pub const DOC: Uuid = Uuid::from_u128(0xD0C);
+
+    /// The default list merge configuration: `Append`, no rules.
+    pub static APPEND: ListMergeConfig = ListMergeConfig {
+        default: ListMergePolicy::Append,
+        rules: Vec::new(),
+    };
 
     pub fn m(n: u128) -> Uuid {
         Uuid::from_u128(n)
@@ -880,7 +941,7 @@ mod apply_change_tests {
     #[test]
     fn stale_change_is_skipped_for_content() {
         let s = synced(sample(), 10);
-        let ops = apply_change(&s, &upsert("own", json!({"old": true}), 8), ME);
+        let ops = apply_change(&s, &upsert("own", json!({"old": true}), 8), ME, &APPEND);
         assert!(!ops
             .iter()
             .any(|o| matches!(o, DocOp::SetContent(_) | DocOp::SetShadow(_))));
@@ -890,7 +951,12 @@ mod apply_change_tests {
     fn upsert_without_rows_replaces_content_and_shadow() {
         let s = synced(sample(), 1);
         let new = json!({"title": "B"});
-        let after = s.project(&apply_change(&s, &upsert("own", new.clone(), 2), ME));
+        let after = s.project(&apply_change(
+            &s,
+            &upsert("own", new.clone(), 2),
+            ME,
+            &APPEND,
+        ));
         assert_eq!(after.content, new);
         assert_eq!(after.shadow.unwrap().seq, 2);
     }
@@ -901,13 +967,13 @@ mod apply_change_tests {
         // A page row for seq 2 carrying the document's current envelope (seq 5).
         let mut first = upsert("own", json!({}), 2);
         first.doc = Some(env(json!({"a": 3}), 5));
-        let after = s.project(&apply_change(&s, &first, ME));
+        let after = s.project(&apply_change(&s, &first, ME, &APPEND));
         assert_eq!(after.shadow.as_ref().unwrap().seq, 5);
         assert_eq!(after.content, json!({"a": 3}));
 
         let mut second = upsert("own", json!({}), 4);
         second.doc = Some(env(json!({"a": 3}), 5));
-        let ops = apply_change(&after, &second, ME);
+        let ops = apply_change(&after, &second, ME, &APPEND);
         assert!(!ops
             .iter()
             .any(|op| matches!(op, DocOp::SetShadow(_) | DocOp::SetContent(_))));
@@ -919,6 +985,7 @@ mod apply_change_tests {
             &empty(),
             &upsert("collection:curated", sample(), 3),
             ME,
+            &APPEND,
         ));
         assert!(after.exists);
         assert_eq!(after.content, sample());
@@ -937,6 +1004,7 @@ mod apply_change_tests {
             &s,
             &upsert("own", json!({"a": 1, "theirs": true}), 2),
             ME,
+            &APPEND,
         ));
         assert_eq!(after.content, json!({"a": 1, "mine": true, "theirs": true}));
         assert_eq!(
@@ -951,7 +1019,7 @@ mod apply_change_tests {
         let mut s = synced(json!({"a": {"x": 1}}), 1);
         s.content = json!({"a": {"x": 2}});
         s.rows = vec![row(5, RowKind::Update)];
-        let ops = apply_change(&s, &upsert("own", json!({}), 2), ME);
+        let ops = apply_change(&s, &upsert("own", json!({}), 2), ME, &APPEND);
         assert!(ops.contains(&DocOp::RecoverFields {
             content: json!({"a": {"x": 2}}),
             fields: vec![FieldConflict {
@@ -978,7 +1046,12 @@ mod apply_change_tests {
         let mut s = synced(json!({"s": "old", "k": 1}), 1);
         s.content = json!({"s": "mine", "k": 2});
         s.rows = vec![row(5, RowKind::Update)];
-        let ops = apply_change(&s, &upsert("own", json!({"s": "theirs", "k": 1}), 2), ME);
+        let ops = apply_change(
+            &s,
+            &upsert("own", json!({"s": "theirs", "k": 1}), 2),
+            ME,
+            &APPEND,
+        );
         let after = s.project(&ops);
         assert_eq!(after.content, json!({"s": "theirs", "k": 2}));
         assert_eq!(
@@ -994,7 +1067,7 @@ mod apply_change_tests {
         s.content = json!({"a": {"x": 2}});
         s.soft_deleted = true;
         s.rows = vec![row(5, RowKind::Update), row(6, RowKind::Delete)];
-        let ops = apply_change(&s, &upsert("own", json!({}), 2), ME);
+        let ops = apply_change(&s, &upsert("own", json!({}), 2), ME, &APPEND);
         assert!(!ops.iter().any(|o| matches!(
             o,
             DocOp::Recover { .. } | DocOp::SetContent(_) | DocOp::Emit(_)
@@ -1013,7 +1086,12 @@ mod apply_change_tests {
         let mut s = synced(json!({"items": ["a"]}), 0);
         s.shadow = None;
         s.rows = vec![row(1, RowKind::Create)];
-        let ops = apply_change(&s, &upsert("own", json!({"items": ["a", "x"]}), 4), ME);
+        let ops = apply_change(
+            &s,
+            &upsert("own", json!({"items": ["a", "x"]}), 4),
+            ME,
+            &APPEND,
+        );
         assert!(ops.contains(&DocOp::Recover {
             content: json!({"items": ["a"]}),
             reason: RecoverReason::Conflict,
@@ -1029,7 +1107,7 @@ mod apply_change_tests {
     fn membership_guard_is_independent_of_content_guard() {
         // Doc already at server_seq 20; lagging scope Y delivers upsert@15.
         let s = synced(sample(), 20);
-        let ops = apply_change(&s, &upsert("collection:y", sample(), 15), ME);
+        let ops = apply_change(&s, &upsert("collection:y", sample(), 15), ME, &APPEND);
         assert!(ops.contains(&DocOp::SetMembership(Membership {
             scope: "collection:y".into(),
             member: true,
@@ -1046,7 +1124,7 @@ mod apply_change_tests {
             member: false,
             seq: 20,
         });
-        let ops = apply_change(&s, &upsert("collection:y", sample(), 15), ME);
+        let ops = apply_change(&s, &upsert("collection:y", sample(), 15), ME, &APPEND);
         assert!(!ops.iter().any(|o| matches!(o, DocOp::SetMembership(_))));
     }
 
@@ -1062,6 +1140,7 @@ mod apply_change_tests {
             &s,
             &kind_change("collection:curated", ChangeKind::Leave, 4),
             ME,
+            &APPEND,
         ));
         assert!(!after.exists);
     }
@@ -1078,12 +1157,14 @@ mod apply_change_tests {
             &s,
             &kind_change("collection:curated", ChangeKind::Leave, 4),
             ME,
+            &APPEND,
         );
         let after_leave = s.project(&leave_ops);
         let after = after_leave.project(&apply_change(
             &after_leave,
             &upsert("collection:curated", sample(), 3),
             ME,
+            &APPEND,
         ));
         assert!(!after.exists);
     }
@@ -1100,6 +1181,7 @@ mod apply_change_tests {
             &s,
             &kind_change("collection:x", ChangeKind::Leave, 4),
             ME,
+            &APPEND,
         ));
         assert!(after.exists);
     }
@@ -1111,7 +1193,7 @@ mod apply_change_tests {
         s.rows = vec![row(5, RowKind::Update)];
         let mut c = upsert("collection:curated", json!({"a": 1}), 2);
         c.doc.as_mut().unwrap().read_only = true;
-        let ops = apply_change(&s, &c, ME);
+        let ops = apply_change(&s, &c, ME, &APPEND);
         assert!(ops.contains(&DocOp::Recover {
             content: json!({"a": 2}),
             reason: RecoverReason::BecamePublication
@@ -1125,8 +1207,13 @@ mod apply_change_tests {
     #[test]
     fn server_copy_applies_with_content_guard() {
         let s = synced(sample(), 5);
-        assert!(apply_server_copy(&s, &env(json!({"x": 1}), 4), ME).is_empty());
-        let after = s.project(&apply_server_copy(&s, &env(json!({"x": 1}), 6), ME));
+        assert!(apply_server_copy(&s, &env(json!({"x": 1}), 4), ME, &APPEND).is_empty());
+        let after = s.project(&apply_server_copy(
+            &s,
+            &env(json!({"x": 1}), 6),
+            ME,
+            &APPEND,
+        ));
         assert_eq!(after.content, json!({"x": 1}));
     }
 
@@ -1135,7 +1222,7 @@ mod apply_change_tests {
         let mut s = synced(json!({"items": ["a"]}), 0);
         s.shadow = None;
         s.rows = vec![row(1, RowKind::Create)];
-        let ops = apply_server_copy(&s, &env(json!({"items": ["a", "x"]}), 4), ME);
+        let ops = apply_server_copy(&s, &env(json!({"items": ["a", "x"]}), 4), ME, &APPEND);
         assert!(ops.contains(&DocOp::Recover {
             content: json!({"items": ["a"]}),
             reason: RecoverReason::Conflict,
@@ -1152,7 +1239,7 @@ mod apply_change_tests {
         s.content = json!({"s": "mine", "k": 2});
         s.rows = vec![row(5, RowKind::Update)];
         s.unacked_upload = Some(m(5));
-        let ops = apply_server_copy(&s, &env(json!({"s": "theirs", "k": 1}), 2), ME);
+        let ops = apply_server_copy(&s, &env(json!({"s": "theirs", "k": 1}), 2), ME, &APPEND);
         assert!(ops.contains(&DocOp::RecoverFields {
             content: json!({"s": "mine", "k": 2}),
             fields: vec![FieldConflict {
@@ -1204,7 +1291,7 @@ mod echo_and_delete_tests {
         s.content = json!({"items": ["x", "y"]});
         s.rows = vec![row(1, RowKind::Update), row(2, RowKind::Update)];
         let echo = with_upload(upsert("own", json!({"items": ["x"]}), 2), m(1));
-        let after = s.project(&apply_change(&s, &echo, ME));
+        let after = s.project(&apply_change(&s, &echo, ME, &APPEND));
         assert_eq!(
             after.content,
             json!({"items": ["x", "y"]}),
@@ -1257,7 +1344,7 @@ mod echo_and_delete_tests {
         s.rows = vec![row(1, RowKind::Update), row(2, RowKind::Update)];
         let envelope = json!({"a": 1, "mine": true, "theirs": true});
 
-        let ops = apply_change(&s, &page_echo(envelope.clone()), ME);
+        let ops = apply_change(&s, &page_echo(envelope.clone()), ME, &APPEND);
         let after = s.project(&ops);
 
         assert_adopted(&after, envelope);
@@ -1272,7 +1359,7 @@ mod echo_and_delete_tests {
         s.rows = vec![row(1, RowKind::Update)];
         let envelope = json!({"items": ["x", "z"]});
 
-        let ops = apply_change(&s, &page_echo(envelope.clone()), ME);
+        let ops = apply_change(&s, &page_echo(envelope.clone()), ME, &APPEND);
 
         assert_adopted(&s.project(&ops), envelope);
         assert_no_conflict_or_marker(&ops);
@@ -1286,7 +1373,7 @@ mod echo_and_delete_tests {
         s.rows = vec![row(1, RowKind::Update), row(2, RowKind::Update)];
         let envelope = json!({"items": ["x", "z"]});
 
-        let ops = apply_change(&s, &page_echo(envelope.clone()), ME);
+        let ops = apply_change(&s, &page_echo(envelope.clone()), ME, &APPEND);
 
         assert_adopted(&s.project(&ops), envelope);
         assert_conflict_recovers(&ops, json!({"items": ["x", "y"]}));
@@ -1300,7 +1387,7 @@ mod echo_and_delete_tests {
         s.rows = vec![row(1, RowKind::Update)];
         let envelope = json!({"a": 1, "b": 2});
 
-        let ops = apply_change(&s, &page_echo(envelope.clone()), ME);
+        let ops = apply_change(&s, &page_echo(envelope.clone()), ME, &APPEND);
 
         assert_adopted(&s.project(&ops), envelope);
         assert_no_conflict_or_marker(&ops);
@@ -1314,7 +1401,7 @@ mod echo_and_delete_tests {
         s.rows = vec![row(1, RowKind::Update), row(2, RowKind::Update)];
         let envelope = json!({"a": 1, "b": 2});
 
-        let ops = apply_change(&s, &page_echo(envelope.clone()), ME);
+        let ops = apply_change(&s, &page_echo(envelope.clone()), ME, &APPEND);
 
         assert_adopted(&s.project(&ops), envelope);
         assert_conflict_recovers(&ops, json!({"a": 1, "c": 3}));
@@ -1328,7 +1415,7 @@ mod echo_and_delete_tests {
         let mut page_echo = with_upload(upsert("own", json!({}), 2), m(1));
         page_echo.doc = Some(env(json!({"n": 2, "other": 1}), 5));
 
-        let ops = apply_change(&s, &page_echo, ME);
+        let ops = apply_change(&s, &page_echo, ME, &APPEND);
         let after = s.project(&ops);
 
         assert!(after.rows.is_empty());
@@ -1345,6 +1432,7 @@ mod echo_and_delete_tests {
             &s,
             &with_upload(upsert("own", json!({"n": 2}), 2), m(1)),
             ME,
+            &APPEND,
         );
         let after = s.project(&ops);
         assert!(after.rows.is_empty());
@@ -1362,6 +1450,7 @@ mod echo_and_delete_tests {
             &s,
             &with_upload(upsert("own", sample(), 3), m(1)),
             ME,
+            &APPEND,
         ));
         assert_eq!(after.shadow.unwrap().seq, 3);
         assert!(after.rows.is_empty());
@@ -1375,6 +1464,7 @@ mod echo_and_delete_tests {
             &s,
             &with_upload(upsert("own", json!({"n": 2}), 2), m(1)),
             ME,
+            &APPEND,
         );
         assert!(!ops
             .iter()
@@ -1390,6 +1480,7 @@ mod echo_and_delete_tests {
             &s,
             &with_upload(kind_change("own", ChangeKind::Delete, 2), m(1)),
             ME,
+            &APPEND,
         );
         let after = s.project(&ops);
         assert!(!after.exists);
@@ -1404,7 +1495,7 @@ mod echo_and_delete_tests {
         let mut s = synced(sample(), 1);
         s.soft_deleted = true;
         s.rows = vec![row(1, RowKind::Update), row(2, RowKind::Delete)];
-        let ops = apply_change(&s, &kind_change("own", ChangeKind::Delete, 2), ME);
+        let ops = apply_change(&s, &kind_change("own", ChangeKind::Delete, 2), ME, &APPEND);
         assert!(!ops
             .iter()
             .any(|o| matches!(o, DocOp::Recover { .. } | DocOp::Emit(_))));
@@ -1416,7 +1507,7 @@ mod echo_and_delete_tests {
         let mut s = synced(json!({"a": 1}), 1);
         s.content = json!({"a": 2});
         s.rows = vec![row(1, RowKind::Update)];
-        let ops = apply_change(&s, &kind_change("own", ChangeKind::Delete, 2), ME);
+        let ops = apply_change(&s, &kind_change("own", ChangeKind::Delete, 2), ME, &APPEND);
         assert!(ops.contains(&DocOp::Recover {
             content: json!({"a": 2}),
             reason: RecoverReason::DeleteWins
@@ -1434,6 +1525,7 @@ mod echo_and_delete_tests {
             &s,
             &kind_change("own", ChangeKind::Delete, 2),
             ME,
+            &APPEND,
         ));
         assert!(!after.exists);
         assert_eq!(after.tombstone_seq, Some(2));
@@ -1445,7 +1537,7 @@ mod echo_and_delete_tests {
             tombstone_seq: Some(20),
             ..empty()
         };
-        let ops = apply_change(&s, &upsert("collection:y", sample(), 15), ME);
+        let ops = apply_change(&s, &upsert("collection:y", sample(), 15), ME, &APPEND);
         assert!(!s.project(&ops).exists);
     }
 
@@ -1485,13 +1577,15 @@ mod echo_and_delete_tests {
     #[should_panic(expected = "upsert without doc")]
     fn upsert_without_doc_is_a_bug() {
         let s = synced(sample(), 1);
-        apply_change(&s, &kind_change("own", ChangeKind::Upsert, 2), ME);
+        apply_change(&s, &kind_change("own", ChangeKind::Upsert, 2), ME, &APPEND);
     }
 }
 
 #[cfg(test)]
 mod rebase_tests {
+    use super::fixtures::APPEND;
     use super::*;
+    use crate::engine::list_merge::{ListMergePolicy, PathPattern};
     use serde_json::json;
 
     #[test]
@@ -1500,23 +1594,36 @@ mod rebase_tests {
             &json!({"a": 1}),
             &json!({"a": 1, "b": 2}),
             &json!({"a": 1, "c": 3}),
+            &APPEND,
         );
         assert_eq!(r, Rebased::Clean(json!({"a": 1, "b": 2, "c": 3})));
     }
 
     #[test]
-    fn append_to_an_array_the_server_made_an_object_is_a_conflict() {
+    fn append_to_an_array_the_server_made_an_object_collides_at_the_array() {
         let r = rebase(
             &json!({"items": ["a"]}),
             &json!({"items": {"k": 1}}),
             &json!({"items": ["a", "b"]}),
+            &APPEND,
         );
-        assert_eq!(r, Rebased::Conflict);
+        assert_eq!(
+            r,
+            Rebased::Fields {
+                content: json!({"items": {"k": 1}}),
+                conflicts: vec![kept("/items", json!(["a", "b"]))]
+            }
+        );
     }
 
     #[test]
     fn no_local_change_takes_new_base() {
-        let r = rebase(&json!({"a": 1}), &json!({"a": 2}), &json!({"a": 1}));
+        let r = rebase(
+            &json!({"a": 1}),
+            &json!({"a": 2}),
+            &json!({"a": 1}),
+            &APPEND,
+        );
         assert_eq!(r, Rebased::Clean(json!({"a": 2})));
     }
 
@@ -1534,6 +1641,7 @@ mod rebase_tests {
             &json!({"a": {"x": 1}, "k": 1}),
             &json!({"k": 1}),
             &json!({"a": {"x": 2}, "k": 2}),
+            &APPEND,
         );
         assert_eq!(
             r,
@@ -1550,6 +1658,7 @@ mod rebase_tests {
             &json!({"s": "old", "k": 1}),
             &json!({"s": "theirs", "k": 1}),
             &json!({"s": "mine", "k": 2}),
+            &APPEND,
         );
         assert_eq!(
             r,
@@ -1562,7 +1671,12 @@ mod rebase_tests {
 
     #[test]
     fn same_value_on_both_sides_is_not_a_conflict() {
-        let r = rebase(&json!({"s": "old"}), &json!({"s": "x"}), &json!({"s": "x"}));
+        let r = rebase(
+            &json!({"s": "old"}),
+            &json!({"s": "x"}),
+            &json!({"s": "x"}),
+            &APPEND,
+        );
         assert_eq!(r, Rebased::Clean(json!({"s": "x"})));
     }
 
@@ -1572,6 +1686,7 @@ mod rebase_tests {
             &json!({"s": "old", "k": 1}),
             &json!({"s": "theirs", "k": 1}),
             &json!({"k": 1}),
+            &APPEND,
         );
         assert_eq!(
             r,
@@ -1592,6 +1707,7 @@ mod rebase_tests {
             &json!({"a": {"x": 1, "y": 1}}),
             &json!({"a": {"x": 2, "y": 1}}),
             &json!({"a": "flat"}),
+            &APPEND,
         );
         assert_eq!(
             r,
@@ -1603,13 +1719,20 @@ mod rebase_tests {
     }
 
     #[test]
-    fn appends_to_one_array_from_both_sides_merge() {
+    fn appends_to_one_array_from_both_sides_collide_at_the_array() {
         let r = rebase(
             &json!({"items": ["a"]}),
             &json!({"items": ["a", "t"]}),
             &json!({"items": ["a", "m1", "m2"]}),
+            &APPEND,
         );
-        assert_eq!(r, Rebased::Clean(json!({"items": ["a", "t", "m1", "m2"]})));
+        assert_eq!(
+            r,
+            Rebased::Fields {
+                content: json!({"items": ["a", "t"]}),
+                conflicts: vec![kept("/items", json!(["a", "m1", "m2"]))]
+            }
+        );
     }
 
     #[test]
@@ -1618,6 +1741,7 @@ mod rebase_tests {
             &json!({"items": ["a", "b", "c"]}),
             &json!({"items": ["a", "B", "c"]}),
             &json!({"items": ["a", "b2", "C"]}),
+            &APPEND,
         );
         assert_eq!(
             r,
@@ -1641,6 +1765,246 @@ mod rebase_tests {
                 {"op": "replace", "path": "/2", "value": "d"},
                 {"op": "add", "path": "/3", "value": "e"}
             ])
+        );
+    }
+
+    fn pitches(list: Value) -> Value {
+        json!({ "pitches": list })
+    }
+
+    fn scale() -> Value {
+        pitches(json!([0, 200, 400, 500, 700, 900]))
+    }
+
+    /// The server's list is kept and the whole local list is set aside.
+    fn list_kept_aside(theirs: Value, mine: Value) -> Rebased {
+        Rebased::Fields {
+            conflicts: vec![kept("/pitches", mine["pitches"].clone())],
+            content: theirs,
+        }
+    }
+
+    fn atomic() -> ListMergeConfig {
+        ListMergeConfig {
+            default: ListMergePolicy::Atomic,
+            rules: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn retunes_of_different_degrees_merge() {
+        let mine = pitches(json!([0, 200, 386, 500, 700, 900]));
+        let theirs = pitches(json!([0, 200, 400, 500, 700, 884]));
+        assert_eq!(
+            rebase(&scale(), &theirs, &mine, &APPEND),
+            Rebased::Clean(pitches(json!([0, 200, 386, 500, 700, 884])))
+        );
+    }
+
+    #[test]
+    fn removals_on_both_sides_keep_the_servers_list() {
+        let mine = pitches(json!([0, 200, 500, 700, 900]));
+        let theirs = pitches(json!([0, 200, 400, 500, 700]));
+        assert_eq!(
+            rebase(&scale(), &theirs, &mine, &APPEND),
+            list_kept_aside(theirs, mine)
+        );
+    }
+
+    #[test]
+    fn an_insert_against_a_retune_keeps_the_servers_list() {
+        let mine = pitches(json!([0, 200, 400, 450, 500, 700, 900]));
+        let theirs = pitches(json!([0, 200, 400, 500, 702, 900]));
+        assert_eq!(
+            rebase(&scale(), &theirs, &mine, &APPEND),
+            list_kept_aside(theirs, mine)
+        );
+    }
+
+    #[test]
+    fn inserts_at_one_spot_on_both_sides_keep_the_servers_list() {
+        let mine = pitches(json!([0, 200, 400, 450, 500, 700, 900]));
+        let theirs = pitches(json!([0, 200, 400, 460, 500, 700, 900]));
+        assert_eq!(
+            rebase(&scale(), &theirs, &mine, &APPEND),
+            list_kept_aside(theirs, mine)
+        );
+    }
+
+    #[test]
+    fn a_removal_against_a_retune_of_that_degree_keeps_the_servers_list() {
+        let mine = pitches(json!([0, 200, 400, 700, 900]));
+        let theirs = pitches(json!([0, 200, 400, 498, 700, 900]));
+        assert_eq!(
+            rebase(&scale(), &theirs, &mine, &APPEND),
+            list_kept_aside(theirs, mine)
+        );
+    }
+
+    #[test]
+    fn a_removal_of_a_repeated_value_against_a_retune_of_its_twin_keeps_the_servers_list() {
+        let old = pitches(json!([0, 200, 200, 500]));
+        let mine = pitches(json!([0, 200, 500]));
+        let theirs = pitches(json!([0, 204, 200, 500]));
+        assert_eq!(
+            rebase(&old, &theirs, &mine, &APPEND),
+            list_kept_aside(theirs, mine)
+        );
+    }
+
+    #[test]
+    fn a_local_append_merges_with_a_server_retune() {
+        let mine = pitches(json!([0, 200, 400, 500, 700, 900, 1000]));
+        let theirs = pitches(json!([0, 200, 386, 500, 700, 900]));
+        assert_eq!(
+            rebase(&scale(), &theirs, &mine, &APPEND),
+            Rebased::Clean(pitches(json!([0, 200, 386, 500, 700, 900, 1000])))
+        );
+    }
+
+    #[test]
+    fn a_server_append_merges_with_a_local_retune() {
+        let mine = pitches(json!([0, 200, 386, 500, 700, 900]));
+        let theirs = pitches(json!([0, 200, 400, 500, 700, 900, 1000]));
+        assert_eq!(
+            rebase(&scale(), &theirs, &mine, &APPEND),
+            Rebased::Clean(pitches(json!([0, 200, 386, 500, 700, 900, 1000])))
+        );
+    }
+
+    #[test]
+    fn appends_on_both_sides_keep_the_servers_list() {
+        let mine = pitches(json!([0, 200, 400, 500, 700, 900, 1000]));
+        let theirs = pitches(json!([0, 200, 400, 500, 700, 900, 1100]));
+        assert_eq!(
+            rebase(&scale(), &theirs, &mine, &APPEND),
+            list_kept_aside(theirs, mine)
+        );
+    }
+
+    #[test]
+    fn an_append_against_a_removal_keeps_the_servers_list() {
+        let mine = pitches(json!([0, 200, 400, 500, 700, 900, 1000]));
+        let theirs = pitches(json!([0, 200, 400, 500, 700]));
+        assert_eq!(
+            rebase(&scale(), &theirs, &mine, &APPEND),
+            list_kept_aside(theirs, mine)
+        );
+    }
+
+    #[test]
+    fn the_same_append_on_both_sides_is_one_element() {
+        let both = pitches(json!([0, 200, 400, 500, 700, 900, 1000]));
+        assert_eq!(
+            rebase(&scale(), &both, &both, &APPEND),
+            Rebased::Clean(both.clone())
+        );
+    }
+
+    fn two_tunings() -> Value {
+        json!({"tunings": [
+            {"name": "A", "pitches": [0, 100]},
+            {"name": "B", "pitches": [0, 200]}
+        ]})
+    }
+
+    /// Inserts 50 into the first tuning's pitches.
+    fn inner_insert() -> Value {
+        json!({"tunings": [
+            {"name": "A", "pitches": [0, 50, 100]},
+            {"name": "B", "pitches": [0, 200]}
+        ]})
+    }
+
+    #[test]
+    fn a_resized_inner_list_merges_with_edits_elsewhere_in_the_outer_list() {
+        let renamed = json!({"tunings": [
+            {"name": "A", "pitches": [0, 100]},
+            {"name": "B2", "pitches": [0, 200]}
+        ]});
+        assert_eq!(
+            rebase(&two_tunings(), &renamed, &inner_insert(), &APPEND),
+            Rebased::Clean(json!({"tunings": [
+                {"name": "A", "pitches": [0, 50, 100]},
+                {"name": "B2", "pitches": [0, 200]}
+            ]}))
+        );
+        let retuned = json!({"tunings": [
+            {"name": "A", "pitches": [0, 101]},
+            {"name": "B", "pitches": [0, 200]}
+        ]});
+        assert_eq!(
+            rebase(&two_tunings(), &retuned, &inner_insert(), &APPEND),
+            Rebased::Fields {
+                content: retuned.clone(),
+                conflicts: vec![kept("/tunings/0/pitches", json!([0, 50, 100]))]
+            }
+        );
+    }
+
+    #[test]
+    fn a_resized_outer_list_collides_with_any_edit_inside_it() {
+        let removed = json!({"tunings": [{"name": "A", "pitches": [0, 100]}]});
+        assert_eq!(
+            rebase(&two_tunings(), &removed, &inner_insert(), &APPEND),
+            Rebased::Fields {
+                content: removed.clone(),
+                conflicts: vec![kept("/tunings", inner_insert()["tunings"].clone())]
+            }
+        );
+    }
+
+    #[test]
+    fn retunes_of_different_degrees_conflict_when_the_list_is_atomic() {
+        let mine = pitches(json!([0, 200, 386, 500, 700, 900]));
+        let theirs = pitches(json!([0, 200, 400, 500, 700, 884]));
+        assert_eq!(
+            rebase(&scale(), &theirs, &mine, &atomic()),
+            list_kept_aside(theirs, mine)
+        );
+    }
+
+    #[test]
+    fn an_atomic_list_changed_on_one_side_applies() {
+        let old = json!({"name": "12-TET", "pitches": [0, 200, 400]});
+        let mine = json!({"name": "12-TET", "pitches": [0, 200, 386, 1000]});
+        let theirs = json!({"name": "Just", "pitches": [0, 200, 400]});
+        assert_eq!(
+            rebase(&old, &theirs, &mine, &atomic()),
+            Rebased::Clean(json!({"name": "Just", "pitches": [0, 200, 386, 1000]}))
+        );
+    }
+
+    #[test]
+    fn rules_choose_the_policy_per_list() {
+        let mine = json!({"tunings": [
+            {"name": "A", "pitches": [0, 101]},
+            {"name": "B", "pitches": [0, 200]}
+        ]});
+        let theirs = json!({"tunings": [
+            {"name": "A", "pitches": [1, 100]},
+            {"name": "B", "pitches": [0, 200]}
+        ]});
+        assert_eq!(
+            rebase(&two_tunings(), &theirs, &mine, &APPEND),
+            Rebased::Clean(json!({"tunings": [
+                {"name": "A", "pitches": [1, 101]},
+                {"name": "B", "pitches": [0, 200]}
+            ]}))
+        );
+        let atomic_pitches = ListMergeConfig {
+            default: ListMergePolicy::Append,
+            rules: vec![(
+                PathPattern("/tunings/*/pitches".into()),
+                ListMergePolicy::Atomic,
+            )],
+        };
+        assert_eq!(
+            rebase(&two_tunings(), &theirs, &mine, &atomic_pitches),
+            Rebased::Fields {
+                content: theirs.clone(),
+                conflicts: vec![kept("/tunings/0/pitches", json!([0, 101]))]
+            }
         );
     }
 }
@@ -2085,7 +2449,7 @@ mod property_tests {
                 && doc
                     .as_ref()
                     .is_some_and(|doc| self.equal_content_adoptable(doc, committed.seq));
-            let ops = apply_change(&self.snap, &change, ME);
+            let ops = apply_change(&self.snap, &change, ME, &APPEND);
             self.check_adopted(adoptable, &ops);
             self.count_rebase_conflict(rebase_possible && !is_echo_for_us, &ops, false);
             if rebase_possible
@@ -2162,12 +2526,12 @@ mod property_tests {
                     && self.snap.unacked_upload.is_none()
                     && self.snap.shadow.as_ref().is_some_and(|shadow| {
                         matches!(
-                            rebase(&shadow.content, &doc.content, &self.snap.content),
+                            rebase(&shadow.content, &doc.content, &self.snap.content, &APPEND),
                             Rebased::Clean(_) | Rebased::Fields { .. }
                         )
                     });
                 let pre_content = self.snap.content.clone();
-                let ops = apply_snapshot_doc(&self.snap, "own", &doc, ME);
+                let ops = apply_snapshot_doc(&self.snap, "own", &doc, ME, &APPEND);
                 self.check_adopted(adoptable, &ops);
                 if never_sent_rebase {
                     assert!(
@@ -2269,7 +2633,7 @@ mod property_tests {
                     let before_server_seq = self.snap.server_seq();
                     let old_shadow_content = self.snap.shadow.as_ref().map(|s| s.content.clone());
                     let local_content_before = self.snap.content.clone();
-                    let ops = apply_server_copy(&self.snap, &doc, ME);
+                    let ops = apply_server_copy(&self.snap, &doc, ME, &APPEND);
                     self.count_rebase_conflict(rebase_possible, &ops, true);
                     if rebase_possible && !pending_delete_before && doc.seq > before_server_seq {
                         if let Some(shadow_content) = &old_shadow_content {
@@ -2712,7 +3076,7 @@ mod snapshot_doc_tests {
     #[test]
     fn snapshot_doc_with_pending_rows_recovers_exact_local_content() {
         let (s, doc) = pending_append();
-        let ops = apply_snapshot_doc(&s, "own", &doc, ME);
+        let ops = apply_snapshot_doc(&s, "own", &doc, ME, &APPEND);
         assert!(ops.contains(&DocOp::Recover {
             content: json!({"items": ["a", "b"]}),
             reason: RecoverReason::Conflict,
@@ -2732,7 +3096,7 @@ mod snapshot_doc_tests {
         s.content = json!({"items": ["a", "b"]});
         s.rows = vec![row(1, RowKind::Update)];
         let doc = env(json!({"items": ["a"], "theirs": 1}), 5);
-        let ops = apply_snapshot_doc(&s, "own", &doc, ME);
+        let ops = apply_snapshot_doc(&s, "own", &doc, ME, &APPEND);
         assert!(!ops
             .iter()
             .any(|op| matches!(op, DocOp::Recover { .. } | DocOp::Emit(_))));
@@ -2767,7 +3131,7 @@ mod snapshot_doc_tests {
     fn snapshot_doc_without_pending_rows_is_adopted_as_is() {
         let s = synced(json!({"items": ["a"]}), 1);
         let doc = env(json!({"items": ["x"]}), 5);
-        let ops = apply_snapshot_doc(&s, "own", &doc, ME);
+        let ops = apply_snapshot_doc(&s, "own", &doc, ME, &APPEND);
         assert!(!ops
             .iter()
             .any(|op| matches!(op, DocOp::Recover { .. } | DocOp::Emit(_))));
@@ -2780,7 +3144,7 @@ mod snapshot_doc_tests {
     fn snapshot_doc_with_pending_delete_keeps_the_delete() {
         let (mut s, doc) = pending_append();
         s.rows.push(row(2, RowKind::Delete));
-        let after = s.project(&apply_snapshot_doc(&s, "own", &doc, ME));
+        let after = s.project(&apply_snapshot_doc(&s, "own", &doc, ME, &APPEND));
         assert_eq!(after.rows.len(), 2);
         assert_eq!(after.content, json!({"items": ["a", "b"]}));
         assert_eq!(after.shadow.unwrap().seq, 5);
@@ -2793,7 +3157,7 @@ mod snapshot_doc_tests {
         s.content = json!({"items": ["a", "b"]});
         s.rows = vec![row(1, RowKind::Update)];
         let doc = env(json!({"items": ["a"], "theirs": 1}), 5);
-        let ops = apply_snapshot_doc(&s, "own", &doc, ME);
+        let ops = apply_snapshot_doc(&s, "own", &doc, ME, &APPEND);
         assert!(!ops
             .iter()
             .any(|op| matches!(op, DocOp::Recover { .. } | DocOp::Emit(_))));
@@ -2811,7 +3175,7 @@ mod snapshot_doc_tests {
         s.shadow = None;
         s.rows = vec![row(1, RowKind::Create)];
         let doc = env(json!({"items": ["a", "x"]}), 4);
-        let ops = apply_snapshot_doc(&s, "own", &doc, ME);
+        let ops = apply_snapshot_doc(&s, "own", &doc, ME, &APPEND);
         assert!(ops.contains(&DocOp::Recover {
             content: json!({"items": ["a"]}),
             reason: RecoverReason::Conflict,
@@ -2828,7 +3192,7 @@ mod snapshot_doc_tests {
     fn snapshot_doc_is_skipped_by_the_content_guard() {
         let (s, _) = pending_append();
         let older = env(json!({"items": []}), 1);
-        let ops = apply_snapshot_doc(&s, "own", &older, ME);
+        let ops = apply_snapshot_doc(&s, "own", &older, ME, &APPEND);
         assert!(!ops.iter().any(|op| matches!(
             op,
             DocOp::SetShadow(_) | DocOp::SetContent(_) | DocOp::Recover { .. }
@@ -2870,7 +3234,7 @@ mod equal_content_tests {
         let s = lost_create(json!({"items": ["a"]}), vec![row(1, RowKind::Create)]);
         let mut change = upsert("own", json!({"items": ["a"]}), 4);
         change.doc.as_mut().unwrap().hash = "server-hash".into();
-        let ops = apply_change(&s, &change, ME);
+        let ops = apply_change(&s, &change, ME, &APPEND);
         assert_adopted(&s, &ops, 4);
         assert_eq!(
             s.project(&ops).shadow.unwrap().hash,
@@ -2885,7 +3249,7 @@ mod equal_content_tests {
             json!({"items": ["a"]}),
             vec![row(1, RowKind::Create), row(2, RowKind::Update)],
         );
-        let ops = apply_snapshot_doc(&s, "own", &env(json!({"items": ["a"]}), 4), ME);
+        let ops = apply_snapshot_doc(&s, "own", &env(json!({"items": ["a"]}), 4), ME, &APPEND);
         assert_adopted(&s, &ops, 4);
         assert!(!ops.iter().any(|op| matches!(op, DocOp::InsertMarker(_))));
     }
@@ -2893,7 +3257,7 @@ mod equal_content_tests {
     #[test]
     fn no_shadow_server_copy_with_equal_content_adopts_and_settles() {
         let s = lost_create(json!({"n": 1}), vec![row(1, RowKind::Create)]);
-        let ops = apply_server_copy(&s, &env(json!({"n": 1}), 2), ME);
+        let ops = apply_server_copy(&s, &env(json!({"n": 1}), 2), ME, &APPEND);
         assert_adopted(&s, &ops, 2);
     }
 
@@ -2904,7 +3268,7 @@ mod equal_content_tests {
             json!({"items": ["a", "b"]}),
             vec![row(1, RowKind::Create), row(2, RowKind::Update)],
         );
-        let ops = apply_change(&s, &upsert("own", json!({"items": ["a"]}), 4), ME);
+        let ops = apply_change(&s, &upsert("own", json!({"items": ["a"]}), 4), ME, &APPEND);
         assert!(ops.contains(&DocOp::Recover {
             content: json!({"items": ["a", "b"]}),
             reason: RecoverReason::Conflict,

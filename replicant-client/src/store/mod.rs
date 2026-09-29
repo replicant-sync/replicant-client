@@ -10,6 +10,7 @@ use uuid::Uuid;
 use docs::{LogOrigin, Writer};
 
 use crate::engine::doc::DocEvent;
+use crate::engine::list_merge::ListMergeConfig;
 use crate::engine::types::{SCOPE_CURATED, SCOPE_OWN};
 use crate::queries::Queries;
 
@@ -69,6 +70,8 @@ pub struct Store {
     pool: SqlitePool,
     options: SqliteConnectOptions,
     instance_id: Uuid,
+    /// How the per-document rules merge lists; the engine sets it from its config.
+    pub(crate) list_merge: ListMergeConfig,
 }
 
 impl Store {
@@ -90,6 +93,7 @@ impl Store {
             pool,
             options,
             instance_id: Uuid::new_v4(),
+            list_merge: ListMergeConfig::default(),
         })
     }
 

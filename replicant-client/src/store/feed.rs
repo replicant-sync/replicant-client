@@ -42,7 +42,7 @@ impl Store {
         let mut notices = Vec::new();
         for change in changes {
             let snap = load_snapshot(&mut tx, change.doc_id).await?;
-            let ops = apply_change(&snap, change, me);
+            let ops = apply_change(&snap, change, me, &self.list_merge);
             notices.extend(apply_ops(&mut tx, &writer, &snap, &ops, change.doc.as_ref()).await?);
         }
         advance_cursor(&mut tx, scope, new_cursor).await?;
@@ -63,7 +63,7 @@ impl Store {
         let mut notices = Vec::new();
         for doc in docs {
             let snap = load_snapshot(&mut tx, doc.doc_id).await?;
-            let ops = apply_snapshot_doc(&snap, scope, doc, me);
+            let ops = apply_snapshot_doc(&snap, scope, doc, me, &self.list_merge);
             notices.extend(apply_ops(&mut tx, &writer, &snap, &ops, Some(doc)).await?);
         }
         tx.commit().await?;

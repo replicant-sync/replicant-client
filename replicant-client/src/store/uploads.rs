@@ -92,7 +92,7 @@ impl Store {
         doc: Option<&DocEnvelope>,
     ) -> StoreResult<Vec<DocNotice>> {
         self.apply_rule(doc_id, doc, |snap| match doc {
-            Some(doc) => rules::apply_server_copy(snap, doc, me),
+            Some(doc) => rules::apply_server_copy(snap, doc, me, &self.list_merge),
             None => rules::apply_server_missing(snap),
         })
         .await

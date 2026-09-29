@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::engine::{CredentialLoader, EngineConfig, EngineEvent};
+use crate::engine::list_merge::ListMergeConfig;
 use crate::store::test_support::seed_user;
 use crate::store::Store;
 use crate::transport::wire::JoinAuth;
@@ -73,6 +74,7 @@ pub(crate) fn config(server_url: &str, credentials: CredentialLoader) -> EngineC
         host_version: "1.0".into(),
         credentials,
         jitter_seed: 7,
+        list_merge: ListMergeConfig::default(),
     }
 }
 
