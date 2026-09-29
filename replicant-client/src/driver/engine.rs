@@ -423,6 +423,13 @@ impl Owner {
                 if matches!(request, Request::Join) {
                     self.join_fingerprint = self.auth_fingerprint;
                 }
+                // Marked before it can reach the server: an upload must never be sent unmarked.
+                if let Request::Upload(upload) = &request {
+                    if let Err(error) = store.mark_sent(upload.doc_id, upload.upload_id).await {
+                        warn!(%error, doc_id = %upload.doc_id, "could not mark an upload as sent; not sending it");
+                        return None;
+                    }
+                }
                 return self.connection.send(req, &request, now_unix());
             }
             Effect::Schedule { timer, after } => self.timers.schedule(timer, after),

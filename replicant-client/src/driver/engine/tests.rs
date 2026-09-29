@@ -522,3 +522,37 @@ async fn a_new_users_empty_snapshot_still_unlocks_uploads() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn upload_is_marked_sent_before_it_is_sent() {
+    let server = ScriptedServer::start(ME).await;
+    server.hold_uploads();
+    let mut h = harness(&server.url, credentials("k1"), ME, true).await;
+    h.live().await;
+    let doc_id = h
+        .controls
+        .store
+        .create_document(ME, None, json!({"n": 1}))
+        .await
+        .unwrap();
+    h.controls.outbox.notify_one();
+    h.turn_until("the upload reaches the server", |_| {
+        server.uploads_for(doc_id).len() == 1
+    })
+    .await;
+    let upload_id = server.uploads_for(doc_id)[0]["upload_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let marked = count(
+        &h.controls.store,
+        &format!(
+            "SELECT COUNT(*) FROM outbox WHERE doc_id = '{doc_id}' AND sent_upload_id = '{upload_id}'"
+        ),
+    )
+    .await;
+    assert_eq!(
+        marked, 1,
+        "a held (unacknowledged) upload's rows are marked sent"
+    );
+}
