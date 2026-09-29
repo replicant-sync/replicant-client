@@ -89,7 +89,8 @@ pub struct Change {
     pub upload_id: Option<Uuid>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum UploadKind {
     Create,
     Update,
@@ -107,9 +108,10 @@ pub struct Upload {
     pub payload: Value,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ServerError {
     pub code: String,
+    #[serde(default)]
     pub is_fatal: bool,
     pub retry_after_ms: Option<u64>,
     /// Set on `hash_mismatch`.

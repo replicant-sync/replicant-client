@@ -1,5 +1,6 @@
 pub mod client;
 pub mod database;
+pub mod driver;
 pub mod engine;
 pub mod enrollment;
 pub mod error_code;
@@ -7,6 +8,7 @@ pub mod events;
 pub mod offline_queue;
 pub mod queries;
 pub mod secret_store;
+pub mod transport;
 pub mod websocket;
 
 // C FFI module
