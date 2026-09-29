@@ -2041,8 +2041,17 @@ mod property_tests {
             // Protocol.changes_since loads only the document's current row and drops any upsert
             // whose document is since deleted (its `live?/1` filter): the cursor still advances
             // past it, but a real catch-up page never delivers it at all.
+            // A page read after the delete drops every upsert before it in one go: no later
+            // push of those changes can follow that page.
             if as_page && server.deleted && !committed.deleted {
-                self.cursor = self.cursor.max(committed.seq);
+                while server
+                    .changes
+                    .get(self.delivered)
+                    .is_some_and(|c| !c.deleted)
+                {
+                    self.delivered += 1;
+                }
+                self.cursor = self.cursor.max(server.changes[self.delivered - 1].seq);
                 return;
             }
             let doc = (!committed.deleted).then(|| {
