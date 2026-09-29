@@ -50,7 +50,7 @@ fn conflicts(events: &mut mpsc::UnboundedReceiver<EngineEvent>) -> usize {
     let mut conflicts = 0;
     while let Ok(event) = events.try_recv() {
         if let EngineEvent::Doc(DocNotice {
-            event: DocEvent::ConflictDetected,
+            event: DocEvent::ConflictDetected | DocEvent::FieldConflict { .. },
             ..
         }) = event
         {
@@ -265,8 +265,71 @@ async fn float_round_trip_converges_with_at_most_one_extra_upload() {
         uploads.len() <= 2,
         "more than one extra upload: {uploads:#?}"
     );
+    if uploads.len() == 2 {
+        assert_eq!(
+            uploads[1]["kind"], "update",
+            "the retry re-sends as an update: {uploads:#?}"
+        );
+    }
     assert_eq!(outbox_rows(&store).await, 0);
     assert_eq!(snapshot(&store, doc_id).await.content, json!({"n": 1200.0}));
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn untouched_float_field_converges_after_the_server_rounds_it() {
+    // Editing "m" alone still touches "n"'s round trip: the server patches its jsonb-rounded
+    // row, so the update's push/reply carries "n" as 1200, not the 1200.0 this client sent.
+    let server = ScriptedServer::start(ME).await;
+    server.put_doc(Uuid::from_u128(0xF0), json!({"seed": 1}));
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, mut events) = live_engine(&server, &path).await;
+    let store = engine.store();
+    let doc_id = store
+        .create_document(ME, None, json!({"n": 1200.0, "m": 1}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    eventually("the create settles", || async {
+        outbox_rows(&store).await == 0
+    })
+    .await;
+
+    store
+        .update_document(ME, doc_id, json!({"n": 1200.0, "m": 2}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    eventually("the edit settles", || async {
+        outbox_rows(&store).await == 0
+    })
+    .await;
+
+    assert_eq!(
+        recovered_rows(&store, doc_id).await,
+        0,
+        "nothing was in conflict"
+    );
+    assert_eq!(conflicts(&mut events), 0);
+    assert_eq!(
+        server_content(&server, doc_id),
+        Some(json!({"n": 1200, "m": 2})),
+        "the server's jsonb rounds the untouched float"
+    );
+    assert_eq!(
+        snapshot(&store, doc_id).await.content,
+        json!({"n": 1200.0, "m": 2}),
+        "the client keeps its own float"
+    );
+    let uploads = server.uploads_for(doc_id);
+    assert_eq!(
+        // One upload for the create, one for the edit: the patch only touches "m", so the
+        // rounded echo of "n" never needs a base_hash comparison against the client's own
+        // 1200.0 and no retry is triggered.
+        uploads.len(),
+        2,
+        "unexpected upload count: {uploads:#?}"
+    );
     engine.stop().await;
 }
 
@@ -313,6 +376,7 @@ async fn lost_upload_reply_then_new_edit_appends_once() {
         snapshot(&store, doc_id).await.content,
         json!({"items": ["a", "b"]})
     );
+    assert_eq!(recovered_rows(&store, doc_id).await, 0);
     assert_eq!(conflicts(&mut events), 0);
     engine.stop().await;
 }
@@ -342,15 +406,15 @@ async fn lost_create_reply_then_edit_settles_without_conflict() {
     jump(Duration::from_millis(1100)).await;
     eventually("settled", || async { outbox_rows(&store).await == 0 }).await;
     assert_eq!(
-        server_content(&server, doc_id),
-        Some(json!({"items": ["a", "b"]}))
-    );
-    assert_eq!(
         recovered_rows(&store, doc_id).await,
         0,
         "nothing was in conflict"
     );
     assert_eq!(conflicts(&mut events), 0);
+    assert_eq!(
+        server_content(&server, doc_id),
+        Some(json!({"items": ["a", "b"]}))
+    );
     engine.stop().await;
 }
 
