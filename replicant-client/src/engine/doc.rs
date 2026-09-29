@@ -582,6 +582,9 @@ pub fn rebase(
         .cloned()
         .collect();
     if outermost.iter().any(|p| p.is_empty()) {
+        if local == new_base {
+            return Rebased::Clean(new_base.clone());
+        }
         return Rebased::Conflict;
     }
     let conflicts: Vec<FieldConflict> = outermost
@@ -650,9 +653,21 @@ fn list_shape(old: &[Value], side: Option<&Value>) -> ListShape {
     }
 }
 
+/// The indices where `side` differs from `old` (same length as `old`).
+fn changed_indices(old: &[Value], side: &[Value]) -> std::collections::HashSet<usize> {
+    old.iter()
+        .zip(side)
+        .enumerate()
+        .filter_map(|(i, (was, now))| (was != now).then_some(i))
+        .collect()
+}
+
 /// Whether the list at `path` collides as one value: always under `Atomic`; under `Append`
-/// once positions stop lining up (anything but same-length edits on both sides, or one side
-/// only appending while the other keeps the length).
+/// once positions stop lining up. Same-length edits on both sides merge by position unless
+/// both sides changed an overlapping index and ended with different lists — a shifted diff
+/// (a remove and an insert, or a reorder) can otherwise read as agreement at indices neither
+/// side actually agreed on. One side only appending while the other keeps the length always
+/// merges by position.
 fn merges_as_one_value(
     old_base: &Value,
     local: &Value,
@@ -665,15 +680,25 @@ fn merges_as_one_value(
     };
     match lists.policy_for(path) {
         ListMergePolicy::Atomic => true,
-        ListMergePolicy::Append => !matches!(
-            (
+        ListMergePolicy::Append => {
+            match (
                 list_shape(old, local.pointer(path)),
-                list_shape(old, new_base.pointer(path))
-            ),
-            (ListShape::SameLength, ListShape::SameLength)
-                | (ListShape::SameLength, ListShape::Appended)
-                | (ListShape::Appended, ListShape::SameLength)
-        ),
+                list_shape(old, new_base.pointer(path)),
+            ) {
+                (ListShape::SameLength, ListShape::SameLength) => {
+                    let (Some(Value::Array(local)), Some(Value::Array(theirs))) =
+                        (local.pointer(path), new_base.pointer(path))
+                    else {
+                        unreachable!("ListShape::SameLength implies an array of the same length")
+                    };
+                    !changed_indices(old, local).is_disjoint(&changed_indices(old, theirs))
+                        && local != theirs
+                }
+                (ListShape::SameLength, ListShape::Appended)
+                | (ListShape::Appended, ListShape::SameLength) => false,
+                _ => true,
+            }
+        }
         ListMergePolicy::Full => unreachable!("Engine::start refuses the Full list merge policy"),
     }
 }
@@ -1736,7 +1761,7 @@ mod rebase_tests {
     }
 
     #[test]
-    fn the_same_array_element_changed_on_both_sides_is_a_field_conflict() {
+    fn overlapping_array_elements_changed_on_both_sides_collide_at_the_array() {
         let r = rebase(
             &json!({"items": ["a", "b", "c"]}),
             &json!({"items": ["a", "B", "c"]}),
@@ -1746,8 +1771,8 @@ mod rebase_tests {
         assert_eq!(
             r,
             Rebased::Fields {
-                content: json!({"items": ["a", "B", "C"]}),
-                conflicts: vec![kept("/items/1", json!("b2"))]
+                content: json!({"items": ["a", "B", "c"]}),
+                conflicts: vec![kept("/items", json!(["a", "b2", "C"]))]
             }
         );
     }
@@ -1917,7 +1942,7 @@ mod rebase_tests {
     }
 
     #[test]
-    fn a_resized_inner_list_merges_with_edits_elsewhere_in_the_outer_list() {
+    fn a_resized_inner_list_merges_with_edits_at_a_different_index_in_the_outer_list() {
         let renamed = json!({"tunings": [
             {"name": "A", "pitches": [0, 100]},
             {"name": "B2", "pitches": [0, 200]}
@@ -1929,6 +1954,13 @@ mod rebase_tests {
                 {"name": "B2", "pitches": [0, 200]}
             ]}))
         );
+    }
+
+    #[test]
+    fn a_resized_inner_list_collides_with_an_edit_at_the_same_index_in_the_outer_list() {
+        // Both sides touch tuning A (outer index 0), so the outer /tunings list collides whole
+        // even though the edits (an insert into A's pitches, a retune of A's pitches) would
+        // have merged if they had landed on different tunings.
         let retuned = json!({"tunings": [
             {"name": "A", "pitches": [0, 101]},
             {"name": "B", "pitches": [0, 200]}
@@ -1937,7 +1969,7 @@ mod rebase_tests {
             rebase(&two_tunings(), &retuned, &inner_insert(), &APPEND),
             Rebased::Fields {
                 content: retuned.clone(),
-                conflicts: vec![kept("/tunings/0/pitches", json!([0, 50, 100]))]
+                conflicts: vec![kept("/tunings", inner_insert()["tunings"].clone())]
             }
         );
     }
@@ -1975,22 +2007,31 @@ mod rebase_tests {
         );
     }
 
+    // Tunings keyed by name (an object, not a list) so the two edits below land in the same
+    // pitches list without the outer container itself being a list rule (b) also governs.
+    fn tunings_by_name() -> Value {
+        json!({"tunings": {
+            "A": {"pitches": [0, 100]},
+            "B": {"pitches": [0, 200]}
+        }})
+    }
+
     #[test]
     fn rules_choose_the_policy_per_list() {
-        let mine = json!({"tunings": [
-            {"name": "A", "pitches": [0, 101]},
-            {"name": "B", "pitches": [0, 200]}
-        ]});
-        let theirs = json!({"tunings": [
-            {"name": "A", "pitches": [1, 100]},
-            {"name": "B", "pitches": [0, 200]}
-        ]});
+        let mine = json!({"tunings": {
+            "A": {"pitches": [0, 101]},
+            "B": {"pitches": [0, 200]}
+        }});
+        let theirs = json!({"tunings": {
+            "A": {"pitches": [1, 100]},
+            "B": {"pitches": [0, 200]}
+        }});
         assert_eq!(
-            rebase(&two_tunings(), &theirs, &mine, &APPEND),
-            Rebased::Clean(json!({"tunings": [
-                {"name": "A", "pitches": [1, 101]},
-                {"name": "B", "pitches": [0, 200]}
-            ]}))
+            rebase(&tunings_by_name(), &theirs, &mine, &APPEND),
+            Rebased::Clean(json!({"tunings": {
+                "A": {"pitches": [1, 101]},
+                "B": {"pitches": [0, 200]}
+            }}))
         );
         let atomic_pitches = ListMergeConfig {
             default: ListMergePolicy::Append,
@@ -2000,11 +2041,139 @@ mod rebase_tests {
             )],
         };
         assert_eq!(
-            rebase(&two_tunings(), &theirs, &mine, &atomic_pitches),
+            rebase(&tunings_by_name(), &theirs, &mine, &atomic_pitches),
             Rebased::Fields {
                 content: theirs.clone(),
-                conflicts: vec![kept("/tunings/0/pitches", json!([0, 101]))]
+                conflicts: vec![kept("/tunings/A/pitches", json!([0, 101]))]
             }
+        );
+    }
+
+    #[test]
+    fn a_removal_on_each_side_with_a_shared_append_collides_at_the_array() {
+        // Mine removes 400 and appends 1200; theirs removes 700 and appends 1200. The two
+        // removals shift the tail by one either way, so the shifted diffs land on overlapping
+        // indices; a plain positional merge would silently undo theirs' removal of 700.
+        let mine = pitches(json!([0, 200, 500, 700, 900, 1200]));
+        let theirs = pitches(json!([0, 200, 400, 500, 900, 1200]));
+        assert_eq!(
+            rebase(&scale(), &theirs, &mine, &APPEND),
+            list_kept_aside(theirs, mine)
+        );
+    }
+
+    #[test]
+    fn a_removal_on_each_side_with_a_shared_middle_insert_collides_at_the_array() {
+        // Same shape as above, but the shared new value (800) lands in the middle of each list
+        // rather than at the tail: mine removes 400 and inserts 800; theirs removes 700 and
+        // inserts 800.
+        let mine = pitches(json!([0, 200, 500, 700, 800, 900]));
+        let theirs = pitches(json!([0, 200, 800, 400, 500, 900]));
+        assert_eq!(
+            rebase(&scale(), &theirs, &mine, &APPEND),
+            list_kept_aside(theirs, mine)
+        );
+    }
+
+    #[test]
+    fn a_reorder_on_one_side_collides_with_an_edit_the_reorder_touches() {
+        // Mine swaps the two tunings; theirs edits a field inside the first one. The swap
+        // touches both indices, so it overlaps theirs' edit at index 0.
+        fn tuning(name: &str, kind: &str, pitches: Value) -> Value {
+            json!({"name": name, "kind": kind, "pitches": pitches})
+        }
+        let old = json!({"tunings": [
+            tuning("A", "x", json!([0, 100])),
+            tuning("B", "x", json!([0, 200]))
+        ]});
+        let mine = json!({"tunings": [
+            tuning("B", "x", json!([0, 200])),
+            tuning("A", "x", json!([0, 100]))
+        ]});
+        let theirs = json!({"tunings": [
+            tuning("A", "y", json!([0, 100])),
+            tuning("B", "x", json!([0, 200]))
+        ]});
+        assert_eq!(
+            rebase(&old, &theirs, &mine, &APPEND),
+            Rebased::Fields {
+                content: theirs.clone(),
+                conflicts: vec![kept("/tunings", mine["tunings"].clone())]
+            }
+        );
+    }
+
+    #[test]
+    fn a_reorder_and_a_disjoint_retune_merge_by_position() {
+        // Mine swaps indices 0 and 1; theirs retunes index 3. The changed-index sets ({0,1} vs
+        // {3}) are disjoint, so rule (b) leaves them to merge by position: nothing is lost, but
+        // "swap" is really just two replacements at stable positions, so the result carries
+        // both edits rather than an actually-reordered list.
+        let old = pitches(json!([0, 200, 400, 600]));
+        let mine = pitches(json!([200, 0, 400, 600]));
+        let theirs = pitches(json!([0, 200, 400, 650]));
+        assert_eq!(
+            rebase(&old, &theirs, &mine, &APPEND),
+            Rebased::Clean(pitches(json!([200, 0, 400, 650])))
+        );
+    }
+
+    #[test]
+    fn both_sides_retuning_the_same_degree_collides_at_the_array() {
+        let mine = pitches(json!([0, 200, 386, 500, 700, 900]));
+        let theirs = pitches(json!([0, 200, 395, 500, 700, 900]));
+        assert_eq!(
+            rebase(&scale(), &theirs, &mine, &APPEND),
+            list_kept_aside(theirs, mine)
+        );
+    }
+
+    #[test]
+    fn an_atomic_outer_list_overrides_an_inner_append_rule() {
+        let lists = ListMergeConfig {
+            default: ListMergePolicy::Append,
+            rules: vec![(PathPattern("/tunings".into()), ListMergePolicy::Atomic)],
+        };
+        let mine = json!({"tunings": [
+            {"name": "A", "pitches": [0, 101]},
+            {"name": "B", "pitches": [0, 200]}
+        ]});
+        let theirs = json!({"tunings": [
+            {"name": "A", "pitches": [0, 100]},
+            {"name": "B", "pitches": [0, 201]}
+        ]});
+        assert_eq!(
+            rebase(&two_tunings(), &theirs, &mine, &lists),
+            Rebased::Fields {
+                content: theirs.clone(),
+                conflicts: vec![kept("/tunings", mine["tunings"].clone())]
+            }
+        );
+    }
+
+    #[test]
+    fn an_append_on_an_empty_list_applies_but_both_sides_appending_conflicts() {
+        let empty = pitches(json!([]));
+        let mine = pitches(json!([100]));
+        assert_eq!(
+            rebase(&empty, &empty, &mine, &APPEND),
+            Rebased::Clean(mine.clone())
+        );
+        let theirs = pitches(json!([200]));
+        assert_eq!(
+            rebase(&empty, &theirs, &mine, &APPEND),
+            list_kept_aside(theirs, mine)
+        );
+    }
+
+    #[test]
+    fn both_sides_removing_the_same_element_from_a_root_list_is_clean() {
+        let old = json!([0, 200, 400, 500]);
+        let mine = json!([0, 400, 500]);
+        let theirs = json!([0, 400, 500]);
+        assert_eq!(
+            rebase(&old, &theirs, &mine, &APPEND),
+            Rebased::Clean(theirs)
         );
     }
 }
