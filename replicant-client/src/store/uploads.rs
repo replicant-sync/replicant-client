@@ -177,7 +177,9 @@ mod tests {
         assert_eq!(notices, vec![]);
         assert!(recovered(&t).await.is_empty());
         assert_eq!(count(&t.store, "SELECT COUNT(*) FROM outbox").await, 0);
-        assert_eq!(snapshot(&t.store, DOC).await.shadow.map(|s| s.seq), Some(4));
+        let shadow = snapshot(&t.store, DOC).await.shadow.unwrap();
+        assert_eq!(shadow.seq, 4);
+        assert_eq!(shadow.content, json!({"n": 1200}));
     }
 
     #[tokio::test]

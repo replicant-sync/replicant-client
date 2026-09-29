@@ -27,7 +27,7 @@ async fn upgrade_then_immediate_drop_makes_at_most_six_attempts_in_30_s_with_one
     }
     let upgrades = server.stats.upgrades();
     assert!(
-        upgrades >= 2,
+        upgrades >= 5,
         "the engine stopped retrying after {upgrades} dials"
     );
     assert!(
@@ -144,7 +144,7 @@ async fn repeated_and_concurrent_reconnects_keep_one_socket_and_one_timer() {
     assert!(h.owner.connection.has_socket());
 
     // Disconnect the flooded engine, then hammer Reconnect against a server that drops every
-    // upgrade: at most one dial per second (Decision 6).
+    // upgrade: at most one dial per second.
     server.set_mode(Mode::DropAfterUpgrade);
     jump(Duration::from_secs(16)).await;
     h.turn_until("the connect timeout", |o| {
@@ -170,7 +170,7 @@ async fn repeated_and_concurrent_reconnects_keep_one_socket_and_one_timer() {
         server.stats.peak_live() <= 1,
         "two sockets were open at once"
     );
-    // Decision 6 (Task 13): a Reconnect within a second of a dial waits for the second to end.
+    // A Reconnect within a second of a dial waits for the second to end.
     assert!(
         dials <= elapsed.floor() + 1.0,
         "{dials} dials in {elapsed:.1} s under a Reconnect flood"

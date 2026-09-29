@@ -466,6 +466,7 @@ fn float_content_decodes_to_canonical_numbers_under_the_server_hash() {
     else {
         panic!("float_upload_reply must decode as an upload reply");
     };
+    assert_eq!(upload_doc.seq, 5);
     let Ok(Response::Document(document_doc)) =
         reply_to(&frames, "float_document_reply", &document_request())
     else {

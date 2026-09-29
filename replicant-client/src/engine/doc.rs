@@ -2249,7 +2249,7 @@ mod property_tests {
                     }
                     let doc = server.envelope(server.seq());
                     if doc.seq > self.cursor {
-                        // Decision 1: the copy may hold an upload of ours whose reply was lost;
+                        // The copy may hold an upload of ours whose reply was lost;
                         // catching up lets its echo settle our rows first, then we rebuild.
                         self.hits.server_copy_waits += 1;
                         self.catch_up(server, rng);
