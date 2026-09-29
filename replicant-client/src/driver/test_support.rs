@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tempfile::TempDir;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use super::engine::{CredentialLoader, EngineConfig};
+use super::engine::{CredentialLoader, EngineConfig, EngineEvent};
 use crate::store::test_support::seed_user;
 use crate::store::Store;
 use crate::transport::wire::JoinAuth;
@@ -81,6 +82,24 @@ pub(crate) async fn jump(by: Duration) {
     tokio::time::pause();
     tokio::time::advance(by).await;
     tokio::time::resume();
+}
+
+/// The next event `wanted` accepts, skipping others; fails after `WAIT`.
+pub(crate) async fn wait_for(
+    events: &mut mpsc::UnboundedReceiver<EngineEvent>,
+    what: &str,
+    wanted: impl Fn(&EngineEvent) -> bool,
+) -> EngineEvent {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let event = events.recv().await.expect("the engine is running");
+            if wanted(&event) {
+                return event;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
 }
 
 /// Polls `check` every 20 ms of real time until it holds; fails after `WAIT`.
