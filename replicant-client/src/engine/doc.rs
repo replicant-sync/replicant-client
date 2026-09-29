@@ -1315,7 +1315,10 @@ mod property_tests {
     /// How often each rarely reached branch ran.
     #[derive(Debug, Default)]
     struct Hits {
-        rebase_conflicts: u32,
+        /// Rebase conflicts hit by a change-feed delivery (push or catch-up page).
+        rebase_conflicts_delivery: u32,
+        /// Rebase conflicts hit while settling a fetched server copy.
+        rebase_conflicts_server_copy: u32,
         server_copy_fetches: u32,
         server_copy_waits: u32,
         mismatch_retries: u32,
@@ -1325,7 +1328,8 @@ mod property_tests {
 
     impl Hits {
         fn add(&mut self, other: &Hits) {
-            self.rebase_conflicts += other.rebase_conflicts;
+            self.rebase_conflicts_delivery += other.rebase_conflicts_delivery;
+            self.rebase_conflicts_server_copy += other.rebase_conflicts_server_copy;
             self.server_copy_fetches += other.server_copy_fetches;
             self.server_copy_waits += other.server_copy_waits;
             self.mismatch_retries += other.mismatch_retries;
@@ -1341,6 +1345,10 @@ mod property_tests {
         stored: HashMap<(Uuid, Option<String>), Seq>,
         other_edits: u32,
         deleted: bool,
+        /// (seq, value) of the last other-device commit that wrote `shared`; `None` value =
+        /// removed. `seq` is the server's real commit order, unlike `Client::last_local_shared`
+        /// having no equivalent until its upload actually lands.
+        last_other_shared: Option<(Seq, Option<String>)>,
     }
 
     impl Server {
@@ -1351,6 +1359,7 @@ mod property_tests {
                 stored: HashMap::new(),
                 other_edits: 0,
                 deleted: false,
+                last_other_shared: None,
             }
         }
 
@@ -1386,12 +1395,20 @@ mod property_tests {
             self.other_edits += 1;
             let mut next = self.current().clone();
             next["theirs"] = json!(self.other_edits);
-            if rng.next_unit() < 0.5 {
-                next["shared"] = json!(format!("theirs{}", self.other_edits));
+            let shared_write = if rng.next_unit() < 0.5 {
+                let value = format!("theirs{}", self.other_edits);
+                next["shared"] = json!(value);
+                Some(Some(value))
             } else if let Some(fields) = next.as_object_mut() {
                 fields.remove("shared");
+                Some(None)
+            } else {
+                None
+            };
+            let seq = self.commit(next, None, false);
+            if let Some(value) = shared_write {
+                self.last_other_shared = Some((seq, value));
             }
-            self.commit(next, None, false);
         }
 
         fn other_device_delete(&mut self) {
@@ -1451,6 +1468,10 @@ mod property_tests {
         deleted_locally: bool,
         recovered: Vec<Value>,
         hits: Hits,
+        /// (seq, value) of the shared key's value in the last local upload that landed on the
+        /// server and touched `/shared`; recorded in `build`, not `edit` — a queued edit only
+        /// reaches the server, and gets a real seq, once its upload actually commits.
+        last_local_shared: Option<(Seq, String)>,
     }
 
     impl Client {
@@ -1468,6 +1489,7 @@ mod property_tests {
                 deleted_locally: false,
                 recovered: Vec::new(),
                 hits: Hits::default(),
+                last_local_shared: None,
             }
         }
 
@@ -1552,7 +1574,12 @@ mod property_tests {
 
         /// A non-echo delivery or server copy onto a shadow with pending rows that recovers as
         /// a conflict is a rebase that failed.
-        fn count_rebase_conflict(&mut self, rebase_possible: bool, ops: &[DocOp]) {
+        fn count_rebase_conflict(
+            &mut self,
+            rebase_possible: bool,
+            ops: &[DocOp],
+            via_server_copy: bool,
+        ) {
             let conflicted = ops.iter().any(|op| {
                 matches!(
                     op,
@@ -1563,7 +1590,11 @@ mod property_tests {
                 )
             });
             if rebase_possible && conflicted {
-                self.hits.rebase_conflicts += 1;
+                if via_server_copy {
+                    self.hits.rebase_conflicts_server_copy += 1;
+                } else {
+                    self.hits.rebase_conflicts_delivery += 1;
+                }
             }
         }
 
@@ -1572,8 +1603,13 @@ mod property_tests {
                 return;
             };
             self.delivered += 1;
-            // A page carries the current envelope, which a deleted document no longer has.
-            let as_page = as_page && !server.deleted;
+            // Protocol.changes_since loads only the document's current row and drops any upsert
+            // whose document is since deleted (its `live?/1` filter): the cursor still advances
+            // past it, but a real catch-up page never delivers it at all.
+            if as_page && server.deleted && !committed.deleted {
+                self.cursor = self.cursor.max(committed.seq);
+                return;
+            }
             let doc = (!committed.deleted).then(|| {
                 if as_page {
                     server.envelope(server.seq())
@@ -1600,7 +1636,7 @@ mod property_tests {
             let rebase_possible = self.snap.shadow.is_some() && !self.snap.rows.is_empty();
             let before_server_seq = self.snap.server_seq();
             let ops = apply_change(&self.snap, &change, ME);
-            self.count_rebase_conflict(rebase_possible && !is_echo_for_us, &ops);
+            self.count_rebase_conflict(rebase_possible && !is_echo_for_us, &ops, false);
             self.apply(&ops);
             self.cursor = self.cursor.max(committed.seq);
             if let (false, Some(doc)) = (is_echo_for_us, &doc) {
@@ -1688,7 +1724,18 @@ mod property_tests {
             }
             match build_upload(&self.snap, ME) {
                 BuildResult::Send { upload, inflight } => {
+                    let touches_shared =
+                        upload.kind == UploadKind::Update && upload_touches_shared(&upload.payload);
                     let reply = server.upload(&upload);
+                    if touches_shared {
+                        if let Ok(envelope) = &reply {
+                            if let Some(value) =
+                                self.snap.content.get("shared").and_then(Value::as_str)
+                            {
+                                self.last_local_shared = Some((envelope.seq, value.to_string()));
+                            }
+                        }
+                    }
                     self.in_flight = Some((inflight, reply));
                 }
                 BuildResult::SettleLocally(ops) => self.apply(&ops),
@@ -1729,7 +1776,7 @@ mod property_tests {
                     let rebase_possible = self.snap.shadow.is_some() && !self.snap.rows.is_empty();
                     let before_server_seq = self.snap.server_seq();
                     let ops = apply_server_copy(&self.snap, &doc, ME);
-                    self.count_rebase_conflict(rebase_possible, &ops);
+                    self.count_rebase_conflict(rebase_possible, &ops, true);
                     self.apply(&ops);
                     // apply_server_copy's content guard gates on the envelope's own seq.
                     assert_other_device_edit_preserved(
@@ -1768,6 +1815,14 @@ mod property_tests {
         json!(format!("t{n}"))
     }
 
+    /// Whether a JSON Patch upload payload includes an operation on `/shared`.
+    fn upload_touches_shared(payload: &Value) -> bool {
+        payload.as_array().is_some_and(|ops| {
+            ops.iter()
+                .any(|op| op.get("path").and_then(Value::as_str) == Some("/shared"))
+        })
+    }
+
     /// The other-device edit counter this content reflects (0 before any `other_device_edit`).
     fn theirs_of(content: &Value) -> u64 {
         content.get("theirs").and_then(Value::as_u64).unwrap_or(0)
@@ -1800,6 +1855,46 @@ mod property_tests {
             "{what}: an other-device edit (theirs={envelope_theirs}) was dropped without a \
              Recover (client theirs is now {after})"
         );
+    }
+
+    /// The `shared` key is a single slot both sides write, so whichever write has the higher
+    /// server `seq` (the real commit order — a local write's is when its upload lands in
+    /// `build`, not when `edit` queues it) must win: it must be the final server content, and
+    /// an earlier write on the other side must show up in `recovered` if it isn't. Skipped when
+    /// a local delete intentionally discarded the row.
+    fn check_shared_key_preserved(seed: u64, client: &Client, server: &Server) {
+        let final_shared = server.current().get("shared").and_then(Value::as_str);
+        if let Some((local_seq, local_value)) = &client.last_local_shared {
+            let superseded = server
+                .last_other_shared
+                .as_ref()
+                .is_some_and(|(seq, _)| seq > local_seq);
+            if !superseded {
+                let recovered = client
+                    .recovered
+                    .iter()
+                    .any(|c| c.get("shared").and_then(Value::as_str) == Some(local_value.as_str()));
+                assert!(
+                    final_shared == Some(local_value.as_str()) || recovered,
+                    "seed {seed}: local shared {local_value:?} lost without a Recover \
+                     (final={final_shared:?})"
+                );
+            }
+        }
+        if let Some((other_seq, other_value)) = &server.last_other_shared {
+            let superseded = client
+                .last_local_shared
+                .as_ref()
+                .is_some_and(|(seq, _)| seq > other_seq);
+            if !superseded {
+                assert_eq!(
+                    final_shared,
+                    other_value.as_deref(),
+                    "seed {seed}: other-device shared {other_value:?} replaced by a stale \
+                     local value without a Recover"
+                );
+            }
+        }
     }
 
     fn check_invariants(seed: u64, client: &Client) {
@@ -1877,8 +1972,8 @@ mod property_tests {
             }
             // A delete ends the document's life, so only some seeds allow one.
             let local_deletes = seed % 5 == 0;
-            // The lost-create model can't upload a create, so a lost-create client can never
-            // build the delete-triggering upload the model server would apply.
+            // The model server takes no creates, so a lost create can never settle once the
+            // document is deleted server-side.
             let other_deletes = !lost_create && seed % 7 == 0;
             for _ in 0..STEPS {
                 match (rng.next_unit() * 11.0) as u32 {
@@ -1923,11 +2018,12 @@ mod property_tests {
                         });
                     assert!(kept, "seed {seed}: t{n} lost");
                 }
+                check_shared_key_preserved(seed, &client, &server);
             }
             totals.add(&client.hits);
         }
         // Each branch must actually run, or the model has stopped testing it.
-        assert!(totals.rebase_conflicts > 0, "{totals:?}");
+        assert!(totals.rebase_conflicts_delivery > 0, "{totals:?}");
         assert!(totals.server_copy_fetches > 0, "{totals:?}");
         assert!(totals.server_copy_waits > 0, "{totals:?}");
         assert!(totals.mismatch_retries > 0, "{totals:?}");
