@@ -406,6 +406,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validation_error_leaves_the_sent_mark_and_a_later_snapshot_still_conflicts() {
+        let t = temp_store().await;
+        seed_synced(&t.store, DOC, SCOPE_OWN, Some(ME), json!({"n": 0}), 1).await;
+        t.store
+            .update_document(ME, DOC, json!({"n": 1}))
+            .await
+            .unwrap();
+        let (_, inflight) = sent(&t.store, DOC).await;
+        t.store.mark_sent(DOC, inflight.upload_id).await.unwrap();
+
+        let (outcome, notices) = t
+            .store
+            .settle_upload(ME, DOC, &inflight, &Err(ServerError::new("validation")), 0)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, SettleOutcome::Done { rows_remain: true });
+        assert_eq!(
+            notices,
+            vec![DocNotice {
+                doc_id: DOC,
+                event: DocEvent::SyncError {
+                    code: "validation".into()
+                }
+            }]
+        );
+        // An error reply does not clear the mark: an earlier send of the same rows may have
+        // landed, and only the row's eventual settlement proves which version did.
+        let marked: Option<String> =
+            sqlx::query_scalar("SELECT sent_upload_id FROM outbox WHERE doc_id = ?")
+                .bind(DOC.to_string())
+                .fetch_one(&t.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(marked, Some(inflight.upload_id.to_string()));
+
+        // A later snapshot with a changed server doc must still take the conflict path for the
+        // parked, still-marked row: it may already be applied there.
+        let server = envelope(DOC, Some(ME), json!({"n": 9}), 5);
+        let notices = t
+            .store
+            .apply_snapshot_page(ME, SCOPE_OWN, std::slice::from_ref(&server))
+            .await
+            .unwrap();
+        assert_eq!(
+            notices,
+            vec![DocNotice {
+                doc_id: DOC,
+                event: DocEvent::ConflictDetected
+            }]
+        );
+    }
+
+    #[tokio::test]
     async fn server_deleted_takes_delete_wins_path() {
         let t = temp_store().await;
         seed_synced(&t.store, DOC, SCOPE_OWN, Some(ME), json!({"n": 0}), 1).await;

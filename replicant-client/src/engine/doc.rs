@@ -1778,8 +1778,8 @@ mod property_tests {
                 self.apply(&ops);
             } else {
                 let doc = server.envelope(server.seq());
-                // Only a migrated v1 base (shadow seq 0) rebases; no shadow at all is also a
-                // conflict (a create whose reply was lost cannot tell what the snapshot has).
+                // Rows rebase with a migrated v1 base or when none was sent unacknowledged; no
+                // shadow at all is a conflict.
                 let migrated_v1_base = self.snap.shadow.as_ref().is_some_and(|s| s.seq == 0);
                 let adoptable = self.equal_content_adoptable(&doc, doc.seq);
                 let recovers = !adoptable

@@ -354,6 +354,13 @@ struct Session {
     awaiting: HashMap<Uuid, (Seq, u64)>,
     pump_scheduled: bool,
     pump_deferred: bool,
+    /// `own`'s snapshot resync hasn't finished applying yet: a build now could be marked sent
+    /// and found unacknowledged when the snapshot page applies, wrongly forcing the conflict
+    /// path for a returning user's offline edits. Starts true (cursors aren't loaded yet, so it
+    /// isn't known whether `own` needs a snapshot at all); cleared once cursors show a nonzero
+    /// `own` cursor, or on `own`'s `SnapshotFinish`, or when `own` is dropped. Set true again
+    /// whenever `own` starts (or restarts, e.g. after `cursor_too_old`) a snapshot resync.
+    own_snapshot_resync_pending: bool,
 }
 
 impl Session {
@@ -598,6 +605,7 @@ impl Core {
         fx.push(Effect::Cancel(TimerId::ConnectTimeout));
         self.conn = Conn::Connected(Session {
             phase: Some(Phase::LoadingCursors),
+            own_snapshot_resync_pending: true,
             ..Default::default()
         });
         fx.push(Effect::Emit(Lifecycle::ConnectionSucceeded));
@@ -700,6 +708,10 @@ impl Core {
             let cursor = list.iter().find(|(n, _)| n == name).map_or(0, |(_, c)| *c);
             s.cursors.insert(name.clone(), cursor);
             s.applied.insert(name.clone(), cursor);
+            if name == SCOPE_OWN && cursor != 0 {
+                // No snapshot needed: catch-up resumes from this cursor via change pages.
+                s.own_snapshot_resync_pending = false;
+            }
         }
         s.phase = Some(Phase::CatchingUp);
         fx.push(Effect::Emit(Lifecycle::SyncStarted));
@@ -726,6 +738,9 @@ impl Core {
             let Some(s) = self.session() else { return };
             s.scopes
                 .insert(scope.to_string(), ScopeSync::SnapshotRequesting { req });
+            if scope == SCOPE_OWN {
+                s.own_snapshot_resync_pending = true;
+            }
             s.snapshot_seen.insert(scope.to_string(), (Vec::new(), 0));
             s.requests.insert(
                 req,
@@ -784,6 +799,9 @@ impl Core {
         let Some(s) = self.session() else { return };
         s.scopes
             .insert(scope.to_string(), ScopeSync::SnapshotRequesting { req });
+        if scope == SCOPE_OWN {
+            s.own_snapshot_resync_pending = true;
+        }
         s.requests.insert(
             req,
             Pending::Snapshot {
@@ -852,10 +870,12 @@ impl Core {
         if scope == SCOPE_OWN {
             // No further Applied for `own` will ever arrive to release these; with `own`
             // dropped, wait_for_stream will let their rebuild through at once.
+            s.own_snapshot_resync_pending = false;
             let waiting: Vec<Uuid> = s.awaiting.drain().map(|(doc_id, _)| doc_id).collect();
             for doc_id in waiting {
                 self.try_build(doc_id, fx);
             }
+            self.refill(fx);
         }
         self.check_all_live(fx);
     }
@@ -1154,6 +1174,9 @@ impl Core {
                 ApplyTag::SnapshotFinish(t),
             ) if req == t => {
                 s.cursors.insert(scope.clone(), snapshot_seq);
+                if is_own {
+                    s.own_snapshot_resync_pending = false;
+                }
                 self.request_changes(&scope, snapshot_seq, fx);
             }
             _ => {} // push applies and stale tags
@@ -1161,6 +1184,7 @@ impl Core {
         if is_own {
             self.release_awaiting(finished_round, fx);
         }
+        self.refill(fx);
         self.request_pump(fx);
     }
 
@@ -1240,14 +1264,11 @@ impl Core {
             return;
         }
         // A snapshot page applied while an upload is out would find its rows sent and not yet
-        // acknowledged; the finish requests a pump, so these wait only for the resync.
-        let own_resyncing = matches!(
-            s.scopes.get(SCOPE_OWN),
-            Some(ScopeSync::SnapshotRequesting { .. })
-                | Some(ScopeSync::SnapshotApplying { .. })
-                | Some(ScopeSync::SnapshotFinishing { .. })
-        );
-        if own_resyncing {
+        // acknowledged; `refill` requests a pump once the resync finishes, so these wait only
+        // for it — not just while a `GetSnapshot` request is outstanding, but through any
+        // `RetryWait` a failed request or page falls back to before it retries the snapshot.
+        if s.own_snapshot_resync_pending {
+            s.pump_deferred = true;
             return;
         }
         if s.slots_used() >= MAX_IN_FLIGHT {
@@ -1262,7 +1283,7 @@ impl Core {
     /// being at capacity.
     fn refill(&mut self, fx: &mut Vec<Effect>) {
         let Some(s) = self.session() else { return };
-        if s.pump_deferred && s.slots_used() < MAX_IN_FLIGHT {
+        if s.pump_deferred && s.slots_used() < MAX_IN_FLIGHT && !s.own_snapshot_resync_pending {
             s.pump_deferred = false;
             fx.push(Effect::LoadPending);
         }
@@ -2859,6 +2880,8 @@ mod upload_orchestration_tests {
         Uuid::from_u128(0x1000 + n)
     }
 
+    /// Joined and past the snapshot-resync window: `own` has a nonzero cursor, so uploads are
+    /// never held for it.
     fn connected(c: &mut Core) {
         c.step(Input::Start {
             has_credentials: true,
@@ -2868,6 +2891,10 @@ mod upload_orchestration_tests {
             req,
             result: Ok(Response::Joined),
         });
+        c.step(Input::Cursors(vec![
+            ("own".into(), 1000),
+            ("collection:curated".into(), 1),
+        ]));
     }
 
     fn prepared(d: Uuid) -> BuildOutcome {
@@ -3463,7 +3490,15 @@ mod upload_orchestration_tests {
     #[test]
     fn builds_wait_while_own_is_resynced_by_snapshot() {
         let mut c = core();
-        connected(&mut c);
+        // Joined but cursors not yet loaded: `connected` skips this window, so join directly.
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (join_req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        c.step(Input::Reply {
+            req: join_req,
+            result: Ok(Response::Joined),
+        });
         let fx = c.step(Input::Cursors(vec![("collection:curated".into(), 5)]));
         let (snapshot_req, _) = sends(&fx)
             .into_iter()
@@ -3503,6 +3538,104 @@ mod upload_orchestration_tests {
         }));
         let fx = c.step(Input::PendingDocs(vec![doc(1)]));
         assert!(fx.contains(&Effect::BuildUpload { doc_id: doc(1) }));
+    }
+
+    #[test]
+    fn builds_wait_through_a_failed_snapshot_requests_retry_wait() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (join_req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        c.step(Input::Reply {
+            req: join_req,
+            result: Ok(Response::Joined),
+        });
+        let fx = c.step(Input::Cursors(vec![("collection:curated".into(), 5)]));
+        let (snapshot_req, _) = sends(&fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetSnapshot { scope, .. } if scope == "own"))
+            .expect("own resyncs by snapshot");
+        // The request times out: `own` falls back to `RetryWait`, still short of a snapshot.
+        c.step(Input::Timer(TimerId::Request(snapshot_req)));
+        assert!(
+            !c.step(Input::PendingDocs(vec![doc(1)]))
+                .contains(&Effect::BuildUpload { doc_id: doc(1) }),
+            "a build while `own` is only waiting to retry its snapshot could still get marked \
+             sent before the retried snapshot page applies"
+        );
+        let fx = c.step(Input::Timer(TimerId::CatchUpRetry("own".into())));
+        let (own_retry_req, _) = sends(&fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetSnapshot { scope, .. } if scope == "own"))
+            .expect("own retries with a fresh snapshot request");
+        assert!(
+            !c.step(Input::PendingDocs(vec![doc(1)]))
+                .contains(&Effect::BuildUpload { doc_id: doc(1) }),
+            "the retried snapshot request is still outstanding"
+        );
+        c.step(Input::Reply {
+            req: own_retry_req,
+            result: Ok(Response::SnapshotPage {
+                docs: vec![],
+                snapshot_seq: 5,
+                next_page_token: None,
+            }),
+        });
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::SnapshotPage(own_retry_req),
+        });
+        let finish = fx
+            .iter()
+            .find_map(|e| match e {
+                Effect::FinishSnapshot { tag, .. } => Some(tag.clone()),
+                _ => None,
+            })
+            .expect("finish snapshot");
+        c.step(Input::Applied {
+            scope: "own".into(),
+            tag: finish,
+        });
+        assert!(
+            c.step(Input::PendingDocs(vec![doc(1)]))
+                .contains(&Effect::BuildUpload { doc_id: doc(1) }),
+            "the retried snapshot finished; builds resume"
+        );
+    }
+
+    #[test]
+    fn own_dropped_mid_snapshot_resync_releases_the_hold() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (join_req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        c.step(Input::Reply {
+            req: join_req,
+            result: Ok(Response::Joined),
+        });
+        let fx = c.step(Input::Cursors(vec![("collection:curated".into(), 5)]));
+        let (snapshot_req, _) = sends(&fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetSnapshot { scope, .. } if scope == "own"))
+            .expect("own resyncs by snapshot");
+        assert!(
+            !c.step(Input::PendingDocs(vec![doc(1)]))
+                .contains(&Effect::BuildUpload { doc_id: doc(1) }),
+            "held while own's snapshot is outstanding"
+        );
+        let fx = c.step(Input::Reply {
+            req: snapshot_req,
+            result: Err(ServerError::new("subscription_forbidden")),
+        });
+        assert!(
+            fx.contains(&Effect::LoadPending),
+            "own dropped mid-resync must release stranded docs, not leave them held forever"
+        );
+        assert!(c
+            .step(Input::PendingDocs(vec![doc(1)]))
+            .contains(&Effect::BuildUpload { doc_id: doc(1) }));
     }
 }
 
