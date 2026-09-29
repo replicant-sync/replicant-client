@@ -198,8 +198,11 @@ fn membership_seq(snap: &DocSnapshot, scope: &str) -> Seq {
         .map_or(0, |m| m.seq)
 }
 
-/// Non-echo upsert: content guard already passed. When `local_base_known` is false the shadow
-/// is not the base of the pending rows, so edits that would need a rebase settle as a conflict.
+/// Non-echo upsert: content guard already passed. A rebase of pending rows onto the incoming
+/// envelope is only attempted when a shadow exists and the caller says it is that base
+/// (`local_base_known`); with no shadow at all there is no trustworthy base to rebase from — the
+/// envelope may already hold our own upload whose reply was lost, or another device's edit the
+/// shadow never captured — so it settles as a conflict, same as when `local_base_known` is false.
 fn apply_upsert(
     snap: &DocSnapshot,
     doc: &DocEnvelope,
@@ -241,13 +244,11 @@ fn apply_upsert(
         return ops;
     }
     let rebased = match &snap.shadow {
-        _ if !local_base_known => None,
-        // Migration only: no known base, keep local content; pending = diff(new shadow, content).
-        None => Some(snap.content.clone()),
-        Some(old) => match rebase(&old.content, &doc.content, &snap.content) {
+        Some(old) if local_base_known => match rebase(&old.content, &doc.content, &snap.content) {
             Rebased::Clean(v) => Some(v),
             Rebased::Conflict => None,
         },
+        _ => None,
     };
     let Some(content) = rebased else {
         let with_new_shadow = snap.project(&[DocOp::SetShadow(new_shadow.clone())]);
@@ -335,7 +336,8 @@ pub fn apply_change(snap: &DocSnapshot, change: &Change, me: Uuid) -> Vec<DocOp>
             debug_assert!(change.doc.is_some(), "upsert without doc");
             if is_member(&ops) {
                 if let Some(doc) = &change.doc {
-                    ops.extend(apply_upsert(snap, doc, change.seq, true));
+                    // Pages carry the current envelope; the shadow holds that version, not the change's.
+                    ops.extend(apply_upsert(snap, doc, doc.seq.max(change.seq), true));
                 }
             }
         }
@@ -386,6 +388,59 @@ pub fn apply_server_missing(snap: &DocSnapshot) -> Vec<DocOp> {
         // update when a shadow exists (the "exists and mine" flow).
         Some(_) => vec![DocOp::DropAllRows, DocOp::InsertMarker(RowKind::Create)],
     }
+}
+
+/// Full resync: a local member of `scope` that the snapshot did not list has left it. A
+/// document with outbox rows, or whose membership is newer than the snapshot, is kept.
+pub fn sweep_doc(snap: &DocSnapshot, scope: &str, snapshot_seq: Seq) -> Vec<DocOp> {
+    if !snap.rows.is_empty() || membership_seq(snap, scope) > snapshot_seq {
+        return Vec::new();
+    }
+    let mut ops = vec![DocOp::SetMembership(Membership {
+        scope: scope.to_string(),
+        member: false,
+        seq: snapshot_seq,
+    })];
+    let after = snap.project(&ops);
+    if after.exists && !after.memberships.iter().any(|m| m.member) {
+        ops.push(DocOp::HardDelete);
+    }
+    ops
+}
+
+/// A full-resync snapshot document. It carries no `upload_id`, so it may already contain a v2
+/// upload of ours; array patch ops are index-based, so pending edits are never rebased onto it
+/// unless the local shadow is a migrated v1 base (`seq == 0`): they go to `recovered` instead.
+/// A doc with no shadow at all (a v2 create whose reply was lost, or a migrated v1 create never
+/// synced) cannot tell whether the snapshot already holds its pending content, so it also takes
+/// the conflict path.
+pub fn apply_snapshot_doc(
+    snap: &DocSnapshot,
+    scope: &str,
+    doc: &DocEnvelope,
+    me: Uuid,
+) -> Vec<DocOp> {
+    let mut ops = Vec::new();
+    if doc.seq > membership_seq(snap, scope) {
+        ops.push(DocOp::SetMembership(Membership {
+            scope: scope.to_string(),
+            member: true,
+            seq: doc.seq,
+        }));
+    }
+    if doc.seq <= snap.server_seq() {
+        return ops;
+    }
+    let member = snap
+        .project(&ops)
+        .memberships
+        .iter()
+        .any(|m| m.scope == scope && m.member);
+    if member {
+        let migrated_v1_base = snap.shadow.as_ref().is_some_and(|s| s.seq == 0);
+        ops.extend(apply_upsert(snap, doc, doc.seq, migrated_v1_base));
+    }
+    with_settle_invariant(snap, ops, me)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -653,6 +708,24 @@ mod apply_change_tests {
     }
 
     #[test]
+    fn page_upsert_stores_the_envelope_seq_so_older_page_changes_skip() {
+        let s = synced(json!({"a": 1}), 1);
+        // A page row for seq 2 carrying the document's current envelope (seq 5).
+        let mut first = upsert("own", json!({}), 2);
+        first.doc = Some(env(json!({"a": 3}), 5));
+        let after = s.project(&apply_change(&s, &first, ME));
+        assert_eq!(after.shadow.as_ref().unwrap().seq, 5);
+        assert_eq!(after.content, json!({"a": 3}));
+
+        let mut second = upsert("own", json!({}), 4);
+        second.doc = Some(env(json!({"a": 3}), 5));
+        let ops = apply_change(&after, &second, ME);
+        assert!(!ops
+            .iter()
+            .any(|op| matches!(op, DocOp::SetShadow(_) | DocOp::SetContent(_))));
+    }
+
+    #[test]
     fn upsert_creates_missing_document() {
         let after = empty().project(&apply_change(
             &empty(),
@@ -719,17 +792,23 @@ mod apply_change_tests {
     }
 
     #[test]
-    fn null_shadow_keeps_local_content() {
-        let mut s = synced(json!({"mine": 1}), 0);
+    fn null_shadow_with_pending_rows_recovers_exact_local_content() {
+        // No known base (a v2 create whose reply was lost, or a migrated v1 doc with no
+        // captured base): rebasing risks re-applying or silently dropping content, so this
+        // settles as a conflict instead of keeping local content unconditionally.
+        let mut s = synced(json!({"items": ["a"]}), 0);
         s.shadow = None;
-        s.rows = vec![row(5, RowKind::Update)];
-        let after = s.project(&apply_change(
-            &s,
-            &upsert("own", json!({"server": 1}), 4),
-            ME,
-        ));
-        assert_eq!(after.content, json!({"mine": 1}));
-        assert_eq!(after.shadow.unwrap().content, json!({"server": 1}));
+        s.rows = vec![row(1, RowKind::Create)];
+        let ops = apply_change(&s, &upsert("own", json!({"items": ["a", "x"]}), 4), ME);
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"items": ["a"]}),
+            reason: RecoverReason::Conflict,
+        }));
+        assert!(ops.contains(&DocOp::Emit(DocEvent::ConflictDetected)));
+        let after = s.project(&ops);
+        assert_eq!(after.content, json!({"items": ["a", "x"]}));
+        assert!(after.rows.is_empty());
+        assert_eq!(after.shadow.unwrap().seq, 4);
     }
 
     #[test]
@@ -835,6 +914,22 @@ mod apply_change_tests {
         assert!(apply_server_copy(&s, &env(json!({"x": 1}), 4), ME).is_empty());
         let after = s.project(&apply_server_copy(&s, &env(json!({"x": 1}), 6), ME));
         assert_eq!(after.content, json!({"x": 1}));
+    }
+
+    #[test]
+    fn server_copy_with_no_shadow_and_pending_rows_recovers_exact_local_content() {
+        let mut s = synced(json!({"items": ["a"]}), 0);
+        s.shadow = None;
+        s.rows = vec![row(1, RowKind::Create)];
+        let ops = apply_server_copy(&s, &env(json!({"items": ["a", "x"]}), 4), ME);
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"items": ["a"]}),
+            reason: RecoverReason::Conflict,
+        }));
+        assert!(ops.contains(&DocOp::Emit(DocEvent::ConflictDetected)));
+        let after = s.project(&ops);
+        assert_eq!(after.content, json!({"items": ["a", "x"]}));
+        assert!(after.rows.is_empty());
     }
 
     #[test]
@@ -1184,5 +1279,626 @@ mod rebase_tests {
     fn edit_under_removed_parent_conflicts() {
         let r = rebase(&json!({"a": {"x": 1}}), &json!({}), &json!({"a": {"x": 2}}));
         assert_eq!(r, Rebased::Conflict);
+    }
+}
+
+#[cfg(test)]
+mod property_tests {
+    //! One writable document against a model server that applies uploads (deduplicated by
+    //! `(upload_id, base_hash)`). Changes reach the client as pushes (envelope at the change's
+    //! seq) or catch-up pages (current envelope). A lost reply is a reconnect: every committed
+    //! change is delivered before the next build.
+    use std::collections::HashMap;
+
+    use super::change_fixtures::env;
+    use super::fixtures::*;
+    use super::*;
+    use crate::engine::backoff::Jitter;
+    use crate::engine::types::{ServerError, Upload};
+    use serde_json::json;
+
+    const SEEDS: u64 = 500;
+    const STEPS: usize = 80;
+    const MAX_LOCAL_EDITS: u32 = 12;
+    const MAX_OTHER_EDITS: u32 = 8;
+
+    struct Server {
+        /// Index = seq; seq 1 is the content both sides start from.
+        history: Vec<Value>,
+        changes: Vec<(Seq, Option<Uuid>)>,
+        stored: HashMap<(Uuid, String), Seq>,
+        other_edits: u32,
+    }
+
+    impl Server {
+        fn new(content: Value) -> Server {
+            Server {
+                history: vec![Value::Null, content],
+                changes: Vec::new(),
+                stored: HashMap::new(),
+                other_edits: 0,
+            }
+        }
+
+        fn seq(&self) -> Seq {
+            self.history.len() as Seq - 1
+        }
+
+        fn current(&self) -> &Value {
+            &self.history[self.history.len() - 1]
+        }
+
+        fn envelope(&self, seq: Seq) -> DocEnvelope {
+            env(self.history[seq as usize].clone(), seq)
+        }
+
+        fn commit(&mut self, content: Value, upload_id: Option<Uuid>) -> Seq {
+            self.history.push(content);
+            let seq = self.seq();
+            self.changes.push((seq, upload_id));
+            seq
+        }
+
+        fn other_device_edit(&mut self) {
+            if self.other_edits == MAX_OTHER_EDITS {
+                return;
+            }
+            self.other_edits += 1;
+            let mut next = self.current().clone();
+            next["theirs"] = json!(self.other_edits);
+            self.commit(next, None);
+        }
+
+        fn upload(&mut self, upload: &Upload) -> Result<DocEnvelope, ServerError> {
+            let base_hash = upload
+                .base_hash
+                .clone()
+                .expect("the model only uploads updates");
+            if let Some(seq) = self.stored.get(&(upload.upload_id, base_hash.clone())) {
+                return Ok(self.envelope(*seq));
+            }
+            let current_hash = content_hash(self.current());
+            if base_hash != current_hash {
+                let mut error = ServerError::new("hash_mismatch");
+                error.current_hash = Some(current_hash);
+                error.current_seq = Some(self.seq());
+                return Err(error);
+            }
+            let patch: json_patch::Patch = serde_json::from_value(upload.payload.clone()).unwrap();
+            let mut next = self.current().clone();
+            json_patch::patch(&mut next, &patch).unwrap();
+            let seq = self.commit(next, Some(upload.upload_id));
+            self.stored.insert((upload.upload_id, base_hash), seq);
+            Ok(self.envelope(seq))
+        }
+    }
+
+    struct Client {
+        snap: DocSnapshot,
+        next_row: u128,
+        in_flight: Option<(InFlight, Result<DocEnvelope, ServerError>)>,
+        mismatches: u32,
+        delivered: usize,
+        must_catch_up: bool,
+        local_edits: u32,
+        recovered: Vec<Value>,
+    }
+
+    impl Client {
+        fn new(content: Value) -> Client {
+            Client {
+                snap: synced(content, 1),
+                next_row: 0,
+                in_flight: None,
+                mismatches: 0,
+                delivered: 0,
+                must_catch_up: false,
+                local_edits: 0,
+                recovered: Vec::new(),
+            }
+        }
+
+        /// A v2 create whose upload landed but the reply was lost: no shadow yet, one pending
+        /// `Create` row. Fuzzes the no-shadow branch of `apply_snapshot_doc` and `apply_change`'s
+        /// non-echo arm (every push or page delivered before this client's create resolves),
+        /// plus its echo arm on the seeds where `server.changes` carries a matching entry.
+        /// `apply_server_copy`'s no-shadow branch is not reached here: `build` never sends while
+        /// the shadow is still unset.
+        fn new_lost_create(content: Value) -> Client {
+            let mut c = Client::new(content);
+            c.snap.shadow = None;
+            c.next_row = 1;
+            c.snap.rows = vec![OutboxRow {
+                mutation_id: m(1),
+                kind: RowKind::Create,
+                parked: false,
+            }];
+            c
+        }
+
+        fn push_row(&mut self, kind: RowKind) {
+            self.next_row += 1;
+            self.snap.rows.push(OutboxRow {
+                mutation_id: m(self.next_row),
+                kind,
+                parked: false,
+            });
+        }
+
+        /// Applies ops the way the store does: markers get fresh increasing ids.
+        fn apply(&mut self, ops: &[DocOp]) {
+            let seq_before = self.snap.server_seq();
+            for op in ops {
+                match op {
+                    DocOp::InsertMarker(kind) => self.push_row(*kind),
+                    DocOp::Recover { content, .. } => self.recovered.push(content.clone()),
+                    other => self.snap = self.snap.project(std::slice::from_ref(other)),
+                }
+            }
+            assert!(
+                self.snap.server_seq() >= seq_before,
+                "shadow seq went backwards"
+            );
+        }
+
+        fn edit(&mut self) {
+            if self.local_edits == MAX_LOCAL_EDITS {
+                return;
+            }
+            self.local_edits += 1;
+            let token = json!(format!("t{}", self.local_edits));
+            self.snap.content["items"]
+                .as_array_mut()
+                .expect("items array")
+                .push(token);
+            self.push_row(RowKind::Update);
+        }
+
+        fn deliver(&mut self, server: &Server, as_page: bool) {
+            let Some(&(seq, upload_id)) = server.changes.get(self.delivered) else {
+                return;
+            };
+            self.delivered += 1;
+            let doc = if as_page {
+                server.envelope(server.seq())
+            } else {
+                server.envelope(seq)
+            };
+            let is_echo_for_us = upload_id.is_some_and(|u| self.rows_contain(u));
+            let pending_delete_before = self
+                .snap
+                .rows
+                .last()
+                .is_some_and(|r| r.kind == RowKind::Delete);
+            let before_server_seq = self.snap.server_seq();
+            let change = Change {
+                scope: "own".into(),
+                seq,
+                prev_seq: seq - 1,
+                doc_id: DOC,
+                kind: ChangeKind::Upsert,
+                doc: Some(doc.clone()),
+                client_id: None,
+                upload_id,
+            };
+            let ops = apply_change(&self.snap, &change, ME);
+            self.apply(&ops);
+            if !is_echo_for_us {
+                // apply_change's content guard gates on the change's own seq, not the envelope's
+                // (a page can carry a newer envelope than the change it is delivering).
+                assert_other_device_edit_preserved(
+                    before_server_seq,
+                    seq,
+                    pending_delete_before,
+                    &doc,
+                    self,
+                    &ops,
+                    "deliver",
+                );
+            }
+        }
+
+        fn rows_contain(&self, mutation_id: Uuid) -> bool {
+            self.snap.rows.iter().any(|r| r.mutation_id == mutation_id)
+        }
+
+        fn catch_up(&mut self, server: &Server, rng: &mut Jitter) {
+            while self.delivered < server.changes.len() {
+                let as_page = rng.next_unit() < 0.5;
+                self.deliver(server, as_page);
+            }
+            self.must_catch_up = false;
+        }
+
+        /// A full resync: the current envelope as a snapshot document; the cursor jumps past
+        /// every committed change.
+        fn snapshot(&mut self, server: &Server) {
+            let doc = server.envelope(server.seq());
+            // A pending delete wins unconditionally (shadow only); it is not a conflict.
+            let pending_delete = self
+                .snap
+                .rows
+                .last()
+                .is_some_and(|r| r.kind == RowKind::Delete);
+            // Only a migrated v1 base (shadow seq 0) rebases; no shadow at all is also a
+            // conflict (a create whose reply was lost cannot tell what the snapshot already has).
+            let migrated_v1_base = self.snap.shadow.as_ref().is_some_and(|s| s.seq == 0);
+            let recovers = !self.snap.rows.is_empty()
+                && !pending_delete
+                && !migrated_v1_base
+                && doc.seq > self.snap.server_seq();
+            let pre_content = self.snap.content.clone();
+
+            let ops = apply_snapshot_doc(&self.snap, "own", &doc, ME);
+            if recovers {
+                assert!(
+                    ops.contains(&DocOp::Recover {
+                        content: pre_content,
+                        reason: RecoverReason::Conflict,
+                    }),
+                    "a doc with pending rows and no migrated base must recover its exact local content"
+                );
+                assert!(
+                    !ops.iter().any(|op| matches!(op, DocOp::InsertMarker(_))),
+                    "a doc with pending rows and no migrated base must never rebase onto a snapshot"
+                );
+            }
+            self.apply(&ops);
+            self.delivered = server.changes.len();
+            self.must_catch_up = false;
+        }
+
+        fn build(&mut self, server: &mut Server, rng: &mut Jitter) {
+            // The model server only accepts updates against an existing document: a client with
+            // no shadow yet (a pending create) waits for a page or snapshot to give it one.
+            if self.in_flight.is_some() || self.snap.shadow.is_none() {
+                return;
+            }
+            if self.must_catch_up {
+                self.catch_up(server, rng);
+            }
+            match build_upload(&self.snap, ME) {
+                BuildResult::Send { upload, inflight } => {
+                    let reply = server.upload(&upload);
+                    self.in_flight = Some((inflight, reply));
+                }
+                BuildResult::SettleLocally(ops) => self.apply(&ops),
+                BuildResult::Nothing => {}
+                BuildResult::NeedsServerCopy => panic!("the model document always has a shadow"),
+            }
+        }
+
+        fn reply(&mut self, server: &Server) {
+            let Some((inflight, reply)) = self.in_flight.take() else {
+                return;
+            };
+            match settle(&self.snap, &inflight, &reply, ME, self.mismatches) {
+                SettleResult::Ops(ops) => {
+                    self.mismatches = 0;
+                    self.apply(&ops);
+                }
+                SettleResult::FetchServerCopy => {
+                    self.mismatches += 1;
+                    let pending_delete_before = self
+                        .snap
+                        .rows
+                        .last()
+                        .is_some_and(|r| r.kind == RowKind::Delete);
+                    let before_server_seq = self.snap.server_seq();
+                    let doc = server.envelope(server.seq());
+                    let ops = apply_server_copy(&self.snap, &doc, ME);
+                    self.apply(&ops);
+                    // apply_server_copy's content guard gates on the envelope's own seq.
+                    assert_other_device_edit_preserved(
+                        before_server_seq,
+                        doc.seq,
+                        pending_delete_before,
+                        &doc,
+                        self,
+                        &ops,
+                        "server copy",
+                    );
+                }
+                SettleResult::Retry { mismatch, .. } => {
+                    if mismatch {
+                        self.mismatches += 1;
+                    }
+                }
+            }
+        }
+
+        fn lose_reply(&mut self) {
+            if self.in_flight.take().is_some() {
+                self.must_catch_up = true;
+            }
+        }
+    }
+
+    fn token(n: u32) -> Value {
+        json!(format!("t{n}"))
+    }
+
+    /// The other-device edit counter this content reflects (0 before any `other_device_edit`).
+    fn theirs_of(content: &Value) -> u64 {
+        content.get("theirs").and_then(Value::as_u64).unwrap_or(0)
+    }
+
+    /// Asserts a non-echo delivery that actually applies (content guard passed, no pending
+    /// delete in play) never silently drops the other-device edit the incoming envelope
+    /// carries: the client's content must catch up to it, or the delivery must explicitly
+    /// recover the pre-delivery local content instead (tracked in `client.recovered`, not
+    /// discarded). A stale or pending-delete delivery is exempt: it is spec-correct for those to
+    /// leave content untouched. `guard_seq` is whatever seq the caller's own content guard
+    /// compares against `before_server_seq` — the change's seq for a delivery (a page can carry
+    /// a newer envelope than the change it is delivering), the envelope's own seq for a server
+    /// copy.
+    fn assert_other_device_edit_preserved(
+        before_server_seq: Seq,
+        guard_seq: Seq,
+        pending_delete_before: bool,
+        envelope: &DocEnvelope,
+        client: &Client,
+        ops: &[DocOp],
+        what: &str,
+    ) {
+        if pending_delete_before || guard_seq <= before_server_seq {
+            return;
+        }
+        let recovered_now = ops.iter().any(|op| matches!(op, DocOp::Recover { .. }));
+        let after = theirs_of(&client.snap.content);
+        let envelope_theirs = theirs_of(&envelope.content);
+        assert!(
+            after >= envelope_theirs || recovered_now,
+            "{what}: an other-device edit (theirs={envelope_theirs}) was dropped without a \
+             Recover (client theirs is now {after})"
+        );
+    }
+
+    fn check_invariants(seed: u64, client: &Client) {
+        let items = client.snap.content["items"]
+            .as_array()
+            .expect("items array");
+        for n in 1..=client.local_edits {
+            let copies = items.iter().filter(|item| **item == token(n)).count();
+            assert!(
+                copies <= 1,
+                "seed {seed}: t{n} applied {copies} times: {items:?}"
+            );
+        }
+        if client.snap.rows.is_empty() {
+            let shadow = client.snap.shadow.as_ref().expect("shadow");
+            assert_eq!(
+                content_hash(&shadow.content),
+                content_hash(&client.snap.content),
+                "seed {seed}: local edit left without an outbox row"
+            );
+        }
+    }
+
+    fn drain(seed: u64, server: &mut Server, client: &mut Client, rng: &mut Jitter) {
+        for _ in 0..50 {
+            client.reply(server);
+            client.catch_up(server, rng);
+            check_invariants(seed, client);
+            if client.snap.rows.is_empty() {
+                return;
+            }
+            client.build(server, rng);
+        }
+        panic!("seed {seed}: rows never settled: {:?}", client.snap.rows);
+    }
+
+    #[test]
+    fn random_echo_rebase_and_page_sequences_lose_and_duplicate_nothing() {
+        for seed in 1..=SEEDS {
+            let mut rng = Jitter::new(seed * 104_729);
+            let start = json!({"items": [], "theirs": 0});
+            let mut server = Server::new(start.clone());
+            // Half the seeds start as a lost-create client (no shadow, one pending Create row)
+            // to fuzz that branch of apply_snapshot_doc and apply_change.
+            let lost_create = seed % 2 == 0;
+            let mut client = if lost_create {
+                Client::new_lost_create(start)
+            } else {
+                Client::new(start)
+            };
+            if lost_create && seed % 4 == 0 {
+                // The create landed on the server as the doc's starting content, but our reply
+                // was lost; deliver it back as a change too, fuzzing the echo arm with no shadow.
+                server.changes.push((1, Some(m(1))));
+            }
+            for _ in 0..STEPS {
+                match (rng.next_unit() * 8.0) as u32 {
+                    0 => client.edit(),
+                    1 => client.build(&mut server, &mut rng),
+                    2 => server.other_device_edit(),
+                    3 => client.deliver(&server, false),
+                    4 => client.deliver(&server, true),
+                    5 => client.reply(&server),
+                    6 => client.lose_reply(),
+                    _ => client.snapshot(&server),
+                }
+                check_invariants(seed, &client);
+            }
+            drain(seed, &mut server, &mut client, &mut rng);
+
+            assert_eq!(
+                &client.snap.content,
+                server.current(),
+                "seed {seed}: client and server differ"
+            );
+            let final_items = server.current()["items"].as_array().unwrap();
+            for n in 1..=client.local_edits {
+                let kept = final_items.contains(&token(n))
+                    || client.recovered.iter().any(|content| {
+                        content["items"]
+                            .as_array()
+                            .is_some_and(|items| items.contains(&token(n)))
+                    });
+                assert!(kept, "seed {seed}: t{n} lost");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::fixtures::*;
+    use super::*;
+    use serde_json::json;
+
+    const CURATED: &str = "collection:curated";
+
+    fn curated_doc(membership_seq: Seq) -> DocSnapshot {
+        let mut s = synced(json!({"v": 1}), 3);
+        s.owner_id = None;
+        s.memberships = vec![Membership {
+            scope: CURATED.into(),
+            member: true,
+            seq: membership_seq,
+        }];
+        s
+    }
+
+    fn left(seq: Seq) -> DocOp {
+        DocOp::SetMembership(Membership {
+            scope: CURATED.into(),
+            member: false,
+            seq,
+        })
+    }
+
+    #[test]
+    fn sweep_leaves_the_scope_and_deletes_an_orphan() {
+        let ops = sweep_doc(&curated_doc(3), CURATED, 30);
+        assert_eq!(ops, vec![left(30), DocOp::HardDelete]);
+    }
+
+    #[test]
+    fn sweep_never_touches_docs_with_rows() {
+        let mut s = curated_doc(3);
+        s.rows = vec![row(1, RowKind::Update)];
+        assert!(sweep_doc(&s, CURATED, 30).is_empty());
+    }
+
+    #[test]
+    fn sweep_keeps_membership_newer_than_the_snapshot() {
+        assert!(sweep_doc(&curated_doc(40), CURATED, 30).is_empty());
+    }
+
+    #[test]
+    fn sweep_keeps_a_doc_that_is_a_member_elsewhere() {
+        let mut s = curated_doc(3);
+        s.memberships.push(Membership {
+            scope: "own".into(),
+            member: true,
+            seq: 4,
+        });
+        assert_eq!(sweep_doc(&s, CURATED, 30), vec![left(30)]);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_doc_tests {
+    use super::change_fixtures::env;
+    use super::fixtures::*;
+    use super::*;
+    use serde_json::json;
+
+    /// Local copy at seq 1 with one pending append; the snapshot (seq 5) already contains it,
+    /// as it does when the upload landed but its reply was lost.
+    fn pending_append() -> (DocSnapshot, DocEnvelope) {
+        let mut s = synced(json!({"items": ["a"]}), 1);
+        s.content = json!({"items": ["a", "b"]});
+        s.rows = vec![row(1, RowKind::Update)];
+        (s, env(json!({"items": ["a", "b"], "theirs": 1}), 5))
+    }
+
+    #[test]
+    fn snapshot_doc_with_pending_rows_recovers_exact_local_content() {
+        let (s, doc) = pending_append();
+        let ops = apply_snapshot_doc(&s, "own", &doc, ME);
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"items": ["a", "b"]}),
+            reason: RecoverReason::Conflict,
+        }));
+        assert!(ops.contains(&DocOp::Emit(DocEvent::ConflictDetected)));
+        assert!(!ops.iter().any(|op| matches!(op, DocOp::InsertMarker(_))));
+        let after = s.project(&ops);
+        assert_eq!(after.content, json!({"items": ["a", "b"], "theirs": 1}));
+        assert!(after.rows.is_empty());
+        assert_eq!(after.shadow.unwrap().seq, 5);
+    }
+
+    #[test]
+    fn snapshot_doc_without_pending_rows_is_adopted_as_is() {
+        let s = synced(json!({"items": ["a"]}), 1);
+        let doc = env(json!({"items": ["x"]}), 5);
+        let ops = apply_snapshot_doc(&s, "own", &doc, ME);
+        assert!(!ops
+            .iter()
+            .any(|op| matches!(op, DocOp::Recover { .. } | DocOp::Emit(_))));
+        let after = s.project(&ops);
+        assert_eq!(after.content, json!({"items": ["x"]}));
+        assert_eq!(after.shadow.unwrap().seq, 5);
+    }
+
+    #[test]
+    fn snapshot_doc_with_pending_delete_keeps_the_delete() {
+        let (mut s, doc) = pending_append();
+        s.rows.push(row(2, RowKind::Delete));
+        let after = s.project(&apply_snapshot_doc(&s, "own", &doc, ME));
+        assert_eq!(after.rows.len(), 2);
+        assert_eq!(after.content, json!({"items": ["a", "b"]}));
+        assert_eq!(after.shadow.unwrap().seq, 5);
+    }
+
+    #[test]
+    fn snapshot_doc_rebases_migrated_pending_edits() {
+        // Migrated from v1: shadow from base_content at server_seq 0, one pending append.
+        let mut s = synced(json!({"items": ["a"]}), 0);
+        s.content = json!({"items": ["a", "b"]});
+        s.rows = vec![row(1, RowKind::Update)];
+        let doc = env(json!({"items": ["a"], "theirs": 1}), 5);
+        let ops = apply_snapshot_doc(&s, "own", &doc, ME);
+        assert!(!ops
+            .iter()
+            .any(|op| matches!(op, DocOp::Recover { .. } | DocOp::Emit(_))));
+        let after = s.project(&ops);
+        assert_eq!(after.content, json!({"items": ["a", "b"], "theirs": 1}));
+        assert_eq!(after.rows.len(), 1, "the edit is still pending");
+        assert_eq!(after.shadow.unwrap().seq, 5);
+    }
+
+    #[test]
+    fn snapshot_doc_with_no_shadow_and_pending_create_recovers_exact_local_content() {
+        // v2 local create: create upload landed, its reply was lost (no shadow yet). A snapshot
+        // arrives holding both our create and another device's edit; this must never rebase.
+        let mut s = synced(json!({"items": ["a"]}), 0);
+        s.shadow = None;
+        s.rows = vec![row(1, RowKind::Create)];
+        let doc = env(json!({"items": ["a", "x"]}), 4);
+        let ops = apply_snapshot_doc(&s, "own", &doc, ME);
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"items": ["a"]}),
+            reason: RecoverReason::Conflict,
+        }));
+        assert!(ops.contains(&DocOp::Emit(DocEvent::ConflictDetected)));
+        assert!(!ops.iter().any(|op| matches!(op, DocOp::InsertMarker(_))));
+        let after = s.project(&ops);
+        assert_eq!(after.content, json!({"items": ["a", "x"]}));
+        assert!(after.rows.is_empty());
+        assert_eq!(after.shadow.unwrap().seq, 4);
+    }
+
+    #[test]
+    fn snapshot_doc_is_skipped_by_the_content_guard() {
+        let (s, _) = pending_append();
+        let older = env(json!({"items": []}), 1);
+        let ops = apply_snapshot_doc(&s, "own", &older, ME);
+        assert!(!ops.iter().any(|op| matches!(
+            op,
+            DocOp::SetShadow(_) | DocOp::SetContent(_) | DocOp::Recover { .. }
+        )));
     }
 }

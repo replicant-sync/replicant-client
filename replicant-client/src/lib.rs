@@ -8,6 +8,7 @@ pub mod events;
 pub mod offline_queue;
 pub mod queries;
 pub mod secret_store;
+pub mod store;
 pub mod transport;
 pub mod websocket;
 
