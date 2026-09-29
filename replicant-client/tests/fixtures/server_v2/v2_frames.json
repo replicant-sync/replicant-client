@@ -1,0 +1,554 @@
+{
+  "snapshot_page_request": [
+    "1",
+    "2",
+    "sync:v2",
+    "get_snapshot",
+    {
+      "page_token": "3:00000000-0000-0000-0000-000000000000",
+      "scope": "own"
+    }
+  ],
+  "publish_request": [
+    "1",
+    "2",
+    "sync:v2",
+    "publish",
+    {
+      "source_doc_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "float_upload_reply": [
+    "1",
+    "2",
+    "sync:v2",
+    "phx_reply",
+    {
+      "response": {
+        "author_id": null,
+        "content": {
+          "cents": 1.2e3,
+          "title": "t"
+        },
+        "created_at": "2026-01-01T00:00:00.000000Z",
+        "derived_from": null,
+        "doc_id": "00000000-0000-0000-0000-000000000000",
+        "hash": "755185a61fa7ed1f9260bdb2b5f819ce9ff06e52870c546f9258da27f7a6ffe4",
+        "owner_id": "00000000-0000-0000-0000-000000000000",
+        "read_only": false,
+        "seq": 5,
+        "source_doc_id": null,
+        "title": "t",
+        "updated_at": "2026-01-01T00:00:00.000000Z"
+      },
+      "status": "ok"
+    }
+  ],
+  "subscription_forbidden_reply": [
+    "1",
+    "2",
+    "sync:v2",
+    "phx_reply",
+    {
+      "response": {
+        "code": "subscription_forbidden",
+        "is_fatal": false,
+        "scope": "collection:nope"
+      },
+      "status": "error"
+    }
+  ],
+  "cursor_too_old_reply": [
+    "1",
+    "2",
+    "sync:v2",
+    "phx_reply",
+    {
+      "response": {
+        "code": "cursor_too_old",
+        "is_fatal": false,
+        "scope": "own"
+      },
+      "status": "error"
+    }
+  ],
+  "change_push": [
+    "1",
+    null,
+    "sync:v2",
+    "change",
+    {
+      "client_id": "00000000-0000-0000-0000-000000000000",
+      "doc": {
+        "author_id": null,
+        "content": {
+          "title": "Wire"
+        },
+        "created_at": "2026-01-01T00:00:00.000000Z",
+        "derived_from": null,
+        "doc_id": "00000000-0000-0000-0000-000000000000",
+        "hash": "8064ca1f4788d8c96d8e65d48b6a91e6ba8c594c6b6394fdd48752b3eea1ce11",
+        "owner_id": "00000000-0000-0000-0000-000000000000",
+        "read_only": false,
+        "seq": 3,
+        "source_doc_id": null,
+        "title": "Wire",
+        "updated_at": "2026-01-01T00:00:00.000000Z"
+      },
+      "doc_id": "00000000-0000-0000-0000-000000000000",
+      "kind": "upsert",
+      "prev_seq": 1,
+      "scope": "own",
+      "seq": 3,
+      "upload_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "too_large_reply": [
+    "1",
+    "2",
+    "sync:v2",
+    "phx_reply",
+    {
+      "response": {
+        "code": "too_large",
+        "doc_id": "00000000-0000-0000-0000-000000000000",
+        "is_fatal": false
+      },
+      "status": "error"
+    }
+  ],
+  "socket_connect_params": {
+    "client_id": "00000000-0000-0000-0000-000000000000",
+    "protocol_version": "2"
+  },
+  "validation_reply": [
+    "1",
+    "2",
+    "sync:v2",
+    "phx_reply",
+    {
+      "response": {
+        "code": "validation",
+        "is_fatal": false
+      },
+      "status": "error"
+    }
+  ],
+  "unpublish_reply": [
+    "1",
+    "2",
+    "sync:v2",
+    "phx_reply",
+    {
+      "response": {
+        "author_id": "00000000-0000-0000-0000-000000000000",
+        "content": {
+          "title": "Source"
+        },
+        "created_at": "2026-01-01T00:00:00.000000Z",
+        "derived_from": null,
+        "doc_id": "00000000-0000-0000-0000-000000000000",
+        "hash": "c26b4137750a2673dede40fdfd820e3c810f5148a3aceeab3f27dd688cd05feb",
+        "owner_id": null,
+        "read_only": true,
+        "seq": 8,
+        "source_doc_id": "00000000-0000-0000-0000-000000000000",
+        "title": "Source",
+        "updated_at": "2026-01-01T00:00:00.000000Z"
+      },
+      "status": "ok"
+    }
+  ],
+  "changes_reply_populated": [
+    "1",
+    "2",
+    "sync:v2",
+    "phx_reply",
+    {
+      "response": {
+        "changes": [
+          {
+            "client_id": "00000000-0000-0000-0000-000000000000",
+            "doc": null,
+            "doc_id": "00000000-0000-0000-0000-000000000000",
+            "kind": "delete",
+            "prev_seq": 3,
+            "scope": "own",
+            "seq": 4,
+            "upload_id": "00000000-0000-0000-0000-000000000000"
+          }
+        ],
+        "has_more": false,
+        "next_cursor": 4
+      },
+      "status": "ok"
+    }
+  ],
+  "document_reply": [
+    "1",
+    "2",
+    "sync:v2",
+    "phx_reply",
+    {
+      "response": {
+        "author_id": null,
+        "content": {
+          "title": "Wire"
+        },
+        "created_at": "2026-01-01T00:00:00.000000Z",
+        "derived_from": null,
+        "doc_id": "00000000-0000-0000-0000-000000000000",
+        "hash": "8064ca1f4788d8c96d8e65d48b6a91e6ba8c594c6b6394fdd48752b3eea1ce11",
+        "owner_id": "00000000-0000-0000-0000-000000000000",
+        "read_only": false,
+        "seq": 3,
+        "source_doc_id": null,
+        "title": "Wire",
+        "updated_at": "2026-01-01T00:00:00.000000Z"
+      },
+      "status": "ok"
+    }
+  ],
+  "snapshot_reply": [
+    "1",
+    "2",
+    "sync:v2",
+    "phx_reply",
+    {
+      "response": {
+        "docs": [
+          {
+            "author_id": null,
+            "content": {
+              "title": "Wire"
+            },
+            "created_at": "2026-01-01T00:00:00.000000Z",
+            "derived_from": null,
+            "doc_id": "00000000-0000-0000-0000-000000000000",
+            "hash": "8064ca1f4788d8c96d8e65d48b6a91e6ba8c594c6b6394fdd48752b3eea1ce11",
+            "owner_id": "00000000-0000-0000-0000-000000000000",
+            "read_only": false,
+            "seq": 3,
+            "source_doc_id": null,
+            "title": "Wire",
+            "updated_at": "2026-01-01T00:00:00.000000Z"
+          }
+        ],
+        "next_page_token": null,
+        "snapshot_seq": 3
+      },
+      "status": "ok"
+    }
+  ],
+  "publish_update_reply": [
+    "1",
+    "2",
+    "sync:v2",
+    "phx_reply",
+    {
+      "response": {
+        "author_id": "00000000-0000-0000-0000-000000000000",
+        "content": {
+          "title": "Source"
+        },
+        "created_at": "2026-01-01T00:00:00.000000Z",
+        "derived_from": null,
+        "doc_id": "00000000-0000-0000-0000-000000000000",
+        "hash": "c26b4137750a2673dede40fdfd820e3c810f5148a3aceeab3f27dd688cd05feb",
+        "owner_id": null,
+        "read_only": true,
+        "seq": 7,
+        "source_doc_id": "00000000-0000-0000-0000-000000000000",
+        "title": "Source",
+        "updated_at": "2026-01-01T00:00:00.000000Z"
+      },
+      "status": "ok"
+    }
+  ],
+  "upload_update_request": [
+    "1",
+    "2",
+    "sync:v2",
+    "upload",
+    {
+      "base_hash": "755185a61fa7ed1f9260bdb2b5f819ce9ff06e52870c546f9258da27f7a6ffe4",
+      "doc_id": "00000000-0000-0000-0000-000000000000",
+      "kind": "update",
+      "payload": [
+        {
+          "op": "replace",
+          "path": "/title",
+          "value": "t2"
+        }
+      ],
+      "upload_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "socket_refusal": {
+    "code": "update_required",
+    "is_fatal": true
+  },
+  "join_request": [
+    "1",
+    "1",
+    "sync:v2",
+    "phx_join",
+    {
+      "api_key": "<api_key>",
+      "email": "wire@example.com",
+      "signature": "0000000000000000000000000000000000000000000000000000000000000000",
+      "timestamp": 1767225600
+    }
+  ],
+  "hash_mismatch_reply": [
+    "1",
+    "2",
+    "sync:v2",
+    "phx_reply",
+    {
+      "response": {
+        "code": "hash_mismatch",
+        "current_hash": "8064ca1f4788d8c96d8e65d48b6a91e6ba8c594c6b6394fdd48752b3eea1ce11",
+        "current_seq": 3,
+        "doc_id": "00000000-0000-0000-0000-000000000000",
+        "is_fatal": false
+      },
+      "status": "error"
+    }
+  ],
+  "snapshot_request": [
+    "1",
+    "2",
+    "sync:v2",
+    "get_snapshot",
+    {
+      "scope": "own"
+    }
+  ],
+  "deleted_reply": [
+    "1",
+    "2",
+    "sync:v2",
+    "phx_reply",
+    {
+      "response": {
+        "code": "deleted",
+        "current_seq": 4,
+        "doc_id": "00000000-0000-0000-0000-000000000000",
+        "is_fatal": false
+      },
+      "status": "error"
+    }
+  ],
+  "join_reply": [
+    "1",
+    "1",
+    "sync:v2",
+    "phx_reply",
+    {
+      "response": {
+        "protocol_version": 2,
+        "user_id": "00000000-0000-0000-0000-000000000000"
+      },
+      "status": "ok"
+    }
+  ],
+  "upload_reply": [
+    "1",
+    "2",
+    "sync:v2",
+    "phx_reply",
+    {
+      "response": {
+        "author_id": null,
+        "content": {
+          "title": "Wire"
+        },
+        "created_at": "2026-01-01T00:00:00.000000Z",
+        "derived_from": null,
+        "doc_id": "00000000-0000-0000-0000-000000000000",
+        "hash": "8064ca1f4788d8c96d8e65d48b6a91e6ba8c594c6b6394fdd48752b3eea1ce11",
+        "owner_id": "00000000-0000-0000-0000-000000000000",
+        "read_only": false,
+        "seq": 3,
+        "source_doc_id": null,
+        "title": "Wire",
+        "updated_at": "2026-01-01T00:00:00.000000Z"
+      },
+      "status": "ok"
+    }
+  ],
+  "upload_create_request": [
+    "1",
+    "2",
+    "sync:v2",
+    "upload",
+    {
+      "doc_id": "00000000-0000-0000-0000-000000000000",
+      "kind": "create",
+      "payload": {
+        "title": "Wire"
+      },
+      "upload_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "join_error_reply": [
+    "1",
+    "1",
+    "sync:v2",
+    "phx_reply",
+    {
+      "response": {
+        "code": "auth_invalid",
+        "is_fatal": true
+      },
+      "status": "error"
+    }
+  ],
+  "exists_reply": [
+    "1",
+    "2",
+    "sync:v2",
+    "phx_reply",
+    {
+      "response": {
+        "code": "exists",
+        "doc_id": "00000000-0000-0000-0000-000000000000",
+        "existing_owner": "00000000-0000-0000-0000-000000000000",
+        "is_fatal": false
+      },
+      "status": "error"
+    }
+  ],
+  "unpublish_request": [
+    "1",
+    "2",
+    "sync:v2",
+    "unpublish",
+    {
+      "publication_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "changes_reply": [
+    "1",
+    "2",
+    "sync:v2",
+    "phx_reply",
+    {
+      "response": {
+        "changes": [],
+        "has_more": false,
+        "next_cursor": 2
+      },
+      "status": "ok"
+    }
+  ],
+  "change_push_delete": [
+    "1",
+    null,
+    "sync:v2",
+    "change",
+    {
+      "client_id": "00000000-0000-0000-0000-000000000000",
+      "doc": null,
+      "doc_id": "00000000-0000-0000-0000-000000000000",
+      "kind": "delete",
+      "prev_seq": 3,
+      "scope": "own",
+      "seq": 4,
+      "upload_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "publish_update_request": [
+    "1",
+    "2",
+    "sync:v2",
+    "publish_update",
+    {
+      "publication_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "changes_request": [
+    "1",
+    "2",
+    "sync:v2",
+    "get_changes_since",
+    {
+      "cursor": 0,
+      "limit": 500,
+      "scope": "own"
+    }
+  ],
+  "float_document_reply": [
+    "1",
+    "2",
+    "sync:v2",
+    "phx_reply",
+    {
+      "response": {
+        "author_id": null,
+        "content": {
+          "cents": 1200,
+          "title": "t"
+        },
+        "created_at": "2026-01-01T00:00:00.000000Z",
+        "derived_from": null,
+        "doc_id": "00000000-0000-0000-0000-000000000000",
+        "hash": "755185a61fa7ed1f9260bdb2b5f819ce9ff06e52870c546f9258da27f7a6ffe4",
+        "owner_id": "00000000-0000-0000-0000-000000000000",
+        "read_only": false,
+        "seq": 5,
+        "source_doc_id": null,
+        "title": "t",
+        "updated_at": "2026-01-01T00:00:00.000000Z"
+      },
+      "status": "ok"
+    }
+  ],
+  "document_request": [
+    "1",
+    "2",
+    "sync:v2",
+    "get_document",
+    {
+      "doc_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "upload_delete_request": [
+    "1",
+    "2",
+    "sync:v2",
+    "upload",
+    {
+      "doc_id": "00000000-0000-0000-0000-000000000000",
+      "kind": "delete",
+      "payload": null,
+      "upload_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ],
+  "publish_reply": [
+    "1",
+    "2",
+    "sync:v2",
+    "phx_reply",
+    {
+      "response": {
+        "author_id": "00000000-0000-0000-0000-000000000000",
+        "content": {
+          "title": "Source"
+        },
+        "created_at": "2026-01-01T00:00:00.000000Z",
+        "derived_from": null,
+        "doc_id": "00000000-0000-0000-0000-000000000000",
+        "hash": "c26b4137750a2673dede40fdfd820e3c810f5148a3aceeab3f27dd688cd05feb",
+        "owner_id": null,
+        "read_only": true,
+        "seq": 6,
+        "source_doc_id": "00000000-0000-0000-0000-000000000000",
+        "title": "Source",
+        "updated_at": "2026-01-01T00:00:00.000000Z"
+      },
+      "status": "ok"
+    }
+  ]
+}
