@@ -194,6 +194,18 @@ pub(crate) async fn apply_ops(
                 .execute(&mut *conn)
                 .await?;
             }
+            DocOp::RecoverFields { content, fields } => {
+                sqlx::query(
+                    "INSERT INTO recovered (doc_id, content, reason, recovered_at, fields) \
+                     VALUES (?, ?, 'field_conflict', ?, ?)",
+                )
+                .bind(&id)
+                .bind(content.to_string())
+                .bind(now_unix())
+                .bind(serde_json::to_string(fields)?)
+                .execute(&mut *conn)
+                .await?;
+            }
             DocOp::Emit(event) => notices.push(DocNotice {
                 doc_id: snap.doc_id,
                 event: event.clone(),

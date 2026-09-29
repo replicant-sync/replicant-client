@@ -1,3 +1,5 @@
+use json_patch::{AddOperation, PatchOperation};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -67,7 +69,13 @@ pub enum RecoverReason {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DocEvent {
     ConflictDetected,
-    SyncError { code: String },
+    /// Only these paths collided with another device's change; the local values are kept aside.
+    FieldConflict {
+        paths: Vec<String>,
+    },
+    SyncError {
+        code: String,
+    },
 }
 
 /// A write the driver performs inside the same transaction that loaded the snapshot.
@@ -94,6 +102,12 @@ pub enum DocOp {
     Recover {
         content: Value,
         reason: RecoverReason,
+    },
+    /// Keeps the local values at colliding paths (and the full local content) in `recovered`
+    /// with reason `field_conflict`.
+    RecoverFields {
+        content: Value,
+        fields: Vec<FieldConflict>,
     },
     Emit(DocEvent),
 }
@@ -158,7 +172,7 @@ impl DocSnapshot {
                         None => s.memberships.push(mm.clone()),
                     }
                 }
-                DocOp::Recover { .. } | DocOp::Emit(_) => {}
+                DocOp::Recover { .. } | DocOp::RecoverFields { .. } | DocOp::Emit(_) => {}
             }
         }
         s
@@ -269,20 +283,32 @@ fn apply_upsert(
         return ops;
     }
     let rebased = match &snap.shadow {
-        Some(old) if local_base_known => match rebase(&old.content, &doc.content, &snap.content) {
-            Rebased::Clean(v) => Some(v),
-            Rebased::Conflict => None,
-        },
-        _ => None,
+        Some(old) if local_base_known => rebase(&old.content, &doc.content, &snap.content),
+        _ => Rebased::Conflict,
     };
-    let Some(content) = rebased else {
-        let with_new_shadow = snap.project(&[DocOp::SetShadow(new_shadow.clone())]);
-        ops.push(DocOp::SetShadow(new_shadow));
-        ops.extend(conflict_ops(&with_new_shadow));
-        return ops;
-    };
-    ops.push(DocOp::SetShadow(new_shadow));
-    ops.push(DocOp::SetContent(content));
+    match rebased {
+        Rebased::Clean(content) => {
+            ops.push(DocOp::SetShadow(new_shadow));
+            ops.push(DocOp::SetContent(content));
+        }
+        Rebased::Fields { content, conflicts } => {
+            let paths = conflicts.iter().map(|c| c.path.clone()).collect();
+            ops.push(DocOp::RecoverFields {
+                content: snap.content.clone(),
+                fields: conflicts,
+            });
+            ops.push(DocOp::SetShadow(new_shadow));
+            // Rows stay: they still describe the non-colliding local edits (an empty diff
+            // settles them at the next build) and keep any sent marks.
+            ops.push(DocOp::SetContent(content));
+            ops.push(DocOp::Emit(DocEvent::FieldConflict { paths }));
+        }
+        Rebased::Conflict => {
+            let with_new_shadow = snap.project(&[DocOp::SetShadow(new_shadow.clone())]);
+            ops.push(DocOp::SetShadow(new_shadow));
+            ops.extend(conflict_ops(&with_new_shadow));
+        }
+    }
     ops
 }
 
@@ -469,19 +495,145 @@ pub fn apply_snapshot_doc(
     with_settle_invariant(snap, ops, me)
 }
 
+/// A path both sides changed to different values: the server's value is kept, this is the
+/// local side's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldConflict {
+    /// JSON Pointer.
+    pub path: String,
+    /// `Null` when `local_removed`.
+    pub local_value: Value,
+    pub local_removed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Rebased {
     Clean(Value),
+    /// Every local change applied except those at `conflicts`, where the server's value stays.
+    Fields {
+        content: Value,
+        conflicts: Vec<FieldConflict>,
+    },
+    /// No sound merge: the whole document collided, or the kept local changes do not apply.
     Conflict,
 }
 
-/// Replays the local change (`old_base` → `local`) onto `new_base`.
+/// Replays the local change (`old_base` → `local`) onto `new_base` field by field. A local
+/// operation collides with a server one when their paths are equal or one contains the other
+/// and the two sides end with different values there; the collision is recorded at the shorter
+/// path. `json_patch::diff` compares arrays position by position, so an element path is a field
+/// like any other; local appends never collide and are re-appended after the server's.
 pub fn rebase(old_base: &Value, new_base: &Value, local: &Value) -> Rebased {
-    let local_patch = json_patch::diff(old_base, local);
+    let local_ops = json_patch::diff(old_base, local).0;
+    let their_paths: Vec<String> = json_patch::diff(old_base, new_base)
+        .0
+        .iter()
+        .map(|op| op_path(op).to_string())
+        .collect();
+    let mut contested: Vec<String> = Vec::new();
+    for op in local_ops.iter().filter(|op| !is_append(old_base, op)) {
+        let path = op_path(op);
+        let shortest = their_paths
+            .iter()
+            .filter(|theirs| contains(theirs, path) || contains(path, theirs))
+            .map(|theirs| {
+                if theirs.len() < path.len() {
+                    theirs.as_str()
+                } else {
+                    path
+                }
+            })
+            .min_by_key(|p| p.len());
+        if let Some(p) = shortest {
+            if !contested.iter().any(|c| c == p) {
+                contested.push(p.to_string());
+            }
+        }
+    }
+    let outermost: Vec<String> = contested
+        .iter()
+        .filter(|p| !contested.iter().any(|q| q != *p && contains(q, p)))
+        .cloned()
+        .collect();
+    if outermost.iter().any(|p| p.is_empty()) {
+        return Rebased::Conflict;
+    }
+    let conflicts: Vec<FieldConflict> = outermost
+        .iter()
+        .filter(|p| local.pointer(p) != new_base.pointer(p))
+        .map(|p| FieldConflict {
+            path: p.clone(),
+            local_value: local.pointer(p).cloned().unwrap_or(Value::Null),
+            local_removed: local.pointer(p).is_none(),
+        })
+        .collect();
+    let mut kept = Vec::new();
+    let mut appends = Vec::new();
+    for op in local_ops {
+        if is_append(old_base, &op) {
+            appends.push(to_end(op));
+        } else if !outermost.iter().any(|p| contains(p, op_path(&op))) {
+            kept.push(op);
+        }
+    }
+    kept.extend(appends);
     let mut out = new_base.clone();
-    match json_patch::patch(&mut out, &local_patch) {
-        Ok(()) => Rebased::Clean(out),
-        Err(_) => Rebased::Conflict,
+    if json_patch::patch(&mut out, &kept).is_err() {
+        return Rebased::Conflict;
+    }
+    if conflicts.is_empty() {
+        Rebased::Clean(out)
+    } else {
+        Rebased::Fields {
+            content: out,
+            conflicts,
+        }
+    }
+}
+
+fn op_path(op: &PatchOperation) -> &str {
+    match op {
+        PatchOperation::Add(op) => &op.path,
+        PatchOperation::Remove(op) => &op.path,
+        PatchOperation::Replace(op) => &op.path,
+        PatchOperation::Move(op) => &op.path,
+        PatchOperation::Copy(op) => &op.path,
+        PatchOperation::Test(op) => &op.path,
+    }
+}
+
+/// `path` is `ancestor` or lies under it ("" contains every path).
+fn contains(ancestor: &str, path: &str) -> bool {
+    path == ancestor
+        || (path.len() > ancestor.len()
+            && path.starts_with(ancestor)
+            && path.as_bytes()[ancestor.len()] == b'/')
+}
+
+/// An `add` at or past the end of an array the old base already had.
+fn is_append(old_base: &Value, op: &PatchOperation) -> bool {
+    let PatchOperation::Add(add) = op else {
+        return false;
+    };
+    let Some((parent, index)) = add.path.rsplit_once('/') else {
+        return false;
+    };
+    match (old_base.pointer(parent), index.parse::<usize>()) {
+        (Some(Value::Array(items)), Ok(index)) => index >= items.len(),
+        _ => false,
+    }
+}
+
+fn to_end(op: PatchOperation) -> PatchOperation {
+    match op {
+        PatchOperation::Add(add) => {
+            let parent = add.path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            PatchOperation::Add(AddOperation {
+                path: format!("{parent}/-"),
+                value: add.value,
+            })
+        }
+        other => other,
     }
 }
 
@@ -786,19 +938,45 @@ mod apply_change_tests {
     }
 
     #[test]
-    fn rebase_conflict_recovers_local_and_takes_server() {
+    fn rebase_field_conflict_keeps_the_local_value_aside_and_takes_the_server_value() {
         let mut s = synced(json!({"a": {"x": 1}}), 1);
         s.content = json!({"a": {"x": 2}});
         s.rows = vec![row(5, RowKind::Update)];
         let ops = apply_change(&s, &upsert("own", json!({}), 2), ME);
-        assert!(ops.contains(&DocOp::Recover {
+        assert!(ops.contains(&DocOp::RecoverFields {
             content: json!({"a": {"x": 2}}),
-            reason: RecoverReason::Conflict
+            fields: vec![FieldConflict {
+                path: "/a".into(),
+                local_value: json!({"x": 2}),
+                local_removed: false
+            }]
         }));
-        assert!(ops.contains(&DocOp::Emit(DocEvent::ConflictDetected)));
+        assert!(ops.contains(&DocOp::Emit(DocEvent::FieldConflict {
+            paths: vec!["/a".into()]
+        })));
+        assert!(!ops.iter().any(|op| matches!(op, DocOp::Recover { .. })));
         let after = s.project(&ops);
         assert_eq!(after.content, json!({}));
-        assert!(after.rows.is_empty());
+        assert_eq!(
+            after.rows.len(),
+            1,
+            "rows stay; the next build settles an empty diff"
+        );
+    }
+
+    #[test]
+    fn field_conflict_keeps_non_colliding_local_edits_pending() {
+        let mut s = synced(json!({"s": "old", "k": 1}), 1);
+        s.content = json!({"s": "mine", "k": 2});
+        s.rows = vec![row(5, RowKind::Update)];
+        let ops = apply_change(&s, &upsert("own", json!({"s": "theirs", "k": 1}), 2), ME);
+        let after = s.project(&ops);
+        assert_eq!(after.content, json!({"s": "theirs", "k": 2}));
+        assert_eq!(
+            after.shadow.unwrap().content,
+            json!({"s": "theirs", "k": 1})
+        );
+        assert_eq!(after.rows.len(), 1);
     }
 
     #[test]
@@ -957,6 +1135,27 @@ mod apply_change_tests {
         let after = s.project(&ops);
         assert_eq!(after.content, json!({"items": ["a", "x"]}));
         assert!(after.rows.is_empty());
+    }
+
+    #[test]
+    fn server_copy_field_conflict_with_a_sent_unacked_upload_keeps_rows_and_the_mark() {
+        let mut s = synced(json!({"s": "old", "k": 1}), 1);
+        s.content = json!({"s": "mine", "k": 2});
+        s.rows = vec![row(5, RowKind::Update)];
+        s.unacked_upload = Some(m(5));
+        let ops = apply_server_copy(&s, &env(json!({"s": "theirs", "k": 1}), 2), ME);
+        assert!(ops.contains(&DocOp::RecoverFields {
+            content: json!({"s": "mine", "k": 2}),
+            fields: vec![FieldConflict {
+                path: "/s".into(),
+                local_value: json!("mine"),
+                local_removed: false
+            }]
+        }));
+        let after = s.project(&ops);
+        assert_eq!(after.content, json!({"s": "theirs", "k": 2}));
+        assert_eq!(after.rows.len(), 1);
+        assert_eq!(after.unacked_upload, Some(m(5)));
     }
 
     #[test]
@@ -1302,10 +1501,128 @@ mod rebase_tests {
         assert_eq!(r, Rebased::Clean(json!({"a": 2})));
     }
 
+    fn kept(path: &str, local_value: Value) -> FieldConflict {
+        FieldConflict {
+            path: path.into(),
+            local_value,
+            local_removed: false,
+        }
+    }
+
     #[test]
-    fn edit_under_removed_parent_conflicts() {
-        let r = rebase(&json!({"a": {"x": 1}}), &json!({}), &json!({"a": {"x": 2}}));
-        assert_eq!(r, Rebased::Conflict);
+    fn edit_under_removed_parent_is_a_field_conflict() {
+        let r = rebase(
+            &json!({"a": {"x": 1}, "k": 1}),
+            &json!({"k": 1}),
+            &json!({"a": {"x": 2}, "k": 2}),
+        );
+        assert_eq!(
+            r,
+            Rebased::Fields {
+                content: json!({"k": 2}),
+                conflicts: vec![kept("/a", json!({"x": 2}))]
+            }
+        );
+    }
+
+    #[test]
+    fn same_field_set_on_both_sides_is_a_field_conflict() {
+        let r = rebase(
+            &json!({"s": "old", "k": 1}),
+            &json!({"s": "theirs", "k": 1}),
+            &json!({"s": "mine", "k": 2}),
+        );
+        assert_eq!(
+            r,
+            Rebased::Fields {
+                content: json!({"s": "theirs", "k": 2}),
+                conflicts: vec![kept("/s", json!("mine"))]
+            }
+        );
+    }
+
+    #[test]
+    fn same_value_on_both_sides_is_not_a_conflict() {
+        let r = rebase(&json!({"s": "old"}), &json!({"s": "x"}), &json!({"s": "x"}));
+        assert_eq!(r, Rebased::Clean(json!({"s": "x"})));
+    }
+
+    #[test]
+    fn local_remove_against_a_server_set_is_a_field_conflict() {
+        let r = rebase(
+            &json!({"s": "old", "k": 1}),
+            &json!({"s": "theirs", "k": 1}),
+            &json!({"k": 1}),
+        );
+        assert_eq!(
+            r,
+            Rebased::Fields {
+                content: json!({"s": "theirs", "k": 1}),
+                conflicts: vec![FieldConflict {
+                    path: "/s".into(),
+                    local_value: Value::Null,
+                    local_removed: true
+                }]
+            }
+        );
+    }
+
+    #[test]
+    fn an_ancestor_and_a_descendant_change_collide_at_the_ancestor() {
+        let r = rebase(
+            &json!({"a": {"x": 1, "y": 1}}),
+            &json!({"a": {"x": 2, "y": 1}}),
+            &json!({"a": "flat"}),
+        );
+        assert_eq!(
+            r,
+            Rebased::Fields {
+                content: json!({"a": {"x": 2, "y": 1}}),
+                conflicts: vec![kept("/a", json!("flat"))]
+            }
+        );
+    }
+
+    #[test]
+    fn appends_to_one_array_from_both_sides_merge() {
+        let r = rebase(
+            &json!({"items": ["a"]}),
+            &json!({"items": ["a", "t"]}),
+            &json!({"items": ["a", "m1", "m2"]}),
+        );
+        assert_eq!(r, Rebased::Clean(json!({"items": ["a", "t", "m1", "m2"]})));
+    }
+
+    #[test]
+    fn the_same_array_element_changed_on_both_sides_is_a_field_conflict() {
+        let r = rebase(
+            &json!({"items": ["a", "b", "c"]}),
+            &json!({"items": ["a", "B", "c"]}),
+            &json!({"items": ["a", "b2", "C"]}),
+        );
+        assert_eq!(
+            r,
+            Rebased::Fields {
+                content: json!({"items": ["a", "B", "C"]}),
+                conflicts: vec![kept("/items/1", json!("b2"))]
+            }
+        );
+    }
+
+    #[test]
+    fn array_diffs_are_positional() {
+        // The collision rule treats array element paths as fields; that is only sound while
+        // json_patch::diff compares arrays position by position.
+        let patch = json_patch::diff(&json!(["a", "b", "c"]), &json!(["b", "c", "d", "e"]));
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap(),
+            json!([
+                {"op": "replace", "path": "/0", "value": "b"},
+                {"op": "replace", "path": "/1", "value": "c"},
+                {"op": "replace", "path": "/2", "value": "d"},
+                {"op": "add", "path": "/3", "value": "e"}
+            ])
+        );
     }
 }
 
@@ -1353,6 +1670,7 @@ mod property_tests {
         local_deletes_settled: u32,
         equal_content_adopts: u32,
         never_sent_rebases: u32,
+        field_conflicts: u32,
     }
 
     impl Hits {
@@ -1366,6 +1684,7 @@ mod property_tests {
             self.local_deletes_settled += other.local_deletes_settled;
             self.equal_content_adopts += other.equal_content_adopts;
             self.never_sent_rebases += other.never_sent_rebases;
+            self.field_conflicts += other.field_conflicts;
         }
     }
 
@@ -1420,8 +1739,8 @@ mod property_tests {
             seq
         }
 
-        /// Bumps `theirs` and sets or removes `shared`: a removed key makes a local replace of
-        /// it fail to rebase (`Rebased::Conflict`). `order` is the counter every write to
+        /// Bumps `theirs` and sets or removes `shared`: setting or removing it collides with a
+        /// concurrent local write (a field conflict). `order` is the counter every write to
         /// `shared`, from either side, advances (see `Client::edit`).
         fn other_device_edit(&mut self, rng: &mut Jitter, order: &mut u64) {
             if self.deleted || self.other_edits == MAX_OTHER_EDITS {
@@ -1520,6 +1839,10 @@ mod property_tests {
         /// captured in `build`, at upload time, not from `snap.content` on the reply — content
         /// can have moved on by then, which would pair a stale seq with fresher content.
         landed_shared: Option<(Seq, String)>,
+        /// Every field kept aside by a `RecoverFields`, across the whole run.
+        field_recovered: Vec<FieldConflict>,
+        /// (seq, value) of `shared` in every local upload that landed and touched it.
+        landed_shared_writes: Vec<(Seq, String)>,
     }
 
     impl Client {
@@ -1539,6 +1862,8 @@ mod property_tests {
                 hits: Hits::default(),
                 local_shared_writes: Vec::new(),
                 landed_shared: None,
+                field_recovered: Vec::new(),
+                landed_shared_writes: Vec::new(),
             }
         }
 
@@ -1580,6 +1905,9 @@ mod property_tests {
                             self.hits.delete_wins += 1;
                         }
                         self.recovered.push(content.clone());
+                    }
+                    DocOp::RecoverFields { fields, .. } => {
+                        self.field_recovered.extend(fields.iter().cloned());
                     }
                     other => self.snap = self.snap.project(std::slice::from_ref(other)),
                 }
@@ -1635,7 +1963,7 @@ mod property_tests {
             ops: &[DocOp],
             via_server_copy: bool,
         ) {
-            let conflicted = ops.iter().any(|op| {
+            let whole_conflicted = ops.iter().any(|op| {
                 matches!(
                     op,
                     DocOp::Recover {
@@ -1644,11 +1972,17 @@ mod property_tests {
                     }
                 )
             });
-            if rebase_possible && conflicted {
+            let field_conflicted = ops
+                .iter()
+                .any(|op| matches!(op, DocOp::RecoverFields { .. }));
+            if rebase_possible && (whole_conflicted || field_conflicted) {
                 if via_server_copy {
                     self.hits.rebase_conflicts_server_copy += 1;
                 } else {
                     self.hits.rebase_conflicts_delivery += 1;
+                }
+                if field_conflicted {
+                    self.hits.field_conflicts += 1;
                 }
             }
         }
@@ -1732,8 +2066,9 @@ mod property_tests {
                 && committed.seq > before_server_seq
             {
                 if let (Some(shadow_content), Some(doc)) = (&old_shadow_content, &doc) {
-                    assert_shared_replace_conflicts(
+                    assert_shared_collision_kept_aside(
                         "deliver",
+                        self,
                         shadow_content,
                         &local_content_before,
                         &doc.content,
@@ -1800,7 +2135,7 @@ mod property_tests {
                     && self.snap.shadow.as_ref().is_some_and(|shadow| {
                         matches!(
                             rebase(&shadow.content, &doc.content, &self.snap.content),
-                            Rebased::Clean(_)
+                            Rebased::Clean(_) | Rebased::Fields { .. }
                         )
                     });
                 let pre_content = self.snap.content.clone();
@@ -1862,7 +2197,8 @@ mod property_tests {
                     .map(str::to_string);
                     let reply = server.upload(&upload);
                     if let (Some(value), Ok(envelope)) = (shared_at_build, &reply) {
-                        self.landed_shared = Some((envelope.seq, value));
+                        self.landed_shared = Some((envelope.seq, value.clone()));
+                        self.landed_shared_writes.push((envelope.seq, value));
                     }
                     self.in_flight = Some((inflight, reply));
                 }
@@ -1909,8 +2245,9 @@ mod property_tests {
                     self.count_rebase_conflict(rebase_possible, &ops, true);
                     if rebase_possible && !pending_delete_before && doc.seq > before_server_seq {
                         if let Some(shadow_content) = &old_shadow_content {
-                            assert_shared_replace_conflicts(
+                            assert_shared_collision_kept_aside(
                                 "server copy",
+                                self,
                                 shadow_content,
                                 &local_content_before,
                                 &doc.content,
@@ -1998,37 +2335,40 @@ mod property_tests {
         );
     }
 
-    /// A local pending edit to `shared` is a *replace*-type diff once the old shadow already had
-    /// a value there (not adding it fresh) — `rebase`'s "an add always cleanly reapplies"
-    /// leniency does not cover that case: `json_patch`'s replace requires the path to still hold
-    /// what it started from, so if the incoming envelope also changed `shared`, both sides
-    /// touched the same existing value and this must conflict. Checked immediately, at the exact
-    /// rebase attempt, rather than by eventual outcome: a pending row a client bug wrongly keeps
-    /// un-conflicted can still "win" much later through the outbox's ordinary retry once the
-    /// shadow updates, which comparing only the seed's final content cannot tell apart from a
-    /// legitimate concurrent edit that raced and won on a matching hash.
-    fn assert_shared_replace_conflicts(
+    /// At a rebase where both sides changed `shared` from the old shadow to different values,
+    /// the server's value must be the result and the local one kept aside: in a
+    /// `field_conflict` entry naming `/shared`, or in a whole-document `Recover`.
+    fn assert_shared_collision_kept_aside(
         what: &str,
+        client: &Client,
         old_shadow: &Value,
         local_before: &Value,
         incoming: &Value,
         ops: &[DocOp],
     ) {
-        let Some(old) = old_shadow.get("shared").and_then(Value::as_str) else {
-            return; // an add-type diff: rebase legitimately always applies it cleanly
-        };
-        let mine = local_before.get("shared").and_then(Value::as_str);
-        let theirs = incoming.get("shared").and_then(Value::as_str);
-        // `json_patch::patch`'s replace succeeds against any existing value at the path,
-        // whatever it is — a same-key SET-vs-SET is never a conflict, only ever the local
-        // client's own value cleanly winning. It fails only when the path is gone entirely, so a
-        // replace-type local diff conflicts only when the incoming envelope removed the key.
-        if mine != Some(old) && theirs.is_none() {
-            let recovered_now = ops.iter().any(|op| matches!(op, DocOp::Recover { .. }));
-            assert!(
-                recovered_now,
-                "{what}: a replace-type shared conflict (old={old:?} mine={mine:?} \
-                 theirs={theirs:?}) was not recovered"
+        let old = old_shadow.get("shared");
+        let mine = local_before.get("shared");
+        let theirs = incoming.get("shared");
+        if mine == old || theirs == old || mine == theirs {
+            return;
+        }
+        let whole = ops.iter().any(|op| matches!(op, DocOp::Recover { .. }));
+        let field = ops.iter().any(|op| {
+            matches!(op, DocOp::RecoverFields { fields, .. } if fields.iter().any(|f| {
+                f.path == "/shared"
+                    && f.local_removed == mine.is_none()
+                    && (f.local_removed || Some(&f.local_value) == mine)
+            }))
+        });
+        assert!(
+            whole || field,
+            "{what}: colliding shared (mine={mine:?} theirs={theirs:?}) was not kept aside"
+        );
+        if field {
+            assert_eq!(
+                client.snap.project(ops).content.get("shared"),
+                theirs,
+                "{what}: a colliding shared must take the server's value"
             );
         }
     }
@@ -2038,17 +2378,9 @@ mod property_tests {
     /// "did it actually win a race" — because they answer different questions and neither
     /// substitutes for the other:
     ///
-    /// 1. Every *intended* local write (`local_shared_writes`, recorded the moment `edit` makes
-    ///    it, whether or not it ever reaches an upload) must end up either as the final server
-    ///    content, in `recovered` (the rebase that dropped it recorded the pre-drop content), or
-    ///    superseded by a *later write from either side* — "later" by `order`, the counter both
-    ///    `Client::edit` and `Server::other_device_edit` advance the moment they write. A later
-    ///    write on either side legitimately supersedes an earlier local one: another local edit
-    ///    overwriting its own unbuilt draft is exactly as final as another device's edit winning
-    ///    a conflict (seed 7: "mine1" lands, then "mine4" is overwritten in memory by the
-    ///    client's own next edit "mine5" before either is ever uploaded — "mine4" needing no
-    ///    Recover of its own is correct, not a loss). Call order is right here because the
-    ///    question is only "is this value accounted for somewhere", never "who should have won".
+    /// 1. Every intended local write must be the final server value, kept aside (a
+    ///    `field_conflict` entry for `/shared` or a whole-document copy), superseded by a later
+    ///    local write, or overwritten by another device *after* it landed (commit order).
     ///
     /// 2. The latest other-device write must be the final content unless a *local write that
     ///    actually landed* (`landed_shared`, only set once a build's upload lands, with the
@@ -2064,25 +2396,38 @@ mod property_tests {
     fn check_shared_key_preserved(seed: u64, client: &Client, server: &Server) {
         let final_shared = server.current().get("shared").and_then(Value::as_str);
         for (order, value) in &client.local_shared_writes {
-            let superseded_by_other = server
-                .other_shared_writes
-                .iter()
-                .any(|(other_order, _, _)| other_order > order);
             let superseded_by_later_local = client
                 .local_shared_writes
                 .iter()
                 .any(|(local_order, _)| local_order > order);
-            if superseded_by_other || superseded_by_later_local {
+            if superseded_by_later_local {
                 continue;
             }
-            let recovered = client
+            let overwritten_after_landing = client
+                .landed_shared_writes
+                .iter()
+                .filter(|(_, landed)| landed == value)
+                .any(|(landed_seq, _)| {
+                    server
+                        .other_shared_writes
+                        .iter()
+                        .any(|(_, other_seq, _)| other_seq > landed_seq)
+                });
+            let field_kept = client
+                .field_recovered
+                .iter()
+                .any(|f| f.path == "/shared" && !f.local_removed && f.local_value == json!(value));
+            let whole_kept = client
                 .recovered
                 .iter()
                 .any(|c| c.get("shared").and_then(Value::as_str) == Some(value.as_str()));
             assert!(
-                final_shared == Some(value.as_str()) || recovered,
-                "seed {seed}: local shared {value:?} (order {order}) lost without a Recover \
-                 (final={final_shared:?})"
+                final_shared == Some(value.as_str())
+                    || field_kept
+                    || whole_kept
+                    || overwritten_after_landing,
+                "seed {seed}: local shared {value:?} (order {order}) neither final nor kept \
+                 aside (final={final_shared:?})"
             );
         }
         if let Some((_, other_seq, other_value)) = server
@@ -2258,6 +2603,7 @@ mod property_tests {
         assert!(totals.local_deletes_settled > 0, "{totals:?}");
         assert!(totals.equal_content_adopts > 0, "{totals:?}");
         assert!(totals.never_sent_rebases > 0, "{totals:?}");
+        assert!(totals.field_conflicts > 0, "{totals:?}");
     }
 }
 

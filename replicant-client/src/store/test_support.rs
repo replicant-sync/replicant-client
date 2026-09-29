@@ -165,6 +165,10 @@ pub(crate) fn upsert_change(scope: &str, doc: DocEnvelope) -> Change {
     }
 }
 
+pub(crate) async fn exec(store: &Store, sql: &str) {
+    sqlx::query(sql).execute(&store.pool).await.unwrap();
+}
+
 pub(crate) fn delete_change(scope: &str, doc_id: Uuid, seq: Seq) -> Change {
     Change {
         scope: scope.to_string(),

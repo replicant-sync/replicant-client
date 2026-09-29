@@ -40,6 +40,8 @@ pub enum StoreError {
     Corrupt(String),
     #[error("server user id must not be nil")]
     NilServerUserId,
+    #[error("no field-conflict copy with id {0}")]
+    NoFieldConflict(i64),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
