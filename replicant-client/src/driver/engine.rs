@@ -433,6 +433,8 @@ impl Owner {
                 if let Request::Upload(upload) = &request {
                     if let Err(error) = store.mark_sent(upload.doc_id, upload.upload_id).await {
                         warn!(%error, doc_id = %upload.doc_id, "could not mark an upload as sent; not sending it");
+                        // Times the request out now, so the document backs off at once.
+                        self.answer(Input::Timer(TimerId::Request(req)));
                         return None;
                     }
                 }
@@ -481,20 +483,20 @@ impl Owner {
                 Ok(()) => self.answer(Input::Applied { scope, tag }),
                 Err(error) => self.force_reconnect("finish_snapshot", &error),
             },
-            Effect::LoadPending => {
-                let docs = store.load_pending().await.unwrap_or_else(|error| {
-                    warn!(%error, "load_pending failed");
-                    Vec::new()
-                });
-                self.answer(Input::PendingDocs(docs));
-            }
+            Effect::LoadPending => match store.load_pending().await {
+                Ok(docs) => self.answer(Input::PendingDocs(docs)),
+                Err(error) => {
+                    warn!(%error, "load_pending failed; retrying");
+                    self.answer(Input::PendingLoadFailed);
+                }
+            },
             Effect::BuildUpload { doc_id } => {
                 let outcome = store
                     .build_upload(me, doc_id)
                     .await
                     .unwrap_or_else(|error| {
-                        warn!(%error, %doc_id, "build_upload failed; the rows wait for the next pump");
-                        BuildOutcome::Nothing
+                        warn!(%error, %doc_id, "build_upload failed; the document backs off");
+                        BuildOutcome::Failed
                     });
                 self.answer(Input::UploadBuilt { doc_id, outcome });
             }

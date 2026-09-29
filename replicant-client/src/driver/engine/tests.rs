@@ -556,3 +556,79 @@ async fn upload_is_marked_sent_before_it_is_sent() {
         "a held (unacknowledged) upload's rows are marked sent"
     );
 }
+
+/// A live owner with one unsent document; nothing has asked the owner to upload it yet.
+async fn live_with_unsent_doc(server: &ScriptedServer) -> (Harness, Uuid) {
+    let mut h = harness(&server.url, credentials("k1"), ME, true).await;
+    h.live().await;
+    let doc_id = h
+        .controls
+        .store
+        .create_document(ME, None, json!({"n": 1}))
+        .await
+        .unwrap();
+    (h, doc_id)
+}
+
+#[tokio::test]
+async fn failed_build_backs_the_doc_off_and_uploads_on_retry() {
+    let server = ScriptedServer::start(ME).await;
+    let (mut h, doc_id) = live_with_unsent_doc(&server).await;
+    exec(
+        &h.controls.store,
+        "ALTER TABLE tombstones RENAME TO tombstones_off",
+    )
+    .await;
+    h.owner.feed(Input::PendingDocs(vec![doc_id])).await;
+    assert!(h.owner.timers.is_scheduled(&TimerId::DocRetry(doc_id)));
+    exec(
+        &h.controls.store,
+        "ALTER TABLE tombstones_off RENAME TO tombstones",
+    )
+    .await;
+    jump(Duration::from_millis(1100)).await;
+    h.turn_until("the retried upload reaches the server", |_| {
+        server.doc(doc_id).is_some()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn failed_pending_load_retries_the_pump() {
+    let server = ScriptedServer::start(ME).await;
+    let (mut h, doc_id) = live_with_unsent_doc(&server).await;
+    exec(&h.controls.store, "ALTER TABLE outbox RENAME TO outbox_off").await;
+    h.owner.feed(Input::OutboxChanged).await;
+    // A fired pump cancels its cap; only the retry can schedule the pump again.
+    h.turn_until("the failed pump is rescheduled", |o| {
+        o.timers.is_scheduled(&TimerId::Pump) && !o.timers.is_scheduled(&TimerId::PumpCap)
+    })
+    .await;
+    exec(&h.controls.store, "ALTER TABLE outbox_off RENAME TO outbox").await;
+    jump(Duration::from_millis(1100)).await;
+    h.turn_until("the retried pump's upload reaches the server", |_| {
+        server.doc(doc_id).is_some()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn failed_mark_sent_backs_the_doc_off_at_once() {
+    let server = ScriptedServer::start(ME).await;
+    let (mut h, doc_id) = live_with_unsent_doc(&server).await;
+    exec(
+        &h.controls.store,
+        "CREATE TRIGGER refuse_mark BEFORE UPDATE OF sent_upload_id ON outbox \
+         BEGIN SELECT RAISE(ABORT, 'refused'); END",
+    )
+    .await;
+    h.owner.feed(Input::PendingDocs(vec![doc_id])).await;
+    assert!(h.owner.timers.is_scheduled(&TimerId::DocRetry(doc_id)));
+    assert!(server.uploads_for(doc_id).is_empty());
+    exec(&h.controls.store, "DROP TRIGGER refuse_mark").await;
+    jump(Duration::from_millis(1100)).await;
+    h.turn_until("the retried upload reaches the server", |_| {
+        server.doc(doc_id).is_some()
+    })
+    .await;
+}

@@ -127,10 +127,17 @@ pub enum ApplyTag {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BuildOutcome {
-    Send { upload: Upload, inflight: InFlight },
+    Send {
+        upload: Upload,
+        inflight: InFlight,
+    },
     NeedsServerCopy,
     Nothing,
-    SettledLocally { rows_remain: bool },
+    SettledLocally {
+        rows_remain: bool,
+    },
+    /// The store failed; the document backs off and is rebuilt when its retry fires.
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -184,6 +191,8 @@ pub enum Input {
         tag: ApplyTag,
     },
     PendingDocs(Vec<Uuid>),
+    /// `LoadPending` failed in the store; the pump retries after a growing delay.
+    PendingLoadFailed,
     UploadBuilt {
         doc_id: Uuid,
         outcome: BuildOutcome,
@@ -253,7 +262,7 @@ pub enum Effect {
         snapshot_seq: Seq,
         tag: ApplyTag,
     },
-    /// Answered with `Input::PendingDocs`.
+    /// Answered with `Input::PendingDocs`, or `Input::PendingLoadFailed`.
     LoadPending,
     /// Answered with `Input::UploadBuilt`.
     BuildUpload {
@@ -356,6 +365,7 @@ struct Session {
     awaiting: HashMap<Uuid, (Seq, u64)>,
     pump_scheduled: bool,
     pump_deferred: bool,
+    pending_load_failures: u32,
     /// `own`'s snapshot resync hasn't finished applying yet: a build now could be marked sent
     /// and found unacknowledged when the snapshot page applies, wrongly forcing the conflict
     /// path for a returning user's offline edits. Starts true (cursors aren't loaded yet, so it
@@ -1279,6 +1289,21 @@ impl Core {
         }
     }
 
+    /// Schedules the pump after a failed `LoadPending`, backing off like a failing document. A
+    /// pump already scheduled (a newer write) keeps its shorter delay.
+    fn retry_pump(&mut self, fx: &mut Vec<Effect>) {
+        let Some(s) = self.session() else { return };
+        s.pending_load_failures += 1;
+        if s.pump_scheduled {
+            return;
+        }
+        s.pump_scheduled = true;
+        fx.push(Effect::Schedule {
+            timer: TimerId::Pump,
+            after: doc_retry_delay(s.pending_load_failures),
+        });
+    }
+
     fn try_build(&mut self, doc_id: Uuid, fx: &mut Vec<Effect>) {
         let Some(s) = self.session() else { return };
         let busy = s.in_flight.contains_key(&doc_id)
@@ -1407,6 +1432,9 @@ impl Core {
         match input {
             Input::OutboxChanged => self.request_pump(fx),
             Input::PendingDocs(docs) => {
+                if let Some(s) = self.session() {
+                    s.pending_load_failures = 0;
+                }
                 for d in docs {
                     self.try_build(d, fx);
                 }
@@ -1439,6 +1467,7 @@ impl Core {
                         }
                     }
                     BuildOutcome::Nothing => self.forget_failures(doc_id),
+                    BuildOutcome::Failed => self.back_off_doc(doc_id, None, fx),
                 }
                 self.refill(fx);
             }
@@ -1478,6 +1507,7 @@ impl Core {
                 }
                 self.refill(fx);
             }
+            Input::PendingLoadFailed => self.retry_pump(fx),
             Input::ServerCopyApplied { doc_id } => {
                 if let Some(s) = self.session() {
                     s.fetching.remove(&doc_id);
@@ -3106,6 +3136,47 @@ mod upload_orchestration_tests {
             outcome: BuildOutcome::Nothing,
         });
         assert!(fx.contains(&Effect::LoadPending));
+    }
+
+    #[test]
+    fn failed_build_backs_the_doc_off_and_rebuilds_it_on_retry() {
+        let mut c = core();
+        connected(&mut c);
+        c.step(Input::PendingDocs(vec![doc(1)]));
+        let fx = c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: BuildOutcome::Failed,
+        });
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::DocRetry(doc(1)),
+            after: Duration::from_secs(1)
+        }));
+        assert!(!builds(&c.step(Input::PendingDocs(vec![doc(1)]))));
+        assert!(builds(&c.step(Input::Timer(TimerId::DocRetry(doc(1))))));
+    }
+
+    #[test]
+    fn failed_pending_load_retries_the_pump_with_a_growing_delay() {
+        let mut c = core();
+        connected(&mut c);
+        assert!(c
+            .step(Input::Timer(TimerId::Pump))
+            .contains(&Effect::LoadPending));
+        for delay in [1, 2, 4] {
+            let fx = c.step(Input::PendingLoadFailed);
+            assert!(fx.contains(&Effect::Schedule {
+                timer: TimerId::Pump,
+                after: Duration::from_secs(delay)
+            }));
+            let fx = c.step(Input::Timer(TimerId::Pump));
+            assert!(fx.contains(&Effect::LoadPending));
+        }
+        c.step(Input::PendingDocs(vec![]));
+        let fx = c.step(Input::PendingLoadFailed);
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::Pump,
+            after: Duration::from_secs(1)
+        }));
     }
 
     #[test]
