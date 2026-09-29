@@ -10,7 +10,7 @@ use super::backoff::{
     catch_up_retry_delay, connect_delay, doc_retry_delay, Jitter, MIN_CONNECT_DELAY,
 };
 use super::doc::InFlight;
-use super::types::{Change, DocEnvelope, Scope, Seq, ServerError, Upload};
+use super::types::{Change, DocEnvelope, Scope, Seq, ServerError, Upload, SCOPE_OWN};
 
 pub const MAX_IN_FLIGHT: usize = 8;
 pub const PAGE_LIMIT: u32 = 500;
@@ -24,6 +24,7 @@ const QUIET: Duration = Duration::from_millis(200);
 const QUIET_CAP: Duration = Duration::from_secs(1);
 const HALT_RETRY: Duration = Duration::from_secs(300);
 const MAX_CATCH_UP_FAILURES: u32 = 3;
+const UNREADABLE_PUSHES_BEFORE_ERROR: u32 = 3;
 
 /// Why the connection is halted and will not retry on its own schedule.
 #[derive(Debug, Clone, PartialEq)]
@@ -72,6 +73,8 @@ pub enum TimerId {
     DocRetry(Uuid),
     CatchUpRetry(Scope),
     HaltRetry,
+    /// Ends the second after a dial during which a `Reconnect` command waits.
+    DialCooldown,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,7 +118,8 @@ pub enum Response {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ApplyTag {
     Page(u64),
-    Push,
+    /// Carries the pushed change's seq, which the apply commits as the scope's cursor.
+    Push(Seq),
     SnapshotPage(u64),
     /// Carries the req of the scope's last snapshot page.
     SnapshotFinish(u64),
@@ -123,10 +127,17 @@ pub enum ApplyTag {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum BuildOutcome {
-    Send { upload: Upload, inflight: InFlight },
+    Send {
+        upload: Upload,
+        inflight: InFlight,
+    },
     NeedsServerCopy,
     Nothing,
-    SettledLocally { rows_remain: bool },
+    SettledLocally {
+        rows_remain: bool,
+    },
+    /// The store failed; the document backs off and is rebuilt when its retry fires.
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -169,6 +180,10 @@ pub enum Input {
         result: Result<Response, ServerError>,
     },
     Push(Change),
+    /// A push that did not decode; it may have been a change, so its scope catches up.
+    UnreadablePush {
+        scope: Option<Scope>,
+    },
     Timer(TimerId),
     Cursors(Vec<(Scope, Seq)>),
     Applied {
@@ -176,6 +191,8 @@ pub enum Input {
         tag: ApplyTag,
     },
     PendingDocs(Vec<Uuid>),
+    /// `LoadPending` failed in the store; the pump retries after a growing delay.
+    PendingLoadFailed,
     UploadBuilt {
         doc_id: Uuid,
         outcome: BuildOutcome,
@@ -245,7 +262,7 @@ pub enum Effect {
         snapshot_seq: Seq,
         tag: ApplyTag,
     },
-    /// Answered with `Input::PendingDocs`.
+    /// Answered with `Input::PendingDocs`, or `Input::PendingLoadFailed`.
     LoadPending,
     /// Answered with `Input::UploadBuilt`.
     BuildUpload {
@@ -337,8 +354,25 @@ struct Session {
     doc_failures: HashMap<Uuid, u32>,
     mismatch_attempts: HashMap<Uuid, u32>,
     catch_up_failures: HashMap<Scope, u32>,
+    unreadable_pushes: HashMap<Option<Scope>, u32>,
+    /// Scopes that took an unreadable push while not `Live`; the push may be the one change
+    /// `finish_scope` would otherwise seal past, so it rechecks once more before going `Live`.
+    recheck_before_live: HashSet<Scope>,
+    /// Per scope, the cursor whose changes the store has committed.
+    applied: HashMap<Scope, Seq>,
+    /// Documents whose server copy is newer than the committed `own` changes: the copy's seq,
+    /// and the first request id a catch-up round begun after the wait can have.
+    awaiting: HashMap<Uuid, (Seq, u64)>,
     pump_scheduled: bool,
     pump_deferred: bool,
+    pending_load_failures: u32,
+    /// `own`'s snapshot resync hasn't finished applying yet: a build now could be marked sent
+    /// and found unacknowledged when the snapshot page applies, wrongly forcing the conflict
+    /// path for a returning user's offline edits. Starts true (cursors aren't loaded yet, so it
+    /// isn't known whether `own` needs a snapshot at all); cleared once cursors show a nonzero
+    /// `own` cursor, or on `own`'s `SnapshotFinish`, or when `own` is dropped. Set true again
+    /// whenever `own` starts (or restarts, e.g. after `cursor_too_old`) a snapshot resync.
+    own_snapshot_resync_pending: bool,
 }
 
 impl Session {
@@ -364,6 +398,7 @@ pub struct Core {
     jitter: Jitter,
     next_req: u64,
     socket_gen: u64,
+    dial_cooldown: bool,
 }
 
 impl Core {
@@ -375,6 +410,7 @@ impl Core {
             jitter: Jitter::new(seed),
             next_req: 1,
             socket_gen: 0,
+            dial_cooldown: false,
         }
     }
 
@@ -440,12 +476,12 @@ impl Core {
                 Conn::Disconnected => {
                     fx.push(Effect::Cancel(TimerId::Reconnect));
                     self.attempt = 0;
-                    self.connect_now(fx);
+                    self.reconnect_soon(fx);
                 }
                 Conn::Halted(_) => {
                     fx.push(Effect::Cancel(TimerId::HaltRetry));
                     self.attempt = 0;
-                    self.connect_now(fx);
+                    self.reconnect_soon(fx);
                 }
                 _ => {}
             },
@@ -510,6 +546,25 @@ impl Core {
             timer: TimerId::ConnectTimeout,
             after: CONNECT_TIMEOUT,
         });
+        self.dial_cooldown = true;
+        fx.push(Effect::Schedule {
+            timer: TimerId::DialCooldown,
+            after: MIN_CONNECT_DELAY,
+        });
+    }
+
+    /// A `Reconnect` command dials at once unless a dial started under `MIN_CONNECT_DELAY`
+    /// ago: a host that answers every lost connection with `Reconnect` must not storm.
+    fn reconnect_soon(&mut self, fx: &mut Vec<Effect>) {
+        if self.dial_cooldown {
+            self.conn = Conn::Disconnected;
+            fx.push(Effect::Schedule {
+                timer: TimerId::Reconnect,
+                after: MIN_CONNECT_DELAY,
+            });
+        } else {
+            self.connect_now(fx);
+        }
     }
 
     fn close_socket(&self, fx: &mut Vec<Effect>) {
@@ -583,6 +638,10 @@ impl Core {
         fx.push(Effect::Cancel(TimerId::ConnectTimeout));
         self.conn = Conn::Connected(Session {
             phase: Some(Phase::LoadingCursors),
+            // `own` might have been dropped (subscription_forbidden) on an earlier connection:
+            // scope_names no longer lists it, so no SnapshotFinish or cursors-loaded branch for
+            // it will ever arrive to clear this — only hold uploads for it if it can still sync.
+            own_snapshot_resync_pending: self.scope_names.iter().any(|n| n == SCOPE_OWN),
             ..Default::default()
         });
         fx.push(Effect::Emit(Lifecycle::ConnectionSucceeded));
@@ -609,6 +668,15 @@ impl Core {
                             self.halt(reason, fx);
                         }
                         None => {
+                            // The host can tell the user to fix the device clock.
+                            if e.code == "clock_skew" {
+                                fx.push(Effect::Emit(Lifecycle::SyncError {
+                                    code: e.code.clone(),
+                                    scope: None,
+                                    doc_id: None,
+                                    fatal: false,
+                                }));
+                            }
                             self.close_socket(fx);
                             self.fail_connect(e.retry_after_ms, fx);
                         }
@@ -631,6 +699,7 @@ impl Core {
 
     fn on_timer(&mut self, timer: TimerId, fx: &mut Vec<Effect>) {
         match (&mut self.conn, timer) {
+            (_, TimerId::DialCooldown) => self.dial_cooldown = false,
             (Conn::Disconnected, TimerId::Reconnect) => self.connect_now(fx),
             (Conn::Connecting { .. }, TimerId::ConnectTimeout) => {
                 self.close_socket(fx);
@@ -675,6 +744,11 @@ impl Core {
         for name in &self.scope_names {
             let cursor = list.iter().find(|(n, _)| n == name).map_or(0, |(_, c)| *c);
             s.cursors.insert(name.clone(), cursor);
+            s.applied.insert(name.clone(), cursor);
+            if name == SCOPE_OWN && cursor != 0 {
+                // No snapshot needed: catch-up resumes from this cursor via change pages.
+                s.own_snapshot_resync_pending = false;
+            }
         }
         s.phase = Some(Phase::CatchingUp);
         fx.push(Effect::Emit(Lifecycle::SyncStarted));
@@ -701,6 +775,9 @@ impl Core {
             let Some(s) = self.session() else { return };
             s.scopes
                 .insert(scope.to_string(), ScopeSync::SnapshotRequesting { req });
+            if scope == SCOPE_OWN {
+                s.own_snapshot_resync_pending = true;
+            }
             s.snapshot_seen.insert(scope.to_string(), (Vec::new(), 0));
             s.requests.insert(
                 req,
@@ -759,6 +836,9 @@ impl Core {
         let Some(s) = self.session() else { return };
         s.scopes
             .insert(scope.to_string(), ScopeSync::SnapshotRequesting { req });
+        if scope == SCOPE_OWN {
+            s.own_snapshot_resync_pending = true;
+        }
         s.requests.insert(
             req,
             Pending::Snapshot {
@@ -824,6 +904,16 @@ impl Core {
         self.scope_names.retain(|name| name != scope);
         let Some(s) = self.session() else { return };
         s.scopes.insert(scope.to_string(), ScopeSync::Dropped);
+        if scope == SCOPE_OWN {
+            // No further Applied for `own` will ever arrive to release these; with `own`
+            // dropped, wait_for_stream will let their rebuild through at once.
+            s.own_snapshot_resync_pending = false;
+            let waiting: Vec<Uuid> = s.awaiting.drain().map(|(doc_id, _)| doc_id).collect();
+            for doc_id in waiting {
+                self.try_build(doc_id, fx);
+            }
+            self.refill(fx);
+        }
         self.check_all_live(fx);
     }
 
@@ -937,10 +1027,14 @@ impl Core {
                 }
                 // The doc stays in `fetching` until `ServerCopyApplied` unless we back off.
                 match result {
-                    Ok(Response::Document(doc)) => fx.push(Effect::ApplyServerCopy {
-                        doc_id,
-                        doc: Some(doc),
-                    }),
+                    Ok(Response::Document(doc)) => {
+                        if !self.wait_for_stream(doc_id, doc.seq, fx) {
+                            fx.push(Effect::ApplyServerCopy {
+                                doc_id,
+                                doc: Some(doc),
+                            });
+                        }
+                    }
                     Err(e) if e.code == "deleted" => fx.push(Effect::ApplyServerDeleted {
                         doc_id,
                         seq: e.current_seq.unwrap_or(0),
@@ -992,6 +1086,7 @@ impl Core {
         }
         match input {
             Input::Push(change) => self.on_push(change, fx),
+            Input::UnreadablePush { scope } => self.on_unreadable_push(scope, fx),
             Input::Applied { scope, tag } => self.on_applied(scope, tag, fx),
             other => self.on_upload_input(other, fx),
         }
@@ -1020,16 +1115,68 @@ impl Core {
                 scope,
                 changes: vec![change],
                 new_cursor,
-                tag: ApplyTag::Push,
+                tag: ApplyTag::Push(new_cursor),
             });
         } else {
             self.start_catch_up(&scope, fx);
         }
     }
 
+    fn on_unreadable_push(&mut self, scope: Option<Scope>, fx: &mut Vec<Effect>) {
+        let names = self.scope_names.clone();
+        let Some(s) = self.session() else { return };
+        let count = s.unreadable_pushes.entry(scope.clone()).or_insert(0);
+        *count += 1;
+        if *count == UNREADABLE_PUSHES_BEFORE_ERROR {
+            fx.push(Effect::Emit(Lifecycle::SyncError {
+                code: "protocol_error".into(),
+                scope: scope.clone(),
+                doc_id: None,
+                fatal: false,
+            }));
+        }
+        let mut live = Vec::new();
+        for name in names {
+            if scope.as_ref().is_some_and(|wanted| wanted != &name) {
+                continue;
+            }
+            match s.scopes.get(&name) {
+                Some(ScopeSync::Live) => live.push(name),
+                Some(ScopeSync::Dropped) | None => {}
+                Some(_) => {
+                    s.recheck_before_live.insert(name);
+                }
+            }
+        }
+        for name in live {
+            self.start_catch_up(&name, fx);
+        }
+    }
+
     fn on_applied(&mut self, scope: Scope, tag: ApplyTag, fx: &mut Vec<Effect>) {
         let Some(s) = self.session() else { return };
         let state = s.scopes.get(&scope).cloned();
+        let mut finished_round = None;
+        let committed = match (&state, &tag) {
+            (_, ApplyTag::Push(seq)) => Some(*seq),
+            (Some(ScopeSync::Applying { req, has_more }), ApplyTag::Page(t)) if req == t => {
+                if !*has_more {
+                    finished_round = Some(*req);
+                }
+                s.cursors.get(&scope).copied()
+            }
+            (
+                Some(ScopeSync::SnapshotFinishing { req, snapshot_seq }),
+                ApplyTag::SnapshotFinish(t),
+            ) if req == t => Some(*snapshot_seq),
+            _ => None,
+        };
+        if let Some(seq) = committed {
+            let applied = s.applied.entry(scope.clone()).or_insert(0);
+            *applied = (*applied).max(seq);
+        }
+        // `scope` moves into `Effect::FinishSnapshot` below, so decide this before the match.
+        let is_own = scope == SCOPE_OWN;
         match (state, tag) {
             (Some(ScopeSync::Applying { req, has_more }), ApplyTag::Page(t)) if req == t => {
                 if has_more {
@@ -1064,14 +1211,31 @@ impl Core {
                 ApplyTag::SnapshotFinish(t),
             ) if req == t => {
                 s.cursors.insert(scope.clone(), snapshot_seq);
+                if is_own {
+                    s.own_snapshot_resync_pending = false;
+                }
                 self.request_changes(&scope, snapshot_seq, fx);
             }
             _ => {} // push applies and stale tags
         }
+        if is_own {
+            self.release_awaiting(finished_round, fx);
+        }
+        self.refill(fx);
         self.request_pump(fx);
     }
 
     fn finish_scope(&mut self, scope: &str, fx: &mut Vec<Effect>) {
+        let owes_recheck = {
+            let Some(s) = self.session() else { return };
+            s.recheck_before_live.remove(scope)
+        };
+        if owes_recheck {
+            // An unreadable push arrived before this page sealed; it may be the change that
+            // page missed, so check once more instead of declaring the scope live.
+            self.start_catch_up(scope, fx);
+            return;
+        }
         let Some(s) = self.session() else { return };
         s.scopes.insert(scope.to_string(), ScopeSync::Live);
         s.catch_up_failures.remove(scope);
@@ -1125,14 +1289,38 @@ impl Core {
         }
     }
 
+    /// Schedules the pump after a failed `LoadPending`, backing off like a failing document. A
+    /// pump already scheduled (a newer write) keeps its shorter delay.
+    fn retry_pump(&mut self, fx: &mut Vec<Effect>) {
+        let Some(s) = self.session() else { return };
+        s.pending_load_failures += 1;
+        if s.pump_scheduled {
+            return;
+        }
+        s.pump_scheduled = true;
+        fx.push(Effect::Schedule {
+            timer: TimerId::Pump,
+            after: doc_retry_delay(s.pending_load_failures),
+        });
+    }
+
     fn try_build(&mut self, doc_id: Uuid, fx: &mut Vec<Effect>) {
         let Some(s) = self.session() else { return };
         let busy = s.in_flight.contains_key(&doc_id)
             || s.building.contains(&doc_id)
             || s.backing_off.contains(&doc_id)
             || s.fetching.contains(&doc_id)
-            || s.settling.contains(&doc_id);
+            || s.settling.contains(&doc_id)
+            || s.awaiting.contains_key(&doc_id);
         if busy {
+            return;
+        }
+        // A snapshot page applied while an upload is out would find its rows sent and not yet
+        // acknowledged; `refill` requests a pump once the resync finishes, so these wait only
+        // for it — not just while a `GetSnapshot` request is outstanding, but through any
+        // `RetryWait` a failed request or page falls back to before it retries the snapshot.
+        if s.own_snapshot_resync_pending {
+            s.pump_deferred = true;
             return;
         }
         if s.slots_used() >= MAX_IN_FLIGHT {
@@ -1147,7 +1335,7 @@ impl Core {
     /// being at capacity.
     fn refill(&mut self, fx: &mut Vec<Effect>) {
         let Some(s) = self.session() else { return };
-        if s.pump_deferred && s.slots_used() < MAX_IN_FLIGHT {
+        if s.pump_deferred && s.slots_used() < MAX_IN_FLIGHT && !s.own_snapshot_resync_pending {
             s.pump_deferred = false;
             fx.push(Effect::LoadPending);
         }
@@ -1189,10 +1377,64 @@ impl Core {
         });
     }
 
+    /// A server copy newer than the committed `own` changes may already contain an upload of
+    /// ours whose reply was lost. Its echo must settle our rows before anything is rebased onto
+    /// the copy, so the document waits for the change stream and is rebuilt instead.
+    fn wait_for_stream(&mut self, doc_id: Uuid, seq: Seq, fx: &mut Vec<Effect>) -> bool {
+        let first_req = self.next_req;
+        let Some(s) = self.session() else {
+            return false;
+        };
+        let own = s.scopes.get(SCOPE_OWN).cloned();
+        let applied = s.applied.get(SCOPE_OWN).copied().unwrap_or(0);
+        if matches!(own, None | Some(ScopeSync::Dropped)) || seq <= applied {
+            return false;
+        }
+        s.fetching.remove(&doc_id);
+        s.awaiting.insert(doc_id, (seq, first_req));
+        if own == Some(ScopeSync::Live) {
+            let cursor = s.cursors.get(SCOPE_OWN).copied().unwrap_or(0);
+            // Changes even at cursor 0: a snapshot carries no upload ids to recognise the echo.
+            self.request_changes(SCOPE_OWN, cursor, fx);
+        }
+        true
+    }
+
+    /// Rebuilds waiting documents once `own` has committed their copy's seq, or once a catch-up
+    /// round requested after their wait began has finished.
+    fn release_awaiting(&mut self, finished_round: Option<u64>, fx: &mut Vec<Effect>) {
+        let Some(s) = self.session() else { return };
+        let applied = s.applied.get(SCOPE_OWN).copied().unwrap_or(0);
+        let ready: Vec<Uuid> = s
+            .awaiting
+            .iter()
+            .filter(|(_, (seq, first_req))| {
+                *seq <= applied || finished_round.is_some_and(|req| req >= *first_req)
+            })
+            .map(|(doc_id, _)| *doc_id)
+            .collect();
+        for doc_id in &ready {
+            s.awaiting.remove(doc_id);
+        }
+        let another_round = finished_round.is_some()
+            && !s.awaiting.is_empty()
+            && s.scopes.get(SCOPE_OWN) == Some(&ScopeSync::Live);
+        let cursor = s.cursors.get(SCOPE_OWN).copied().unwrap_or(0);
+        for doc_id in ready {
+            self.try_build(doc_id, fx);
+        }
+        if another_round {
+            self.request_changes(SCOPE_OWN, cursor, fx);
+        }
+    }
+
     fn on_upload_input(&mut self, input: Input, fx: &mut Vec<Effect>) {
         match input {
             Input::OutboxChanged => self.request_pump(fx),
             Input::PendingDocs(docs) => {
+                if let Some(s) = self.session() {
+                    s.pending_load_failures = 0;
+                }
                 for d in docs {
                     self.try_build(d, fx);
                 }
@@ -1225,6 +1467,7 @@ impl Core {
                         }
                     }
                     BuildOutcome::Nothing => self.forget_failures(doc_id),
+                    BuildOutcome::Failed => self.back_off_doc(doc_id, None, fx),
                 }
                 self.refill(fx);
             }
@@ -1264,6 +1507,7 @@ impl Core {
                 }
                 self.refill(fx);
             }
+            Input::PendingLoadFailed => self.retry_pump(fx),
             Input::ServerCopyApplied { doc_id } => {
                 if let Some(s) = self.session() {
                     s.fetching.remove(&doc_id);
@@ -1365,6 +1609,11 @@ pub(crate) mod harness {
                 _ => None,
             })
             .collect()
+    }
+
+    pub fn scope_is_live(c: &mut Core, scope: &str) -> bool {
+        c.session()
+            .is_some_and(|s| s.scopes.get(scope) == Some(&ScopeSync::Live))
     }
 }
 
@@ -1564,6 +1813,39 @@ mod connection_tests {
     }
 
     #[test]
+    fn clock_skew_join_error_backs_off_and_reports_without_halting() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        let mut skew = ServerError::new("clock_skew");
+        skew.server_time = Some(1_767_225_600);
+        let fx = c.step(Input::Reply {
+            req,
+            result: Err(skew),
+        });
+        assert_eq!(c.state().connection, ConnectionView::Disconnected);
+        assert!(closes(&fx));
+        assert!(fx.iter().any(|e| matches!(
+            e,
+            Effect::Schedule {
+                timer: TimerId::Reconnect,
+                ..
+            }
+        )));
+        assert_eq!(
+            emitted(&fx),
+            vec![Lifecycle::SyncError {
+                code: "clock_skew".into(),
+                scope: None,
+                doc_id: None,
+                fatal: false
+            }]
+        );
+    }
+
+    #[test]
     fn server_retry_after_overrides_backoff() {
         let mut c = core();
         c.step(Input::Start {
@@ -1720,6 +2002,7 @@ mod connection_tests {
             .pop()
             .unwrap();
         c.step(closed(&c));
+        c.step(Input::Timer(TimerId::DialCooldown));
         c.step(Input::Reconnect);
         open_and_join(&mut c);
         let fx = c.step(Input::Timer(TimerId::HeartbeatTimeout(old_req)));
@@ -1776,9 +2059,52 @@ mod connection_tests {
             c.state().connection,
             ConnectionView::Halted(HaltReason::AuthInvalid)
         );
+        c.step(Input::Timer(TimerId::DialCooldown));
         c.step(Input::Reconnect);
         let fx = c.step(Input::Timer(TimerId::ConnectTimeout));
         assert!(fx.iter().any(|e| matches!(e, Effect::Schedule { timer: TimerId::Reconnect, after } if *after == Duration::from_secs(1))));
+    }
+
+    #[test]
+    fn reconnect_within_a_second_of_a_dial_waits_for_the_cooldown() {
+        let mut c = core();
+        let fx = c.step(Input::Start {
+            has_credentials: true,
+        });
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::DialCooldown,
+            after: Duration::from_secs(1)
+        }));
+        c.step(closed(&c));
+        let fx = c.step(Input::Reconnect);
+        assert!(!opens(&fx), "a dial started less than a second ago");
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::Reconnect,
+            after: Duration::from_secs(1)
+        }));
+        c.step(Input::Timer(TimerId::DialCooldown));
+        assert!(opens(&c.step(Input::Reconnect)));
+    }
+
+    #[test]
+    fn reconnect_from_halted_during_the_cooldown_dials_a_second_later() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        c.step(Input::Reply {
+            req,
+            result: Err(ServerError {
+                is_fatal: true,
+                ..ServerError::new("auth_invalid")
+            }),
+        });
+        let fx = c.step(Input::Reconnect);
+        assert!(!opens(&fx));
+        assert!(fx.contains(&Effect::Cancel(TimerId::HaltRetry)));
+        assert_eq!(c.state().connection, ConnectionView::Disconnected);
+        assert!(opens(&c.step(Input::Timer(TimerId::Reconnect))));
     }
 
     #[test]
@@ -2091,7 +2417,7 @@ mod catch_up_tests {
             e,
             Effect::ApplyChanges {
                 new_cursor: 6,
-                tag: ApplyTag::Push,
+                tag: ApplyTag::Push(6),
                 ..
             }
         )));
@@ -2127,6 +2453,205 @@ mod catch_up_tests {
     }
 
     #[test]
+    fn unreadable_push_starts_catch_up_for_its_scope() {
+        let mut c = core();
+        live(&mut c);
+        let fx = c.step(Input::UnreadablePush {
+            scope: Some("own".into()),
+        });
+        assert_eq!(
+            sends(&fx),
+            vec![(
+                changes_req(&fx, "own"),
+                Request::GetChangesSince {
+                    scope: "own".into(),
+                    cursor: 5,
+                    limit: PAGE_LIMIT
+                }
+            )]
+        );
+        assert!(emitted(&fx).is_empty());
+    }
+
+    #[test]
+    fn unreadable_push_without_a_scope_catches_up_every_live_scope() {
+        let mut c = core();
+        live(&mut c);
+        let fx = c.step(Input::UnreadablePush { scope: None });
+        changes_req(&fx, "own");
+        changes_req(&fx, "collection:curated");
+    }
+
+    #[test]
+    fn third_unreadable_push_on_a_scope_emits_one_sync_error() {
+        let mut c = core();
+        live(&mut c);
+        for push in 1..=5 {
+            let fx = c.step(Input::UnreadablePush {
+                scope: Some("own".into()),
+            });
+            let errors = emitted(&fx);
+            if push == 3 {
+                assert_eq!(
+                    errors,
+                    vec![Lifecycle::SyncError {
+                        code: "protocol_error".into(),
+                        scope: Some("own".into()),
+                        doc_id: None,
+                        fatal: false
+                    }]
+                );
+            } else {
+                assert!(errors.is_empty(), "push {push}: {errors:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn unreadable_push_before_the_final_page_defers_going_live() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        let own = changes_req(&fx, "own");
+        c.step(Input::Reply {
+            req: own,
+            result: Ok(Response::Changes {
+                changes: vec![],
+                next_cursor: 5,
+                has_more: false,
+            }),
+        });
+        // The push arrives while the page is still `Applying`, before it seals the scope live.
+        let fx = c.step(Input::UnreadablePush {
+            scope: Some("own".into()),
+        });
+        assert!(sends(&fx).is_empty());
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::Page(own),
+        });
+        assert!(sends(&fx).iter().any(|(_, r)| *r
+            == Request::GetChangesSince {
+                scope: "own".into(),
+                cursor: 5,
+                limit: PAGE_LIMIT
+            }));
+        assert!(!scope_is_live(&mut c, "own"));
+    }
+
+    #[test]
+    fn unreadable_push_during_snapshot_finishing_defers_going_live() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 0),
+            ("collection:curated".into(), 5),
+        ]));
+        let (snap_req, _) = sends(&fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetSnapshot { .. }))
+            .unwrap();
+        c.step(Input::Reply {
+            req: snap_req,
+            result: Ok(Response::SnapshotPage {
+                docs: vec![],
+                snapshot_seq: 40,
+                next_page_token: None,
+            }),
+        });
+        c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::SnapshotPage(snap_req),
+        });
+        // The push arrives while the scope is `SnapshotFinishing`, before it reaches a page
+        // that could seal it live.
+        c.step(Input::UnreadablePush {
+            scope: Some("own".into()),
+        });
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::SnapshotFinish(snap_req),
+        });
+        let changes_req_id = sends(&fx)
+            .into_iter()
+            .find(|(_, r)| {
+                *r == Request::GetChangesSince {
+                    scope: "own".into(),
+                    cursor: 40,
+                    limit: PAGE_LIMIT,
+                }
+            })
+            .map(|(req, _)| req)
+            .expect("catch-up from the snapshot sequence");
+        // That page is the first one reached since the push arrived; the mark it left on the
+        // scope forces one more round instead of sealing the scope live here.
+        c.step(Input::Reply {
+            req: changes_req_id,
+            result: Ok(Response::Changes {
+                changes: vec![],
+                next_cursor: 40,
+                has_more: false,
+            }),
+        });
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::Page(changes_req_id),
+        });
+        assert!(sends(&fx).iter().any(|(_, r)| *r
+            == Request::GetChangesSince {
+                scope: "own".into(),
+                cursor: 40,
+                limit: PAGE_LIMIT
+            }));
+        assert!(!scope_is_live(&mut c, "own"));
+    }
+
+    #[test]
+    fn recheck_that_finds_nothing_then_goes_live() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        let own = changes_req(&fx, "own");
+        c.step(Input::Reply {
+            req: own,
+            result: Ok(Response::Changes {
+                changes: vec![],
+                next_cursor: 5,
+                has_more: false,
+            }),
+        });
+        c.step(Input::UnreadablePush {
+            scope: Some("own".into()),
+        });
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::Page(own),
+        });
+        let recheck_req = changes_req(&fx, "own");
+        assert!(!scope_is_live(&mut c, "own"));
+        c.step(Input::Reply {
+            req: recheck_req,
+            result: Ok(Response::Changes {
+                changes: vec![],
+                next_cursor: 5,
+                has_more: false,
+            }),
+        });
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::Page(recheck_req),
+        });
+        assert!(sends(&fx).is_empty());
+        assert!(scope_is_live(&mut c, "own"));
+    }
+
+    #[test]
     fn push_during_catch_up_is_buffered_and_applied() {
         let mut c = core();
         connected(&mut c);
@@ -2153,7 +2678,7 @@ mod catch_up_tests {
             e,
             Effect::ApplyChanges {
                 new_cursor: 8,
-                tag: ApplyTag::Push,
+                tag: ApplyTag::Push(8),
                 ..
             }
         )));
@@ -2167,7 +2692,7 @@ mod catch_up_tests {
         c.step(Input::Push(change("own", 12, 11))); // gap → catch-up requesting
         let fx = c.step(Input::Applied {
             scope: "own".into(),
-            tag: ApplyTag::Push,
+            tag: ApplyTag::Push(6),
         });
         assert!(sends(&fx).is_empty());
     }
@@ -2456,6 +2981,8 @@ mod upload_orchestration_tests {
         Uuid::from_u128(0x1000 + n)
     }
 
+    /// Joined and past the snapshot-resync window: `own` has a nonzero cursor, so uploads are
+    /// never held for it.
     fn connected(c: &mut Core) {
         c.step(Input::Start {
             has_credentials: true,
@@ -2465,6 +2992,10 @@ mod upload_orchestration_tests {
             req,
             result: Ok(Response::Joined),
         });
+        c.step(Input::Cursors(vec![
+            ("own".into(), 1000),
+            ("collection:curated".into(), 1),
+        ]));
     }
 
     fn prepared(d: Uuid) -> BuildOutcome {
@@ -2605,6 +3136,47 @@ mod upload_orchestration_tests {
             outcome: BuildOutcome::Nothing,
         });
         assert!(fx.contains(&Effect::LoadPending));
+    }
+
+    #[test]
+    fn failed_build_backs_the_doc_off_and_rebuilds_it_on_retry() {
+        let mut c = core();
+        connected(&mut c);
+        c.step(Input::PendingDocs(vec![doc(1)]));
+        let fx = c.step(Input::UploadBuilt {
+            doc_id: doc(1),
+            outcome: BuildOutcome::Failed,
+        });
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::DocRetry(doc(1)),
+            after: Duration::from_secs(1)
+        }));
+        assert!(!builds(&c.step(Input::PendingDocs(vec![doc(1)]))));
+        assert!(builds(&c.step(Input::Timer(TimerId::DocRetry(doc(1))))));
+    }
+
+    #[test]
+    fn failed_pending_load_retries_the_pump_with_a_growing_delay() {
+        let mut c = core();
+        connected(&mut c);
+        assert!(c
+            .step(Input::Timer(TimerId::Pump))
+            .contains(&Effect::LoadPending));
+        for delay in [1, 2, 4] {
+            let fx = c.step(Input::PendingLoadFailed);
+            assert!(fx.contains(&Effect::Schedule {
+                timer: TimerId::Pump,
+                after: Duration::from_secs(delay)
+            }));
+            let fx = c.step(Input::Timer(TimerId::Pump));
+            assert!(fx.contains(&Effect::LoadPending));
+        }
+        c.step(Input::PendingDocs(vec![]));
+        let fx = c.step(Input::PendingLoadFailed);
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::Pump,
+            after: Duration::from_secs(1)
+        }));
     }
 
     #[test]
@@ -3055,5 +3627,529 @@ mod upload_orchestration_tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn builds_wait_while_own_is_resynced_by_snapshot() {
+        let mut c = core();
+        // Joined but cursors not yet loaded: `connected` skips this window, so join directly.
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (join_req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        c.step(Input::Reply {
+            req: join_req,
+            result: Ok(Response::Joined),
+        });
+        let fx = c.step(Input::Cursors(vec![("collection:curated".into(), 5)]));
+        let (snapshot_req, _) = sends(&fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetSnapshot { scope, .. } if scope == "own"))
+            .expect("own resyncs by snapshot");
+        let fx = c.step(Input::PendingDocs(vec![doc(1)]));
+        assert!(
+            !fx.contains(&Effect::BuildUpload { doc_id: doc(1) }),
+            "a snapshot page applied during an upload would find its rows sent and unacknowledged"
+        );
+        c.step(Input::Reply {
+            req: snapshot_req,
+            result: Ok(Response::SnapshotPage {
+                docs: vec![],
+                snapshot_seq: 5,
+                next_page_token: None,
+            }),
+        });
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::SnapshotPage(snapshot_req),
+        });
+        let finish = fx
+            .iter()
+            .find_map(|e| match e {
+                Effect::FinishSnapshot { tag, .. } => Some(tag.clone()),
+                _ => None,
+            })
+            .expect("finish snapshot");
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: finish,
+        });
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::Pump,
+            after: Duration::from_millis(200)
+        }));
+        let fx = c.step(Input::PendingDocs(vec![doc(1)]));
+        assert!(fx.contains(&Effect::BuildUpload { doc_id: doc(1) }));
+    }
+
+    #[test]
+    fn builds_wait_through_a_failed_snapshot_requests_retry_wait() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (join_req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        c.step(Input::Reply {
+            req: join_req,
+            result: Ok(Response::Joined),
+        });
+        let fx = c.step(Input::Cursors(vec![("collection:curated".into(), 5)]));
+        let (snapshot_req, _) = sends(&fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetSnapshot { scope, .. } if scope == "own"))
+            .expect("own resyncs by snapshot");
+        // The request times out: `own` falls back to `RetryWait`, still short of a snapshot.
+        c.step(Input::Timer(TimerId::Request(snapshot_req)));
+        assert!(
+            !c.step(Input::PendingDocs(vec![doc(1)]))
+                .contains(&Effect::BuildUpload { doc_id: doc(1) }),
+            "a build while `own` is only waiting to retry its snapshot could still get marked \
+             sent before the retried snapshot page applies"
+        );
+        let fx = c.step(Input::Timer(TimerId::CatchUpRetry("own".into())));
+        let (own_retry_req, _) = sends(&fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetSnapshot { scope, .. } if scope == "own"))
+            .expect("own retries with a fresh snapshot request");
+        assert!(
+            !c.step(Input::PendingDocs(vec![doc(1)]))
+                .contains(&Effect::BuildUpload { doc_id: doc(1) }),
+            "the retried snapshot request is still outstanding"
+        );
+        c.step(Input::Reply {
+            req: own_retry_req,
+            result: Ok(Response::SnapshotPage {
+                docs: vec![],
+                snapshot_seq: 5,
+                next_page_token: None,
+            }),
+        });
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::SnapshotPage(own_retry_req),
+        });
+        let finish = fx
+            .iter()
+            .find_map(|e| match e {
+                Effect::FinishSnapshot { tag, .. } => Some(tag.clone()),
+                _ => None,
+            })
+            .expect("finish snapshot");
+        c.step(Input::Applied {
+            scope: "own".into(),
+            tag: finish,
+        });
+        assert!(
+            c.step(Input::PendingDocs(vec![doc(1)]))
+                .contains(&Effect::BuildUpload { doc_id: doc(1) }),
+            "the retried snapshot finished; builds resume"
+        );
+    }
+
+    #[test]
+    fn own_dropped_mid_snapshot_resync_releases_the_hold() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (join_req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        c.step(Input::Reply {
+            req: join_req,
+            result: Ok(Response::Joined),
+        });
+        let fx = c.step(Input::Cursors(vec![("collection:curated".into(), 5)]));
+        let (snapshot_req, _) = sends(&fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetSnapshot { scope, .. } if scope == "own"))
+            .expect("own resyncs by snapshot");
+        assert!(
+            !c.step(Input::PendingDocs(vec![doc(1)]))
+                .contains(&Effect::BuildUpload { doc_id: doc(1) }),
+            "held while own's snapshot is outstanding"
+        );
+        let fx = c.step(Input::Reply {
+            req: snapshot_req,
+            result: Err(ServerError::new("subscription_forbidden")),
+        });
+        assert!(
+            fx.contains(&Effect::LoadPending),
+            "own dropped mid-resync must release stranded docs, not leave them held forever"
+        );
+        assert!(c
+            .step(Input::PendingDocs(vec![doc(1)]))
+            .contains(&Effect::BuildUpload { doc_id: doc(1) }));
+    }
+
+    #[test]
+    fn reconnect_after_own_dropped_does_not_hang_uploads_forever() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (join_req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        c.step(Input::Reply {
+            req: join_req,
+            result: Ok(Response::Joined),
+        });
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        let (own_req, _) = sends(&fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetChangesSince { scope, .. } if scope == "own"))
+            .expect("own catches up via changes");
+        c.step(Input::Reply {
+            req: own_req,
+            result: Err(ServerError::new("subscription_forbidden")),
+        });
+        // `own` is dropped for the rest of this `Core`'s life; simulate a lost connection and
+        // reconnect, the way a real client would after any transient network blip.
+        c.step(closed(&c));
+        c.step(Input::Timer(TimerId::Reconnect));
+        let (rejoin_req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        c.step(Input::Reply {
+            req: rejoin_req,
+            result: Ok(Response::Joined),
+        });
+        c.step(Input::Cursors(vec![("collection:curated".into(), 5)]));
+        assert!(
+            c.step(Input::PendingDocs(vec![doc(1)]))
+                .contains(&Effect::BuildUpload { doc_id: doc(1) }),
+            "own was dropped before the reconnect and can never sync again on this Core; \
+             uploads must not hang waiting for a resync that will never happen"
+        );
+    }
+
+    #[test]
+    fn core_without_own_in_its_scope_list_builds_after_join() {
+        let mut c = Core::new(vec!["collection:curated".into()], 7);
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (join_req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        c.step(Input::Reply {
+            req: join_req,
+            result: Ok(Response::Joined),
+        });
+        c.step(Input::Cursors(vec![("collection:curated".into(), 5)]));
+        assert!(
+            c.step(Input::PendingDocs(vec![doc(1)]))
+                .contains(&Effect::BuildUpload { doc_id: doc(1) }),
+            "own not being subscribed at all must not hold uploads forever"
+        );
+    }
+}
+
+#[cfg(test)]
+mod server_copy_tests {
+    use super::harness::*;
+    use super::*;
+    use crate::engine::types::{ChangeKind, DocEnvelope};
+    use serde_json::json;
+
+    fn doc(n: u128) -> Uuid {
+        Uuid::from_u128(0x2000 + n)
+    }
+
+    fn envelope(d: Uuid, seq: i64) -> DocEnvelope {
+        DocEnvelope {
+            doc_id: d,
+            owner_id: Some(ME),
+            author_id: None,
+            read_only: false,
+            source_doc_id: None,
+            derived_from: None,
+            title: None,
+            content: json!({}),
+            hash: "h".into(),
+            seq,
+        }
+    }
+
+    fn push(d: Uuid, seq: i64, prev_seq: i64) -> Change {
+        Change {
+            scope: "own".into(),
+            seq,
+            prev_seq,
+            doc_id: d,
+            kind: ChangeKind::Upsert,
+            doc: Some(envelope(d, seq)),
+            client_id: None,
+            upload_id: None,
+        }
+    }
+
+    fn changes_req(fx: &[Effect], scope: &str) -> u64 {
+        sends(fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetChangesSince { scope: s, .. } if s == scope))
+            .map(|(req, _)| req)
+            .expect("changes request")
+    }
+
+    fn joined(c: &mut Core) {
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (req, _) = sends(&c.step(opened(c))).pop().unwrap();
+        c.step(Input::Reply {
+            req,
+            result: Ok(Response::Joined),
+        });
+    }
+
+    fn empty_page(c: &mut Core, scope: &str, req: u64, next_cursor: i64) -> Vec<Effect> {
+        c.step(Input::Reply {
+            req,
+            result: Ok(Response::Changes {
+                changes: vec![],
+                next_cursor,
+                has_more: false,
+            }),
+        });
+        c.step(Input::Applied {
+            scope: scope.into(),
+            tag: ApplyTag::Page(req),
+        })
+    }
+
+    /// Connected with both scopes caught up to seq 5.
+    fn live(c: &mut Core) {
+        joined(c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        for scope in ["own", "collection:curated"] {
+            empty_page(c, scope, changes_req(&fx, scope), 5);
+        }
+    }
+
+    /// Connected with both scopes empty: snapshot at seq 0, then an empty page.
+    fn live_empty(c: &mut Core) {
+        joined(c);
+        let cursors_fx = c.step(Input::Cursors(vec![]));
+        for scope in ["own", "collection:curated"] {
+            let (req, _) = sends(&cursors_fx)
+                .into_iter()
+                .find(|(_, r)| matches!(r, Request::GetSnapshot { scope: s, .. } if s == scope))
+                .expect("snapshot request");
+            c.step(Input::Reply {
+                req,
+                result: Ok(Response::SnapshotPage {
+                    docs: vec![],
+                    snapshot_seq: 0,
+                    next_page_token: None,
+                }),
+            });
+            let page_fx = c.step(Input::Applied {
+                scope: scope.into(),
+                tag: ApplyTag::SnapshotPage(req),
+            });
+            let finish = page_fx
+                .iter()
+                .find_map(|e| match e {
+                    Effect::FinishSnapshot { tag, .. } => Some(tag.clone()),
+                    _ => None,
+                })
+                .expect("finish snapshot");
+            let finish_fx = c.step(Input::Applied {
+                scope: scope.into(),
+                tag: finish,
+            });
+            empty_page(c, scope, changes_req(&finish_fx, scope), 0);
+        }
+    }
+
+    /// Settles `d` with `FetchServerCopy` and answers its `get_document` with a copy at `seq`.
+    fn fetch_copy(c: &mut Core, d: Uuid, seq: i64) -> Vec<Effect> {
+        let fx = c.step(Input::Settled {
+            doc_id: d,
+            outcome: SettleOutcome::FetchServerCopy,
+        });
+        let (req, request) = sends(&fx).pop().expect("get_document sent");
+        assert_eq!(request, Request::GetDocument { doc_id: d });
+        c.step(Input::Reply {
+            req,
+            result: Ok(Response::Document(envelope(d, seq))),
+        })
+    }
+
+    fn applies_copy(fx: &[Effect]) -> bool {
+        fx.iter()
+            .any(|e| matches!(e, Effect::ApplyServerCopy { .. }))
+    }
+
+    fn builds(fx: &[Effect], d: Uuid) -> bool {
+        fx.contains(&Effect::BuildUpload { doc_id: d })
+    }
+
+    #[test]
+    fn lost_reply_then_mismatch_waits_for_the_echo_instead_of_fetching() {
+        let mut c = core();
+        live(&mut c);
+        let fx = fetch_copy(&mut c, doc(1), 9);
+        assert!(
+            !applies_copy(&fx),
+            "a copy past the committed own changes may hold our lost upload"
+        );
+        let own = changes_req(&fx, "own");
+        assert!(sends(&fx).contains(&(
+            own,
+            Request::GetChangesSince {
+                scope: "own".into(),
+                cursor: 5,
+                limit: PAGE_LIMIT
+            }
+        )));
+        let fx = empty_page(&mut c, "own", own, 9);
+        assert!(builds(&fx, doc(1)), "rebuilt once the echo is committed");
+        assert!(!applies_copy(&fx));
+    }
+
+    #[test]
+    fn mismatch_at_or_below_the_cursor_fetches_at_once() {
+        let mut c = core();
+        live(&mut c);
+        let fx = fetch_copy(&mut c, doc(1), 5);
+        assert!(fx.contains(&Effect::ApplyServerCopy {
+            doc_id: doc(1),
+            doc: Some(envelope(doc(1), 5))
+        }));
+    }
+
+    #[test]
+    fn copy_at_a_pushed_seq_is_applied_at_once() {
+        let mut c = core();
+        live(&mut c);
+        let fx = c.step(Input::Push(push(doc(7), 6, 5)));
+        assert!(fx.iter().any(|e| matches!(
+            e,
+            Effect::ApplyChanges {
+                tag: ApplyTag::Push(6),
+                ..
+            }
+        )));
+        c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::Push(6),
+        });
+        assert!(applies_copy(&fetch_copy(&mut c, doc(1), 6)));
+    }
+
+    #[test]
+    fn waiting_doc_is_not_rebuilt_by_the_pump() {
+        let mut c = core();
+        live(&mut c);
+        fetch_copy(&mut c, doc(1), 9);
+        let fx = c.step(Input::PendingDocs(vec![doc(1), doc(2)]));
+        assert!(!builds(&fx, doc(1)));
+        assert!(builds(&fx, doc(2)));
+    }
+
+    #[test]
+    fn catch_up_in_progress_at_the_wait_gets_one_more_round() {
+        let mut c = core();
+        live(&mut c);
+        let fx = c.step(Input::UnreadablePush {
+            scope: Some("own".into()),
+        });
+        let early = changes_req(&fx, "own");
+        let fx = fetch_copy(&mut c, doc(1), 9);
+        assert!(!applies_copy(&fx));
+        assert!(
+            sends(&fx)
+                .iter()
+                .all(|(_, r)| !matches!(r, Request::GetChangesSince { .. })),
+            "a round is already out"
+        );
+        let fx = empty_page(&mut c, "own", early, 8);
+        assert!(!builds(&fx, doc(1)), "that round began before the wait");
+        let again = changes_req(&fx, "own");
+        let fx = empty_page(&mut c, "own", again, 8);
+        assert!(
+            builds(&fx, doc(1)),
+            "a round requested after the wait releases the doc even below its seq"
+        );
+    }
+
+    #[test]
+    fn exists_mine_server_copy_also_waits_for_the_stream() {
+        // `exists` with our own id settles as FetchServerCopy too. With no shadow yet, applying
+        // the copy before the lost create's echo would send all local content to `recovered`.
+        let mut c = core();
+        live_empty(&mut c);
+        let fx = fetch_copy(&mut c, doc(1), 1);
+        assert!(!applies_copy(&fx));
+        assert!(
+            sends(&fx).iter().any(|(_, r)| *r
+                == Request::GetChangesSince {
+                    scope: "own".into(),
+                    cursor: 0,
+                    limit: PAGE_LIMIT
+                }),
+            "a snapshot would carry no upload id to echo"
+        );
+    }
+
+    #[test]
+    fn copy_is_applied_at_once_when_own_is_dropped() {
+        let mut c = core();
+        joined(&mut c);
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        c.step(Input::Reply {
+            req: changes_req(&fx, "own"),
+            result: Err(ServerError::new("subscription_forbidden")),
+        });
+        empty_page(
+            &mut c,
+            "collection:curated",
+            changes_req(&fx, "collection:curated"),
+            5,
+        );
+        assert!(applies_copy(&fetch_copy(&mut c, doc(1), 9)));
+    }
+
+    #[test]
+    fn own_dropped_mid_wait_releases_the_waiting_doc() {
+        let mut c = core();
+        live(&mut c);
+        let fx = fetch_copy(&mut c, doc(1), 9);
+        let own = changes_req(&fx, "own");
+        let fx = c.step(Input::Reply {
+            req: own,
+            result: Err(ServerError::new("subscription_forbidden")),
+        });
+        assert!(
+            builds(&fx, doc(1)),
+            "own dropped mid-wait must release the waiting doc, or it is stranded"
+        );
+    }
+
+    #[test]
+    fn push_commits_the_seq_and_releases_the_doc_before_any_round_finishes() {
+        let mut c = core();
+        live(&mut c);
+        // Leaves `own` Live and starts a round that is still outstanding when the doc waits.
+        c.step(Input::UnreadablePush {
+            scope: Some("own".into()),
+        });
+        let fx = fetch_copy(&mut c, doc(1), 6);
+        assert!(
+            !applies_copy(&fx),
+            "own is not Live; the doc waits on the round already out"
+        );
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::Push(6),
+        });
+        assert!(
+            builds(&fx, doc(1)),
+            "the pushed seq commits applied[own] to 6, releasing the doc without waiting for the round to finish"
+        );
     }
 }

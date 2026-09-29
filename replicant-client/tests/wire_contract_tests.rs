@@ -23,6 +23,7 @@ const EXPECTED_FRAME_NAMES: &[&str] = &[
     "changes_reply",
     "changes_reply_populated",
     "changes_request",
+    "clock_skew_join_reply",
     "cursor_too_old_reply",
     "deleted_reply",
     "document_reply",
@@ -329,6 +330,21 @@ fn join_errors_and_socket_refusal_are_fatal_server_errors() {
 }
 
 #[test]
+fn clock_skew_join_reply_is_a_transient_error_with_the_server_time() {
+    let frames = load_frames();
+    let mut codec = joined_codec();
+    let Some(Incoming::Reply { req: 1, result }) =
+        codec.decode(&frames["clock_skew_join_reply"].to_string())
+    else {
+        panic!("clock_skew_join_reply must decode as a reply to the join");
+    };
+    let skew = expect_error("clock_skew_join_reply", result);
+    assert_eq!(skew.code, "clock_skew");
+    assert!(!skew.is_fatal);
+    assert_eq!(skew.server_time, Some(1_767_225_600));
+}
+
+#[test]
 fn socket_url_carries_the_recorded_connect_params() {
     let frames = load_frames();
     let url = url::Url::parse(&socket_url("ws://localhost:4000", Uuid::nil()).unwrap()).unwrap();
@@ -431,10 +447,20 @@ fn publish_requests_carry_their_ids() {
     }
 }
 
-/// Never compare a client-computed hash to a server hash: the server hash is authoritative.
+/// The server hashes content as written and replies with that form (`1.2e3`); a fetch reads the
+/// row back (`1200`) under the same hash. The client decodes both to canonical numbers, so its
+/// own hash of decoded content is not the server's: never compare the two.
 #[test]
-fn float_content_decodes_but_client_hash_is_not_the_server_hash() {
+fn float_content_decodes_to_canonical_numbers_under_the_server_hash() {
     let frames = load_frames();
+    assert_eq!(
+        raw_response(&frames, "float_upload_reply")["content"]["cents"],
+        json!(1200.0)
+    );
+    assert_eq!(
+        raw_response(&frames, "float_document_reply")["content"]["cents"],
+        json!(1200)
+    );
     let Ok(Response::Uploaded(upload_doc)) =
         reply_to(&frames, "float_upload_reply", &create_upload())
     else {
@@ -447,18 +473,16 @@ fn float_content_decodes_but_client_hash_is_not_the_server_hash() {
         panic!("float_document_reply must decode as a document reply");
     };
 
+    assert_eq!(upload_doc.content, json!({"cents": 1200, "title": "t"}));
+    assert_eq!(document_doc.content, upload_doc.content);
     assert_eq!(
         upload_doc.hash, document_doc.hash,
-        "the server hash must survive the jsonb round trip"
+        "the server hash survives the jsonb round trip"
     );
     assert_eq!(
-        calculate_checksum(&upload_doc.content),
+        calculate_checksum(&json!({"cents": 1200.0, "title": "t"})),
         upload_doc.hash,
-        "client hash of the echoed upload content must match the server's hash"
+        "the server hashed the float as written"
     );
-    assert_ne!(
-        calculate_checksum(&document_doc.content),
-        document_doc.hash,
-        "client-computed hash of jsonb-rounded content must not equal the server's hash"
-    );
+    assert_ne!(calculate_checksum(&upload_doc.content), upload_doc.hash);
 }

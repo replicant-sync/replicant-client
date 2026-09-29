@@ -1,3 +1,5 @@
+use json_patch::{AddOperation, PatchOperation};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -51,6 +53,9 @@ pub struct DocSnapshot {
     pub rows: Vec<OutboxRow>,
     pub memberships: Vec<Membership>,
     pub tombstone_seq: Option<Seq>,
+    /// The greatest upload id a pending row was sent in and that is not yet acknowledged: that
+    /// upload may already be applied on the server.
+    pub unacked_upload: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,7 +69,13 @@ pub enum RecoverReason {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DocEvent {
     ConflictDetected,
-    SyncError { code: String },
+    /// Only these paths collided with another device's change; the local values are kept aside.
+    FieldConflict {
+        paths: Vec<String>,
+    },
+    SyncError {
+        code: String,
+    },
 }
 
 /// A write the driver performs inside the same transaction that loaded the snapshot.
@@ -91,6 +102,12 @@ pub enum DocOp {
     Recover {
         content: Value,
         reason: RecoverReason,
+    },
+    /// Keeps the local values at colliding paths (and the full local content) in `recovered`
+    /// with reason `field_conflict`.
+    RecoverFields {
+        content: Value,
+        fields: Vec<FieldConflict>,
     },
     Emit(DocEvent),
 }
@@ -124,8 +141,14 @@ impl DocSnapshot {
                     s.owner_id = *owner_id;
                     s.read_only = *read_only;
                 }
-                DocOp::DeleteRows(ids) => s.rows.retain(|r| !ids.contains(&r.mutation_id)),
-                DocOp::DropAllRows => s.rows.clear(),
+                DocOp::DeleteRows(ids) => {
+                    s.rows.retain(|r| !ids.contains(&r.mutation_id));
+                    s.forget_settled_upload();
+                }
+                DocOp::DropAllRows => {
+                    s.rows.clear();
+                    s.unacked_upload = None;
+                }
                 DocOp::InsertMarker(kind) => s.rows.push(OutboxRow {
                     mutation_id: PROJECTED_MARKER,
                     kind: *kind,
@@ -149,10 +172,19 @@ impl DocSnapshot {
                         None => s.memberships.push(mm.clone()),
                     }
                 }
-                DocOp::Recover { .. } | DocOp::Emit(_) => {}
+                DocOp::Recover { .. } | DocOp::RecoverFields { .. } | DocOp::Emit(_) => {}
             }
         }
         s
+    }
+
+    /// A sent upload covers the rows up to its id; once none of them is left it is settled.
+    fn forget_settled_upload(&mut self) {
+        if let Some(upload_id) = self.unacked_upload {
+            if !self.rows.iter().any(|r| r.mutation_id <= upload_id) {
+                self.unacked_upload = None;
+            }
+        }
     }
 }
 
@@ -202,7 +234,8 @@ fn membership_seq(snap: &DocSnapshot, scope: &str) -> Seq {
 /// envelope is only attempted when a shadow exists and the caller says it is that base
 /// (`local_base_known`); with no shadow at all there is no trustworthy base to rebase from — the
 /// envelope may already hold our own upload whose reply was lost, or another device's edit the
-/// shadow never captured — so it settles as a conflict, same as when `local_base_known` is false.
+/// shadow never captured. With no shadow, an envelope whose content equals the local content is
+/// adopted; anything else settles as a conflict, same as when `local_base_known` is false.
 fn apply_upsert(
     snap: &DocSnapshot,
     doc: &DocEnvelope,
@@ -243,21 +276,40 @@ fn apply_upsert(
         ops.push(DocOp::SetShadow(new_shadow));
         return ops;
     }
-    let rebased = match &snap.shadow {
-        Some(old) if local_base_known => match rebase(&old.content, &doc.content, &snap.content) {
-            Rebased::Clean(v) => Some(v),
-            Rebased::Conflict => None,
-        },
-        _ => None,
-    };
-    let Some(content) = rebased else {
-        let with_new_shadow = snap.project(&[DocOp::SetShadow(new_shadow.clone())]);
+    // No base, but the envelope already holds exactly our content (a create whose reply was
+    // lost): adopt it. Both sides are hashed locally, never against the server's hash.
+    if snap.shadow.is_none() && content_hash(&snap.content) == content_hash(&doc.content) {
         ops.push(DocOp::SetShadow(new_shadow));
-        ops.extend(conflict_ops(&with_new_shadow));
+        ops.push(DocOp::DropAllRows);
         return ops;
+    }
+    let rebased = match &snap.shadow {
+        Some(old) if local_base_known => rebase(&old.content, &doc.content, &snap.content),
+        _ => Rebased::Conflict,
     };
-    ops.push(DocOp::SetShadow(new_shadow));
-    ops.push(DocOp::SetContent(content));
+    match rebased {
+        Rebased::Clean(content) => {
+            ops.push(DocOp::SetShadow(new_shadow));
+            ops.push(DocOp::SetContent(content));
+        }
+        Rebased::Fields { content, conflicts } => {
+            let paths = conflicts.iter().map(|c| c.path.clone()).collect();
+            ops.push(DocOp::RecoverFields {
+                content: snap.content.clone(),
+                fields: conflicts,
+            });
+            ops.push(DocOp::SetShadow(new_shadow));
+            // Rows stay: they still describe the non-colliding local edits (an empty diff
+            // settles them at the next build) and keep any sent marks.
+            ops.push(DocOp::SetContent(content));
+            ops.push(DocOp::Emit(DocEvent::FieldConflict { paths }));
+        }
+        Rebased::Conflict => {
+            let with_new_shadow = snap.project(&[DocOp::SetShadow(new_shadow.clone())]);
+            ops.push(DocOp::SetShadow(new_shadow));
+            ops.extend(conflict_ops(&with_new_shadow));
+        }
+    }
     ops
 }
 
@@ -408,12 +460,10 @@ pub fn sweep_doc(snap: &DocSnapshot, scope: &str, snapshot_seq: Seq) -> Vec<DocO
     ops
 }
 
-/// A full-resync snapshot document. It carries no `upload_id`, so it may already contain a v2
-/// upload of ours; array patch ops are index-based, so pending edits are never rebased onto it
-/// unless the local shadow is a migrated v1 base (`seq == 0`): they go to `recovered` instead.
-/// A doc with no shadow at all (a v2 create whose reply was lost, or a migrated v1 create never
-/// synced) cannot tell whether the snapshot already holds its pending content, so it also takes
-/// the conflict path.
+/// A full-resync snapshot document. It carries no `upload_id`, so it may already contain a sent
+/// upload of ours whose reply was lost: pending rows rebase onto it only when none of them was
+/// sent without acknowledgement (or the shadow is a migrated v1 base at seq 0); otherwise they go
+/// to `recovered`.
 pub fn apply_snapshot_doc(
     snap: &DocSnapshot,
     scope: &str,
@@ -437,25 +487,162 @@ pub fn apply_snapshot_doc(
         .iter()
         .any(|m| m.scope == scope && m.member);
     if member {
+        // Rows never sent cannot be in the snapshot, so they rebase onto it from the shadow. A
+        // sent, unacknowledged upload may already be applied there, so its rows conflict.
         let migrated_v1_base = snap.shadow.as_ref().is_some_and(|s| s.seq == 0);
-        ops.extend(apply_upsert(snap, doc, doc.seq, migrated_v1_base));
+        let base_known = migrated_v1_base || snap.unacked_upload.is_none();
+        ops.extend(apply_upsert(snap, doc, doc.seq, base_known));
     }
     with_settle_invariant(snap, ops, me)
+}
+
+/// A path both sides changed to different values: the server's value is kept, this is the
+/// local side's.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FieldConflict {
+    /// JSON Pointer.
+    pub path: String,
+    /// `Null` when `local_removed`.
+    pub local_value: Value,
+    pub local_removed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Rebased {
     Clean(Value),
+    /// Every local change applied except those at `conflicts`, where the server's value stays.
+    Fields {
+        content: Value,
+        conflicts: Vec<FieldConflict>,
+    },
+    /// No sound merge: the whole document collided, or the kept local changes do not apply.
     Conflict,
 }
 
-/// Replays the local change (`old_base` → `local`) onto `new_base`.
+/// Replays the local change (`old_base` → `local`) onto `new_base` field by field. A local
+/// operation collides with a server one when their paths are equal or one contains the other
+/// and the two sides end with different values there; the collision is recorded at the shorter
+/// path. `json_patch::diff` compares arrays position by position, so an element path is a field
+/// like any other; local appends never collide and are re-appended after the server's.
 pub fn rebase(old_base: &Value, new_base: &Value, local: &Value) -> Rebased {
-    let local_patch = json_patch::diff(old_base, local);
+    let local_ops = json_patch::diff(old_base, local).0;
+    let their_paths: Vec<String> = json_patch::diff(old_base, new_base)
+        .0
+        .iter()
+        .map(|op| op_path(op).to_string())
+        .collect();
+    let mut contested: Vec<String> = Vec::new();
+    for op in local_ops.iter().filter(|op| !is_append(old_base, op)) {
+        let path = op_path(op);
+        let shortest = their_paths
+            .iter()
+            .filter(|theirs| contains(theirs, path) || contains(path, theirs))
+            .map(|theirs| {
+                if theirs.len() < path.len() {
+                    theirs.as_str()
+                } else {
+                    path
+                }
+            })
+            .min_by_key(|p| p.len());
+        if let Some(p) = shortest {
+            if !contested.iter().any(|c| c == p) {
+                contested.push(p.to_string());
+            }
+        }
+    }
+    let outermost: Vec<String> = contested
+        .iter()
+        .filter(|p| !contested.iter().any(|q| q != *p && contains(q, p)))
+        .cloned()
+        .collect();
+    if outermost.iter().any(|p| p.is_empty()) {
+        return Rebased::Conflict;
+    }
+    let conflicts: Vec<FieldConflict> = outermost
+        .iter()
+        .filter(|p| local.pointer(p) != new_base.pointer(p))
+        .map(|p| FieldConflict {
+            path: p.clone(),
+            local_value: local.pointer(p).cloned().unwrap_or(Value::Null),
+            local_removed: local.pointer(p).is_none(),
+        })
+        .collect();
+    let mut kept = Vec::new();
+    let mut appends = Vec::new();
+    for op in local_ops {
+        if is_append(old_base, &op) {
+            // `<parent>/-` on an object would add a key named "-".
+            if !matches!(new_base.pointer(append_parent(&op)), Some(Value::Array(_))) {
+                return Rebased::Conflict;
+            }
+            appends.push(to_end(op));
+        } else if !outermost.iter().any(|p| contains(p, op_path(&op))) {
+            kept.push(op);
+        }
+    }
+    kept.extend(appends);
     let mut out = new_base.clone();
-    match json_patch::patch(&mut out, &local_patch) {
-        Ok(()) => Rebased::Clean(out),
-        Err(_) => Rebased::Conflict,
+    if json_patch::patch(&mut out, &kept).is_err() {
+        return Rebased::Conflict;
+    }
+    if conflicts.is_empty() {
+        Rebased::Clean(out)
+    } else {
+        Rebased::Fields {
+            content: out,
+            conflicts,
+        }
+    }
+}
+
+fn op_path(op: &PatchOperation) -> &str {
+    match op {
+        PatchOperation::Add(op) => &op.path,
+        PatchOperation::Remove(op) => &op.path,
+        PatchOperation::Replace(op) => &op.path,
+        PatchOperation::Move(op) => &op.path,
+        PatchOperation::Copy(op) => &op.path,
+        PatchOperation::Test(op) => &op.path,
+    }
+}
+
+/// `path` is `ancestor` or lies under it ("" contains every path).
+fn contains(ancestor: &str, path: &str) -> bool {
+    path == ancestor
+        || (path.len() > ancestor.len()
+            && path.starts_with(ancestor)
+            && path.as_bytes()[ancestor.len()] == b'/')
+}
+
+/// An `add` at or past the end of an array the old base already had.
+fn is_append(old_base: &Value, op: &PatchOperation) -> bool {
+    let PatchOperation::Add(add) = op else {
+        return false;
+    };
+    let Some((parent, index)) = add.path.rsplit_once('/') else {
+        return false;
+    };
+    match (old_base.pointer(parent), index.parse::<usize>()) {
+        (Some(Value::Array(items)), Ok(index)) => index >= items.len(),
+        _ => false,
+    }
+}
+
+fn append_parent(op: &PatchOperation) -> &str {
+    op_path(op)
+        .rsplit_once('/')
+        .map_or("", |(parent, _)| parent)
+}
+
+fn to_end(op: PatchOperation) -> PatchOperation {
+    let path = format!("{}/-", append_parent(&op));
+    match op {
+        PatchOperation::Add(add) => PatchOperation::Add(AddOperation {
+            path,
+            value: add.value,
+        }),
+        other => other,
     }
 }
 
@@ -505,6 +692,7 @@ pub(crate) mod fixtures {
                 seq,
             }],
             tombstone_seq: None,
+            unacked_upload: None,
         }
     }
 
@@ -759,19 +947,45 @@ mod apply_change_tests {
     }
 
     #[test]
-    fn rebase_conflict_recovers_local_and_takes_server() {
+    fn rebase_field_conflict_keeps_the_local_value_aside_and_takes_the_server_value() {
         let mut s = synced(json!({"a": {"x": 1}}), 1);
         s.content = json!({"a": {"x": 2}});
         s.rows = vec![row(5, RowKind::Update)];
         let ops = apply_change(&s, &upsert("own", json!({}), 2), ME);
-        assert!(ops.contains(&DocOp::Recover {
+        assert!(ops.contains(&DocOp::RecoverFields {
             content: json!({"a": {"x": 2}}),
-            reason: RecoverReason::Conflict
+            fields: vec![FieldConflict {
+                path: "/a".into(),
+                local_value: json!({"x": 2}),
+                local_removed: false
+            }]
         }));
-        assert!(ops.contains(&DocOp::Emit(DocEvent::ConflictDetected)));
+        assert!(ops.contains(&DocOp::Emit(DocEvent::FieldConflict {
+            paths: vec!["/a".into()]
+        })));
+        assert!(!ops.iter().any(|op| matches!(op, DocOp::Recover { .. })));
         let after = s.project(&ops);
         assert_eq!(after.content, json!({}));
-        assert!(after.rows.is_empty());
+        assert_eq!(
+            after.rows.len(),
+            1,
+            "rows stay; the next build settles an empty diff"
+        );
+    }
+
+    #[test]
+    fn field_conflict_keeps_non_colliding_local_edits_pending() {
+        let mut s = synced(json!({"s": "old", "k": 1}), 1);
+        s.content = json!({"s": "mine", "k": 2});
+        s.rows = vec![row(5, RowKind::Update)];
+        let ops = apply_change(&s, &upsert("own", json!({"s": "theirs", "k": 1}), 2), ME);
+        let after = s.project(&ops);
+        assert_eq!(after.content, json!({"s": "theirs", "k": 2}));
+        assert_eq!(
+            after.shadow.unwrap().content,
+            json!({"s": "theirs", "k": 1})
+        );
+        assert_eq!(after.rows.len(), 1);
     }
 
     #[test]
@@ -930,6 +1144,27 @@ mod apply_change_tests {
         let after = s.project(&ops);
         assert_eq!(after.content, json!({"items": ["a", "x"]}));
         assert!(after.rows.is_empty());
+    }
+
+    #[test]
+    fn server_copy_field_conflict_with_a_sent_unacked_upload_keeps_rows_and_the_mark() {
+        let mut s = synced(json!({"s": "old", "k": 1}), 1);
+        s.content = json!({"s": "mine", "k": 2});
+        s.rows = vec![row(5, RowKind::Update)];
+        s.unacked_upload = Some(m(5));
+        let ops = apply_server_copy(&s, &env(json!({"s": "theirs", "k": 1}), 2), ME);
+        assert!(ops.contains(&DocOp::RecoverFields {
+            content: json!({"s": "mine", "k": 2}),
+            fields: vec![FieldConflict {
+                path: "/s".into(),
+                local_value: json!("mine"),
+                local_removed: false
+            }]
+        }));
+        let after = s.project(&ops);
+        assert_eq!(after.content, json!({"s": "theirs", "k": 2}));
+        assert_eq!(after.rows.len(), 1);
+        assert_eq!(after.unacked_upload, Some(m(5)));
     }
 
     #[test]
@@ -1270,31 +1505,162 @@ mod rebase_tests {
     }
 
     #[test]
+    fn append_to_an_array_the_server_made_an_object_is_a_conflict() {
+        let r = rebase(
+            &json!({"items": ["a"]}),
+            &json!({"items": {"k": 1}}),
+            &json!({"items": ["a", "b"]}),
+        );
+        assert_eq!(r, Rebased::Conflict);
+    }
+
+    #[test]
     fn no_local_change_takes_new_base() {
         let r = rebase(&json!({"a": 1}), &json!({"a": 2}), &json!({"a": 1}));
         assert_eq!(r, Rebased::Clean(json!({"a": 2})));
     }
 
+    fn kept(path: &str, local_value: Value) -> FieldConflict {
+        FieldConflict {
+            path: path.into(),
+            local_value,
+            local_removed: false,
+        }
+    }
+
     #[test]
-    fn edit_under_removed_parent_conflicts() {
-        let r = rebase(&json!({"a": {"x": 1}}), &json!({}), &json!({"a": {"x": 2}}));
-        assert_eq!(r, Rebased::Conflict);
+    fn edit_under_removed_parent_is_a_field_conflict() {
+        let r = rebase(
+            &json!({"a": {"x": 1}, "k": 1}),
+            &json!({"k": 1}),
+            &json!({"a": {"x": 2}, "k": 2}),
+        );
+        assert_eq!(
+            r,
+            Rebased::Fields {
+                content: json!({"k": 2}),
+                conflicts: vec![kept("/a", json!({"x": 2}))]
+            }
+        );
+    }
+
+    #[test]
+    fn same_field_set_on_both_sides_is_a_field_conflict() {
+        let r = rebase(
+            &json!({"s": "old", "k": 1}),
+            &json!({"s": "theirs", "k": 1}),
+            &json!({"s": "mine", "k": 2}),
+        );
+        assert_eq!(
+            r,
+            Rebased::Fields {
+                content: json!({"s": "theirs", "k": 2}),
+                conflicts: vec![kept("/s", json!("mine"))]
+            }
+        );
+    }
+
+    #[test]
+    fn same_value_on_both_sides_is_not_a_conflict() {
+        let r = rebase(&json!({"s": "old"}), &json!({"s": "x"}), &json!({"s": "x"}));
+        assert_eq!(r, Rebased::Clean(json!({"s": "x"})));
+    }
+
+    #[test]
+    fn local_remove_against_a_server_set_is_a_field_conflict() {
+        let r = rebase(
+            &json!({"s": "old", "k": 1}),
+            &json!({"s": "theirs", "k": 1}),
+            &json!({"k": 1}),
+        );
+        assert_eq!(
+            r,
+            Rebased::Fields {
+                content: json!({"s": "theirs", "k": 1}),
+                conflicts: vec![FieldConflict {
+                    path: "/s".into(),
+                    local_value: Value::Null,
+                    local_removed: true
+                }]
+            }
+        );
+    }
+
+    #[test]
+    fn an_ancestor_and_a_descendant_change_collide_at_the_ancestor() {
+        let r = rebase(
+            &json!({"a": {"x": 1, "y": 1}}),
+            &json!({"a": {"x": 2, "y": 1}}),
+            &json!({"a": "flat"}),
+        );
+        assert_eq!(
+            r,
+            Rebased::Fields {
+                content: json!({"a": {"x": 2, "y": 1}}),
+                conflicts: vec![kept("/a", json!("flat"))]
+            }
+        );
+    }
+
+    #[test]
+    fn appends_to_one_array_from_both_sides_merge() {
+        let r = rebase(
+            &json!({"items": ["a"]}),
+            &json!({"items": ["a", "t"]}),
+            &json!({"items": ["a", "m1", "m2"]}),
+        );
+        assert_eq!(r, Rebased::Clean(json!({"items": ["a", "t", "m1", "m2"]})));
+    }
+
+    #[test]
+    fn the_same_array_element_changed_on_both_sides_is_a_field_conflict() {
+        let r = rebase(
+            &json!({"items": ["a", "b", "c"]}),
+            &json!({"items": ["a", "B", "c"]}),
+            &json!({"items": ["a", "b2", "C"]}),
+        );
+        assert_eq!(
+            r,
+            Rebased::Fields {
+                content: json!({"items": ["a", "B", "C"]}),
+                conflicts: vec![kept("/items/1", json!("b2"))]
+            }
+        );
+    }
+
+    #[test]
+    fn array_diffs_are_positional() {
+        // The collision rule treats array element paths as fields; that is only sound while
+        // json_patch::diff compares arrays position by position.
+        let patch = json_patch::diff(&json!(["a", "b", "c"]), &json!(["b", "c", "d", "e"]));
+        assert_eq!(
+            serde_json::to_value(&patch).unwrap(),
+            json!([
+                {"op": "replace", "path": "/0", "value": "b"},
+                {"op": "replace", "path": "/1", "value": "c"},
+                {"op": "replace", "path": "/2", "value": "d"},
+                {"op": "add", "path": "/3", "value": "e"}
+            ])
+        );
     }
 }
 
 #[cfg(test)]
 mod property_tests {
-    //! One writable document against a model server that applies uploads (deduplicated by
-    //! `(upload_id, base_hash)`). Changes reach the client as pushes (envelope at the change's
-    //! seq) or catch-up pages (current envelope). A lost reply is a reconnect: every committed
-    //! change is delivered before the next build.
+    //! One writable document against a model server that applies updates and deletes
+    //! (deduplicated by `(upload_id, base_hash)`) and that another device edits or deletes.
+    //! Changes reach the client as pushes (envelope at the change's seq) or catch-up pages
+    //! (current envelope). A lost reply is either a reconnect (every committed change is
+    //! delivered before the next build) or silent (the client learns of it only through
+    //! `hash_mismatch`). Like the machine, the client applies a server copy only once it has
+    //! been delivered every change up to the copy's seq; otherwise it catches up and rebuilds.
     use std::collections::HashMap;
 
     use super::change_fixtures::env;
     use super::fixtures::*;
     use super::*;
     use crate::engine::backoff::Jitter;
-    use crate::engine::types::{ServerError, Upload};
+    use crate::engine::types::{ServerError, Upload, UploadKind};
     use serde_json::json;
 
     const SEEDS: u64 = 500;
@@ -1302,12 +1668,59 @@ mod property_tests {
     const MAX_LOCAL_EDITS: u32 = 12;
     const MAX_OTHER_EDITS: u32 = 8;
 
+    #[derive(Debug, Clone, Copy)]
+    struct Committed {
+        seq: Seq,
+        upload_id: Option<Uuid>,
+        deleted: bool,
+    }
+
+    /// How often each rarely reached branch ran.
+    #[derive(Debug, Default)]
+    struct Hits {
+        /// Rebase conflicts hit by a change-feed delivery (push or catch-up page).
+        rebase_conflicts_delivery: u32,
+        /// Rebase conflicts hit while settling a fetched server copy.
+        rebase_conflicts_server_copy: u32,
+        server_copy_fetches: u32,
+        server_copy_waits: u32,
+        mismatch_retries: u32,
+        delete_wins: u32,
+        local_deletes_settled: u32,
+        equal_content_adopts: u32,
+        never_sent_rebases: u32,
+        field_conflicts: u32,
+    }
+
+    impl Hits {
+        fn add(&mut self, other: &Hits) {
+            self.rebase_conflicts_delivery += other.rebase_conflicts_delivery;
+            self.rebase_conflicts_server_copy += other.rebase_conflicts_server_copy;
+            self.server_copy_fetches += other.server_copy_fetches;
+            self.server_copy_waits += other.server_copy_waits;
+            self.mismatch_retries += other.mismatch_retries;
+            self.delete_wins += other.delete_wins;
+            self.local_deletes_settled += other.local_deletes_settled;
+            self.equal_content_adopts += other.equal_content_adopts;
+            self.never_sent_rebases += other.never_sent_rebases;
+            self.field_conflicts += other.field_conflicts;
+        }
+    }
+
     struct Server {
         /// Index = seq; seq 1 is the content both sides start from.
         history: Vec<Value>,
-        changes: Vec<(Seq, Option<Uuid>)>,
-        stored: HashMap<(Uuid, String), Seq>,
+        changes: Vec<Committed>,
+        stored: HashMap<(Uuid, Option<String>), Seq>,
         other_edits: u32,
+        deleted: bool,
+        /// (order, seq, value) of every other-device write to `shared`, in the order they
+        /// happened; `None` value = removed. `order` comes from the shared counter every write
+        /// to `shared` advances (see `Client::edit`), used to tell whether *some* other-device
+        /// write happened after a given local one. `seq` is the server's real commit order,
+        /// needed to tell whether this write's value actually won a race against a local upload
+        /// that landed later in true time (see `check_shared_key_preserved`).
+        other_shared_writes: Vec<(u64, Seq, Option<String>)>,
     }
 
     impl Server {
@@ -1317,6 +1730,8 @@ mod property_tests {
                 changes: Vec::new(),
                 stored: HashMap::new(),
                 other_edits: 0,
+                deleted: false,
+                other_shared_writes: Vec::new(),
             }
         }
 
@@ -1332,43 +1747,85 @@ mod property_tests {
             env(self.history[seq as usize].clone(), seq)
         }
 
-        fn commit(&mut self, content: Value, upload_id: Option<Uuid>) -> Seq {
+        fn commit(&mut self, content: Value, upload_id: Option<Uuid>, deleted: bool) -> Seq {
             self.history.push(content);
             let seq = self.seq();
-            self.changes.push((seq, upload_id));
+            self.changes.push(Committed {
+                seq,
+                upload_id,
+                deleted,
+            });
             seq
         }
 
-        fn other_device_edit(&mut self) {
-            if self.other_edits == MAX_OTHER_EDITS {
+        /// Bumps `theirs` and sets or removes `shared`: setting or removing it collides with a
+        /// concurrent local write (a field conflict). `order` is the counter every write to
+        /// `shared`, from either side, advances (see `Client::edit`).
+        fn other_device_edit(&mut self, rng: &mut Jitter, order: &mut u64) {
+            if self.deleted || self.other_edits == MAX_OTHER_EDITS {
                 return;
             }
             self.other_edits += 1;
             let mut next = self.current().clone();
             next["theirs"] = json!(self.other_edits);
-            self.commit(next, None);
+            let shared_write = if rng.next_unit() < 0.5 {
+                let value = format!("theirs{}", self.other_edits);
+                next["shared"] = json!(value);
+                Some(Some(value))
+            } else if next.get("shared").is_some() {
+                // Removing a key that was never there changes nothing observable: not a write.
+                next.as_object_mut()
+                    .expect("content is an object")
+                    .remove("shared");
+                Some(None)
+            } else {
+                None
+            };
+            let seq = self.commit(next, None, false);
+            if let Some(value) = shared_write {
+                *order += 1;
+                self.other_shared_writes.push((*order, seq, value));
+            }
+        }
+
+        fn other_device_delete(&mut self) {
+            if self.deleted {
+                return;
+            }
+            self.deleted = true;
+            self.commit(self.current().clone(), None, true);
         }
 
         fn upload(&mut self, upload: &Upload) -> Result<DocEnvelope, ServerError> {
-            let base_hash = upload
-                .base_hash
-                .clone()
-                .expect("the model only uploads updates");
-            if let Some(seq) = self.stored.get(&(upload.upload_id, base_hash.clone())) {
+            let key = (upload.upload_id, upload.base_hash.clone());
+            if let Some(seq) = self.stored.get(&key) {
                 return Ok(self.envelope(*seq));
             }
-            let current_hash = content_hash(self.current());
-            if base_hash != current_hash {
-                let mut error = ServerError::new("hash_mismatch");
-                error.current_hash = Some(current_hash);
-                error.current_seq = Some(self.seq());
-                return Err(error);
+            if self.deleted {
+                return Err(ServerError::new("not_found"));
             }
-            let patch: json_patch::Patch = serde_json::from_value(upload.payload.clone()).unwrap();
-            let mut next = self.current().clone();
-            json_patch::patch(&mut next, &patch).unwrap();
-            let seq = self.commit(next, Some(upload.upload_id));
-            self.stored.insert((upload.upload_id, base_hash), seq);
+            let seq = match upload.kind {
+                UploadKind::Delete => {
+                    self.deleted = true;
+                    self.commit(self.current().clone(), Some(upload.upload_id), true)
+                }
+                UploadKind::Update => {
+                    let current_hash = content_hash(self.current());
+                    if upload.base_hash.as_deref() != Some(current_hash.as_str()) {
+                        let mut error = ServerError::new("hash_mismatch");
+                        error.current_hash = Some(current_hash);
+                        error.current_seq = Some(self.seq());
+                        return Err(error);
+                    }
+                    let patch: json_patch::Patch =
+                        serde_json::from_value(upload.payload.clone()).unwrap();
+                    let mut next = self.current().clone();
+                    json_patch::patch(&mut next, &patch).unwrap();
+                    self.commit(next, Some(upload.upload_id), false)
+                }
+                UploadKind::Create => panic!("the model document always exists on the server"),
+            };
+            self.stored.insert(key, seq);
             Ok(self.envelope(seq))
         }
     }
@@ -1379,9 +1836,32 @@ mod property_tests {
         in_flight: Option<(InFlight, Result<DocEnvelope, ServerError>)>,
         mismatches: u32,
         delivered: usize,
+        /// Highest seq delivered: the model's committed `own` cursor.
+        cursor: Seq,
         must_catch_up: bool,
         local_edits: u32,
+        /// `n` of every `t{n}` appended to `items`.
+        tokens: Vec<u32>,
+        deleted_locally: bool,
         recovered: Vec<Value>,
+        hits: Hits,
+        /// (order, value) of every local write to `shared`, in the order they happened —
+        /// recorded in `edit`, the moment the write is made, whether or not it ever reaches an
+        /// upload (a rebase can silently drop a pending edit before it is ever built). Used to
+        /// tell whether a local write was ever accounted for at all.
+        local_shared_writes: Vec<(u64, String)>,
+        /// (seq, value) of the shared key's value in the last local upload that actually landed
+        /// on the server and touched `/shared` — `seq` is the server's real commit order, which
+        /// `local_shared_writes`'s `order` cannot give: a local write racing a concurrent
+        /// other-device write is settled by whichever lands with a matching hash, not by which
+        /// was queued first, so only a real landing seq can tell whether it won. The value is
+        /// captured in `build`, at upload time, not from `snap.content` on the reply — content
+        /// can have moved on by then, which would pair a stale seq with fresher content.
+        landed_shared: Option<(Seq, String)>,
+        /// Every field kept aside by a `RecoverFields`, across the whole run.
+        field_recovered: Vec<FieldConflict>,
+        /// (seq, value) of `shared` in every local upload that landed and touched it.
+        landed_shared_writes: Vec<(Seq, String)>,
     }
 
     impl Client {
@@ -1392,27 +1872,35 @@ mod property_tests {
                 in_flight: None,
                 mismatches: 0,
                 delivered: 0,
+                cursor: 1,
                 must_catch_up: false,
                 local_edits: 0,
+                tokens: Vec::new(),
+                deleted_locally: false,
                 recovered: Vec::new(),
+                hits: Hits::default(),
+                local_shared_writes: Vec::new(),
+                landed_shared: None,
+                field_recovered: Vec::new(),
+                landed_shared_writes: Vec::new(),
             }
         }
 
-        /// A v2 create whose upload landed but the reply was lost: no shadow yet, one pending
-        /// `Create` row. Fuzzes the no-shadow branch of `apply_snapshot_doc` and `apply_change`'s
-        /// non-echo arm (every push or page delivered before this client's create resolves),
-        /// plus its echo arm on the seeds where `server.changes` carries a matching entry.
-        /// `apply_server_copy`'s no-shadow branch is not reached here: `build` never sends while
-        /// the shadow is still unset.
+        /// A v2 create whose upload landed but whose reply was lost: no shadow yet, one pending
+        /// `Create` row. Fuzzes the no-shadow branch of `apply_snapshot_doc` and of
+        /// `apply_change`'s non-echo arm, plus its echo arm on the seeds where `server.changes`
+        /// carries a matching entry.
         fn new_lost_create(content: Value) -> Client {
             let mut c = Client::new(content);
             c.snap.shadow = None;
+            c.cursor = 0;
             c.next_row = 1;
             c.snap.rows = vec![OutboxRow {
                 mutation_id: m(1),
                 kind: RowKind::Create,
                 parked: false,
             }];
+            c.snap.unacked_upload = Some(m(1));
             c
         }
 
@@ -1431,66 +1919,201 @@ mod property_tests {
             for op in ops {
                 match op {
                     DocOp::InsertMarker(kind) => self.push_row(*kind),
-                    DocOp::Recover { content, .. } => self.recovered.push(content.clone()),
+                    DocOp::Recover { content, reason } => {
+                        if *reason == RecoverReason::DeleteWins {
+                            self.hits.delete_wins += 1;
+                        }
+                        self.recovered.push(content.clone());
+                    }
+                    DocOp::RecoverFields { fields, .. } => {
+                        self.field_recovered.extend(fields.iter().cloned());
+                    }
                     other => self.snap = self.snap.project(std::slice::from_ref(other)),
                 }
             }
-            assert!(
-                self.snap.server_seq() >= seq_before,
-                "shadow seq went backwards"
-            );
+            // A hard delete without a tombstone (sweep, `not_found`) drops the shadow on purpose.
+            if self.snap.exists {
+                assert!(
+                    self.snap.server_seq() >= seq_before,
+                    "shadow seq went backwards"
+                );
+            }
         }
 
-        fn edit(&mut self) {
-            if self.local_edits == MAX_LOCAL_EDITS {
+        /// A local edit as the store accepts it: never on a deleted document. `order` is the
+        /// counter every write to `shared`, from either side, advances — assigned the moment
+        /// the write is made, not the server seq it may or may not ever reach.
+        fn edit(&mut self, rng: &mut Jitter, order: &mut u64) {
+            if !self.snap.exists || self.snap.soft_deleted || self.local_edits == MAX_LOCAL_EDITS {
                 return;
             }
             self.local_edits += 1;
-            let token = json!(format!("t{}", self.local_edits));
-            self.snap.content["items"]
-                .as_array_mut()
-                .expect("items array")
-                .push(token);
+            let n = self.local_edits;
+            if rng.next_unit() < 0.3 {
+                let value = format!("mine{n}");
+                self.snap.content["shared"] = json!(value);
+                *order += 1;
+                self.local_shared_writes.push((*order, value));
+            } else {
+                self.snap.content["items"]
+                    .as_array_mut()
+                    .expect("items array")
+                    .push(token(n));
+                self.tokens.push(n);
+            }
             self.push_row(RowKind::Update);
         }
 
+        /// A local delete as the store writes it: soft delete plus a `Delete` row.
+        fn delete(&mut self) {
+            if !self.snap.exists || self.snap.soft_deleted {
+                return;
+            }
+            self.snap.soft_deleted = true;
+            self.push_row(RowKind::Delete);
+            self.deleted_locally = true;
+        }
+
+        /// A non-echo delivery or server copy onto a shadow with pending rows that recovers as
+        /// a conflict is a rebase that failed.
+        fn count_rebase_conflict(
+            &mut self,
+            rebase_possible: bool,
+            ops: &[DocOp],
+            via_server_copy: bool,
+        ) {
+            let whole_conflicted = ops.iter().any(|op| {
+                matches!(
+                    op,
+                    DocOp::Recover {
+                        reason: RecoverReason::Conflict,
+                        ..
+                    }
+                )
+            });
+            let field_conflicted = ops
+                .iter()
+                .any(|op| matches!(op, DocOp::RecoverFields { .. }));
+            if rebase_possible && (whole_conflicted || field_conflicted) {
+                if via_server_copy {
+                    self.hits.rebase_conflicts_server_copy += 1;
+                } else {
+                    self.hits.rebase_conflicts_delivery += 1;
+                }
+                if field_conflicted {
+                    self.hits.field_conflicts += 1;
+                }
+            }
+        }
+
+        /// A pending document with no shadow whose content the envelope already holds (hashed
+        /// locally on both sides) must be adopted, never recovered.
+        fn equal_content_adoptable(&self, doc: &DocEnvelope, guard_seq: Seq) -> bool {
+            self.snap.exists
+                && self.snap.shadow.is_none()
+                && !self.snap.rows.is_empty()
+                && !delete_pending(&self.snap)
+                && !doc.read_only
+                && guard_seq > self.snap.server_seq()
+                && content_hash(&self.snap.content) == content_hash(&doc.content)
+        }
+
+        fn check_adopted(&mut self, adoptable: bool, ops: &[DocOp]) {
+            if !adoptable {
+                return;
+            }
+            assert!(
+                !ops.iter().any(|op| matches!(op, DocOp::Recover { .. })),
+                "equal content must be adopted, not recovered"
+            );
+            assert!(
+                self.snap.project(ops).rows.is_empty(),
+                "adopting equal content settles every row"
+            );
+            self.hits.equal_content_adopts += 1;
+        }
+
         fn deliver(&mut self, server: &Server, as_page: bool) {
-            let Some(&(seq, upload_id)) = server.changes.get(self.delivered) else {
+            let Some(&committed) = server.changes.get(self.delivered) else {
                 return;
             };
             self.delivered += 1;
-            let doc = if as_page {
-                server.envelope(server.seq())
-            } else {
-                server.envelope(seq)
-            };
-            let is_echo_for_us = upload_id.is_some_and(|u| self.rows_contain(u));
-            let pending_delete_before = self
-                .snap
-                .rows
-                .last()
-                .is_some_and(|r| r.kind == RowKind::Delete);
-            let before_server_seq = self.snap.server_seq();
+            // Protocol.changes_since loads only the document's current row and drops any upsert
+            // whose document is since deleted (its `live?/1` filter): the cursor still advances
+            // past it, but a real catch-up page never delivers it at all.
+            // A page read after the delete drops every upsert before it in one go: no later
+            // push of those changes can follow that page.
+            if as_page && server.deleted && !committed.deleted {
+                while server
+                    .changes
+                    .get(self.delivered)
+                    .is_some_and(|c| !c.deleted)
+                {
+                    self.delivered += 1;
+                }
+                self.cursor = self.cursor.max(server.changes[self.delivered - 1].seq);
+                return;
+            }
+            let doc = (!committed.deleted).then(|| {
+                if as_page {
+                    server.envelope(server.seq())
+                } else {
+                    server.envelope(committed.seq)
+                }
+            });
             let change = Change {
                 scope: "own".into(),
-                seq,
-                prev_seq: seq - 1,
+                seq: committed.seq,
+                prev_seq: committed.seq - 1,
                 doc_id: DOC,
-                kind: ChangeKind::Upsert,
-                doc: Some(doc.clone()),
+                kind: if committed.deleted {
+                    ChangeKind::Delete
+                } else {
+                    ChangeKind::Upsert
+                },
+                doc: doc.clone(),
                 client_id: None,
-                upload_id,
+                upload_id: committed.upload_id,
             };
+            let is_echo_for_us = committed.upload_id.is_some_and(|u| self.rows_contain(u));
+            let pending_delete_before = delete_pending(&self.snap);
+            let rebase_possible = self.snap.shadow.is_some() && !self.snap.rows.is_empty();
+            let before_server_seq = self.snap.server_seq();
+            let old_shadow_content = self.snap.shadow.as_ref().map(|s| s.content.clone());
+            let local_content_before = self.snap.content.clone();
+            let adoptable = !is_echo_for_us
+                && doc
+                    .as_ref()
+                    .is_some_and(|doc| self.equal_content_adoptable(doc, committed.seq));
             let ops = apply_change(&self.snap, &change, ME);
+            self.check_adopted(adoptable, &ops);
+            self.count_rebase_conflict(rebase_possible && !is_echo_for_us, &ops, false);
+            if rebase_possible
+                && !is_echo_for_us
+                && !pending_delete_before
+                && committed.seq > before_server_seq
+            {
+                if let (Some(shadow_content), Some(doc)) = (&old_shadow_content, &doc) {
+                    assert_shared_collision_kept_aside(
+                        "deliver",
+                        self,
+                        shadow_content,
+                        &local_content_before,
+                        &doc.content,
+                        &ops,
+                    );
+                }
+            }
             self.apply(&ops);
-            if !is_echo_for_us {
-                // apply_change's content guard gates on the change's own seq, not the envelope's
-                // (a page can carry a newer envelope than the change it is delivering).
+            self.cursor = self.cursor.max(committed.seq);
+            if let (false, Some(doc)) = (is_echo_for_us, &doc) {
+                // apply_change's content guard gates on the change's own seq, not the
+                // envelope's (a page can carry a newer envelope than the change it delivers).
                 assert_other_device_edit_preserved(
                     before_server_seq,
-                    seq,
+                    committed.seq,
                     pending_delete_before,
-                    &doc,
+                    doc,
                     self,
                     &ops,
                     "deliver",
@@ -1510,56 +2133,101 @@ mod property_tests {
             self.must_catch_up = false;
         }
 
-        /// A full resync: the current envelope as a snapshot document; the cursor jumps past
-        /// every committed change.
+        /// A full resync: the current envelope as a snapshot document, or the sweep when the
+        /// server no longer lists the document; the cursor jumps past every committed change.
         fn snapshot(&mut self, server: &Server) {
-            let doc = server.envelope(server.seq());
-            // A pending delete wins unconditionally (shadow only); it is not a conflict.
-            let pending_delete = self
-                .snap
-                .rows
-                .last()
-                .is_some_and(|r| r.kind == RowKind::Delete);
-            // Only a migrated v1 base (shadow seq 0) rebases; no shadow at all is also a
-            // conflict (a create whose reply was lost cannot tell what the snapshot already has).
-            let migrated_v1_base = self.snap.shadow.as_ref().is_some_and(|s| s.seq == 0);
-            let recovers = !self.snap.rows.is_empty()
-                && !pending_delete
-                && !migrated_v1_base
-                && doc.seq > self.snap.server_seq();
-            let pre_content = self.snap.content.clone();
-
-            let ops = apply_snapshot_doc(&self.snap, "own", &doc, ME);
-            if recovers {
-                assert!(
-                    ops.contains(&DocOp::Recover {
-                        content: pre_content,
-                        reason: RecoverReason::Conflict,
-                    }),
-                    "a doc with pending rows and no migrated base must recover its exact local content"
-                );
-                assert!(
-                    !ops.iter().any(|op| matches!(op, DocOp::InsertMarker(_))),
-                    "a doc with pending rows and no migrated base must never rebase onto a snapshot"
-                );
+            if server.deleted {
+                let ops = sweep_doc(&self.snap, "own", server.seq());
+                self.apply(&ops);
+            } else {
+                let doc = server.envelope(server.seq());
+                // Rows rebase with a migrated v1 base or when none was sent unacknowledged; no
+                // shadow at all is a conflict.
+                let migrated_v1_base = self.snap.shadow.as_ref().is_some_and(|s| s.seq == 0);
+                let adoptable = self.equal_content_adoptable(&doc, doc.seq);
+                let recovers = !adoptable
+                    && self.snap.exists
+                    && !self.snap.rows.is_empty()
+                    && !delete_pending(&self.snap)
+                    && !doc.read_only
+                    && !migrated_v1_base
+                    && doc.seq > self.snap.server_seq()
+                    && (self.snap.shadow.is_none() || self.snap.unacked_upload.is_some());
+                // Rows never sent cannot be in the snapshot: a clean rebase must not recover them.
+                let never_sent_rebase = self.snap.exists
+                    && !self.snap.rows.is_empty()
+                    && !delete_pending(&self.snap)
+                    && !doc.read_only
+                    && doc.seq > self.snap.server_seq()
+                    && self.snap.unacked_upload.is_none()
+                    && self.snap.shadow.as_ref().is_some_and(|shadow| {
+                        matches!(
+                            rebase(&shadow.content, &doc.content, &self.snap.content),
+                            Rebased::Clean(_) | Rebased::Fields { .. }
+                        )
+                    });
+                let pre_content = self.snap.content.clone();
+                let ops = apply_snapshot_doc(&self.snap, "own", &doc, ME);
+                self.check_adopted(adoptable, &ops);
+                if never_sent_rebase {
+                    assert!(
+                        !ops.iter().any(|op| matches!(op, DocOp::Recover { .. })),
+                        "never-sent edits were recovered instead of rebased"
+                    );
+                    self.hits.never_sent_rebases += 1;
+                }
+                if recovers {
+                    assert!(
+                        ops.contains(&DocOp::Recover {
+                            content: pre_content,
+                            reason: RecoverReason::Conflict,
+                        }),
+                        "a doc with pending rows and no migrated base must recover its exact local content"
+                    );
+                    assert!(
+                        !ops.iter().any(|op| matches!(op, DocOp::InsertMarker(_))),
+                        "a doc with pending rows and no migrated base must never rebase onto a snapshot"
+                    );
+                }
+                self.apply(&ops);
             }
-            self.apply(&ops);
             self.delivered = server.changes.len();
+            self.cursor = server.seq();
             self.must_catch_up = false;
         }
 
         fn build(&mut self, server: &mut Server, rng: &mut Jitter) {
-            // The model server only accepts updates against an existing document: a client with
-            // no shadow yet (a pending create) waits for a page or snapshot to give it one.
-            if self.in_flight.is_some() || self.snap.shadow.is_none() {
+            if self.in_flight.is_some() {
                 return;
             }
             if self.must_catch_up {
                 self.catch_up(server, rng);
             }
+            let ends_in_delete = self
+                .snap
+                .rows
+                .last()
+                .is_some_and(|r| r.kind == RowKind::Delete);
+            // The model server takes updates and deletes only: a pending create waits for a
+            // page or snapshot to give it a shadow.
+            if !self.snap.exists || (self.snap.shadow.is_none() && !ends_in_delete) {
+                return;
+            }
             match build_upload(&self.snap, ME) {
                 BuildResult::Send { upload, inflight } => {
+                    self.snap.unacked_upload = self.snap.unacked_upload.max(Some(upload.upload_id));
+                    // Captured now, not from `snap.content` on the reply: content can move on
+                    // (a later local edit) before the reply for this exact upload comes back.
+                    let shared_at_build = (upload.kind == UploadKind::Update
+                        && upload_touches_shared(&upload.payload))
+                    .then(|| self.snap.content.get("shared").and_then(Value::as_str))
+                    .flatten()
+                    .map(str::to_string);
                     let reply = server.upload(&upload);
+                    if let (Some(value), Ok(envelope)) = (shared_at_build, &reply) {
+                        self.landed_shared = Some((envelope.seq, value.clone()));
+                        self.landed_shared_writes.push((envelope.seq, value));
+                    }
                     self.in_flight = Some((inflight, reply));
                 }
                 BuildResult::SettleLocally(ops) => self.apply(&ops),
@@ -1568,25 +2236,53 @@ mod property_tests {
             }
         }
 
-        fn reply(&mut self, server: &Server) {
+        fn reply(&mut self, server: &Server, rng: &mut Jitter) {
             let Some((inflight, reply)) = self.in_flight.take() else {
                 return;
             };
             match settle(&self.snap, &inflight, &reply, ME, self.mismatches) {
                 SettleResult::Ops(ops) => {
+                    if inflight.kind == UploadKind::Delete {
+                        self.hits.local_deletes_settled += 1;
+                    }
                     self.mismatches = 0;
                     self.apply(&ops);
                 }
                 SettleResult::FetchServerCopy => {
+                    self.hits.server_copy_fetches += 1;
                     self.mismatches += 1;
-                    let pending_delete_before = self
-                        .snap
-                        .rows
-                        .last()
-                        .is_some_and(|r| r.kind == RowKind::Delete);
-                    let before_server_seq = self.snap.server_seq();
+                    if server.deleted {
+                        let ops = apply_server_deleted(&self.snap, server.seq());
+                        self.apply(&ops);
+                        return;
+                    }
                     let doc = server.envelope(server.seq());
+                    if doc.seq > self.cursor {
+                        // The copy may hold an upload of ours whose reply was lost;
+                        // catching up lets its echo settle our rows first, then we rebuild.
+                        self.hits.server_copy_waits += 1;
+                        self.catch_up(server, rng);
+                        return;
+                    }
+                    let pending_delete_before = delete_pending(&self.snap);
+                    let rebase_possible = self.snap.shadow.is_some() && !self.snap.rows.is_empty();
+                    let before_server_seq = self.snap.server_seq();
+                    let old_shadow_content = self.snap.shadow.as_ref().map(|s| s.content.clone());
+                    let local_content_before = self.snap.content.clone();
                     let ops = apply_server_copy(&self.snap, &doc, ME);
+                    self.count_rebase_conflict(rebase_possible, &ops, true);
+                    if rebase_possible && !pending_delete_before && doc.seq > before_server_seq {
+                        if let Some(shadow_content) = &old_shadow_content {
+                            assert_shared_collision_kept_aside(
+                                "server copy",
+                                self,
+                                shadow_content,
+                                &local_content_before,
+                                &doc.content,
+                                &ops,
+                            );
+                        }
+                    }
                     self.apply(&ops);
                     // apply_server_copy's content guard gates on the envelope's own seq.
                     assert_other_device_edit_preserved(
@@ -1601,21 +2297,36 @@ mod property_tests {
                 }
                 SettleResult::Retry { mismatch, .. } => {
                     if mismatch {
+                        self.hits.mismatch_retries += 1;
                         self.mismatches += 1;
                     }
                 }
             }
         }
 
+        /// The reply is lost with the connection: the next one catches up before building.
         fn lose_reply(&mut self) {
             if self.in_flight.take().is_some() {
                 self.must_catch_up = true;
             }
         }
+
+        /// The reply is lost but the connection stays: nothing is delivered before the rebuild.
+        fn lose_reply_silently(&mut self) {
+            self.in_flight = None;
+        }
     }
 
     fn token(n: u32) -> Value {
         json!(format!("t{n}"))
+    }
+
+    /// Whether a JSON Patch upload payload includes an operation on `/shared`.
+    fn upload_touches_shared(payload: &Value) -> bool {
+        payload.as_array().is_some_and(|ops| {
+            ops.iter()
+                .any(|op| op.get("path").and_then(Value::as_str) == Some("/shared"))
+        })
     }
 
     /// The other-device edit counter this content reflects (0 before any `other_device_edit`).
@@ -1629,9 +2340,7 @@ mod property_tests {
     /// recover the pre-delivery local content instead (tracked in `client.recovered`, not
     /// discarded). A stale or pending-delete delivery is exempt: it is spec-correct for those to
     /// leave content untouched. `guard_seq` is whatever seq the caller's own content guard
-    /// compares against `before_server_seq` — the change's seq for a delivery (a page can carry
-    /// a newer envelope than the change it is delivering), the envelope's own seq for a server
-    /// copy.
+    /// compares against `before_server_seq`.
     fn assert_other_device_edit_preserved(
         before_server_seq: Seq,
         guard_seq: Seq,
@@ -1654,11 +2363,133 @@ mod property_tests {
         );
     }
 
+    /// At a rebase where both sides changed `shared` from the old shadow to different values,
+    /// the server's value must be the result and the local one kept aside: in a
+    /// `field_conflict` entry naming `/shared`, or in a whole-document `Recover`.
+    fn assert_shared_collision_kept_aside(
+        what: &str,
+        client: &Client,
+        old_shadow: &Value,
+        local_before: &Value,
+        incoming: &Value,
+        ops: &[DocOp],
+    ) {
+        let old = old_shadow.get("shared");
+        let mine = local_before.get("shared");
+        let theirs = incoming.get("shared");
+        if mine == old || theirs == old || mine == theirs {
+            return;
+        }
+        let whole = ops.iter().any(|op| matches!(op, DocOp::Recover { .. }));
+        let field = ops.iter().any(|op| {
+            matches!(op, DocOp::RecoverFields { fields, .. } if fields.iter().any(|f| {
+                f.path == "/shared"
+                    && f.local_removed == mine.is_none()
+                    && (f.local_removed || Some(&f.local_value) == mine)
+            }))
+        });
+        assert!(
+            whole || field,
+            "{what}: colliding shared (mine={mine:?} theirs={theirs:?}) was not kept aside"
+        );
+        if field {
+            assert_eq!(
+                client.snap.project(ops).content.get("shared"),
+                theirs,
+                "{what}: a colliding shared must take the server's value"
+            );
+        }
+    }
+
+    /// The `shared` key is a single slot both sides write, checked two ways with two different
+    /// notions of "later" — call order for "was it ever accounted for", real commit `seq` for
+    /// "did it actually win a race" — because they answer different questions and neither
+    /// substitutes for the other:
+    ///
+    /// 1. Every intended local write must be the final server value, kept aside (a
+    ///    `field_conflict` entry for `/shared` or a whole-document copy), superseded by a later
+    ///    local write, or overwritten by another device *after* it landed (commit order).
+    ///
+    /// 2. The latest other-device write must be the final content unless a *local write that
+    ///    actually landed* (`landed_shared`, only set once a build's upload lands, with the
+    ///    server's real `seq`) did so later in true commit order. This must use `seq`, not call
+    ///    order: two genuinely concurrent writes — neither side aware of the other yet — are
+    ///    settled by whichever upload's hash matches the server first, not by which was queued
+    ///    first (seed 73: a local edit queued *before* a same-key other-device write can still
+    ///    legitimately win, because its base hash still matched when it was finally built and
+    ///    sent — a hash-based race, not a silent revert). Using call order here produced false
+    ///    positives on exactly this kind of correct, concurrent resolution.
+    ///
+    /// Skipped when a local delete intentionally discarded the row.
+    fn check_shared_key_preserved(seed: u64, client: &Client, server: &Server) {
+        let final_shared = server.current().get("shared").and_then(Value::as_str);
+        for (order, value) in &client.local_shared_writes {
+            let superseded_by_later_local = client
+                .local_shared_writes
+                .iter()
+                .any(|(local_order, _)| local_order > order);
+            if superseded_by_later_local {
+                continue;
+            }
+            let overwritten_after_landing = client
+                .landed_shared_writes
+                .iter()
+                .filter(|(_, landed)| landed == value)
+                .any(|(landed_seq, _)| {
+                    server
+                        .other_shared_writes
+                        .iter()
+                        .any(|(_, other_seq, _)| other_seq > landed_seq)
+                });
+            let field_kept = client
+                .field_recovered
+                .iter()
+                .any(|f| f.path == "/shared" && !f.local_removed && f.local_value == json!(value));
+            let whole_kept = client
+                .recovered
+                .iter()
+                .any(|c| c.get("shared").and_then(Value::as_str) == Some(value.as_str()));
+            assert!(
+                final_shared == Some(value.as_str())
+                    || field_kept
+                    || whole_kept
+                    || overwritten_after_landing,
+                "seed {seed}: local shared {value:?} (order {order}) neither final nor kept \
+                 aside (final={final_shared:?})"
+            );
+        }
+        if let Some((_, other_seq, other_value)) = server
+            .other_shared_writes
+            .iter()
+            .max_by_key(|(order, _, _)| *order)
+        {
+            let superseded = client
+                .landed_shared
+                .as_ref()
+                .is_some_and(|(landed_seq, _)| landed_seq > other_seq);
+            if !superseded {
+                assert_eq!(
+                    final_shared,
+                    other_value.as_deref(),
+                    "seed {seed}: other-device shared {other_value:?} (seq {other_seq}) \
+                     replaced by a stale local value without a Recover"
+                );
+            }
+        }
+    }
+
     fn check_invariants(seed: u64, client: &Client) {
+        if !client.snap.exists {
+            assert!(
+                client.snap.rows.is_empty(),
+                "seed {seed}: rows left on a hard-deleted document"
+            );
+            return;
+        }
         let items = client.snap.content["items"]
             .as_array()
             .expect("items array");
-        for n in 1..=client.local_edits {
+        for &n in &client.tokens {
             let copies = items.iter().filter(|item| **item == token(n)).count();
             assert!(
                 copies <= 1,
@@ -1677,11 +2508,20 @@ mod property_tests {
 
     fn drain(seed: u64, server: &mut Server, client: &mut Client, rng: &mut Jitter) {
         for _ in 0..50 {
-            client.reply(server);
+            client.reply(server, rng);
             client.catch_up(server, rng);
             check_invariants(seed, client);
             if client.snap.rows.is_empty() {
                 return;
+            }
+            let ends_in_delete = client
+                .snap
+                .rows
+                .last()
+                .is_some_and(|r| r.kind == RowKind::Delete);
+            if client.snap.shadow.is_none() && !ends_in_delete {
+                // A pending create no delivered change resolved: a later connection's resync.
+                client.snapshot(server);
             }
             client.build(server, rng);
         }
@@ -1690,12 +2530,12 @@ mod property_tests {
 
     #[test]
     fn random_echo_rebase_and_page_sequences_lose_and_duplicate_nothing() {
+        let mut totals = Hits::default();
         for seed in 1..=SEEDS {
             let mut rng = Jitter::new(seed * 104_729);
             let start = json!({"items": [], "theirs": 0});
             let mut server = Server::new(start.clone());
-            // Half the seeds start as a lost-create client (no shadow, one pending Create row)
-            // to fuzz that branch of apply_snapshot_doc and apply_change.
+            // Half the seeds start as a lost-create client (no shadow, one pending Create row).
             let lost_create = seed % 2 == 0;
             let mut client = if lost_create {
                 Client::new_lost_create(start)
@@ -1703,41 +2543,95 @@ mod property_tests {
                 Client::new(start)
             };
             if lost_create && seed % 4 == 0 {
-                // The create landed on the server as the doc's starting content, but our reply
-                // was lost; deliver it back as a change too, fuzzing the echo arm with no shadow.
-                server.changes.push((1, Some(m(1))));
+                // The create landed as the doc's starting content but our reply was lost;
+                // deliver it back as a change too, fuzzing the echo arm with no shadow.
+                server.changes.push(Committed {
+                    seq: 1,
+                    upload_id: Some(m(1)),
+                    deleted: false,
+                });
             }
+            // A delete ends the document's life, so only some seeds allow one.
+            let local_deletes = seed % 5 == 0;
+            // The model server takes no creates, so a lost create can never settle once the
+            // document is deleted server-side.
+            let other_deletes = !lost_create && seed % 7 == 0;
+            if lost_create && seed % 3 == 0 {
+                client.snapshot(&server);
+            }
+            // Advanced only by a write to `shared`, from either side, the moment it happens —
+            // not the server seq (a dropped local write never reaches one) and not the step
+            // index (most steps never touch `shared`).
+            let mut shared_order: u64 = 0;
             for _ in 0..STEPS {
-                match (rng.next_unit() * 8.0) as u32 {
-                    0 => client.edit(),
+                match (rng.next_unit() * 11.0) as u32 {
+                    0 => client.edit(&mut rng, &mut shared_order),
                     1 => client.build(&mut server, &mut rng),
-                    2 => server.other_device_edit(),
+                    2 => server.other_device_edit(&mut rng, &mut shared_order),
                     3 => client.deliver(&server, false),
                     4 => client.deliver(&server, true),
-                    5 => client.reply(&server),
+                    5 => client.reply(&server, &mut rng),
                     6 => client.lose_reply(),
+                    7 => client.lose_reply_silently(),
+                    8 if local_deletes => client.delete(),
+                    9 if other_deletes => server.other_device_delete(),
+                    8 | 9 => client.edit(&mut rng, &mut shared_order),
                     _ => client.snapshot(&server),
                 }
                 check_invariants(seed, &client);
             }
             drain(seed, &mut server, &mut client, &mut rng);
 
-            assert_eq!(
-                &client.snap.content,
-                server.current(),
-                "seed {seed}: client and server differ"
-            );
-            let final_items = server.current()["items"].as_array().unwrap();
-            for n in 1..=client.local_edits {
-                let kept = final_items.contains(&token(n))
-                    || client.recovered.iter().any(|content| {
-                        content["items"]
-                            .as_array()
-                            .is_some_and(|items| items.contains(&token(n)))
-                    });
-                assert!(kept, "seed {seed}: t{n} lost");
+            if server.deleted {
+                assert!(
+                    !client.snap.exists,
+                    "seed {seed}: the server deleted the document but the client kept it"
+                );
+            } else {
+                assert_eq!(
+                    &client.snap.content,
+                    server.current(),
+                    "seed {seed}: client and server differ"
+                );
             }
+            // A local delete intentionally discards local edits.
+            if !client.deleted_locally {
+                let final_items = server.current()["items"].as_array().unwrap();
+                for &n in &client.tokens {
+                    let kept = final_items.contains(&token(n))
+                        || client.recovered.iter().any(|content| {
+                            content["items"]
+                                .as_array()
+                                .is_some_and(|items| items.contains(&token(n)))
+                        });
+                    assert!(kept, "seed {seed}: t{n} lost");
+                }
+                check_shared_key_preserved(seed, &client, &server);
+            }
+            // A lost create with no later edit on either side is identical to what landed.
+            if lost_create
+                && client.local_edits == 0
+                && server.other_edits == 0
+                && !server.deleted
+                && !client.deleted_locally
+            {
+                assert!(
+                    client.recovered.is_empty(),
+                    "seed {seed}: a lost create with no later edit was recovered"
+                );
+            }
+            totals.add(&client.hits);
         }
+        // Each branch must actually run, or the model has stopped testing it.
+        assert!(totals.rebase_conflicts_delivery > 0, "{totals:?}");
+        assert!(totals.server_copy_fetches > 0, "{totals:?}");
+        assert!(totals.server_copy_waits > 0, "{totals:?}");
+        assert!(totals.mismatch_retries > 0, "{totals:?}");
+        assert!(totals.delete_wins > 0, "{totals:?}");
+        assert!(totals.local_deletes_settled > 0, "{totals:?}");
+        assert!(totals.equal_content_adopts > 0, "{totals:?}");
+        assert!(totals.never_sent_rebases > 0, "{totals:?}");
+        assert!(totals.field_conflicts > 0, "{totals:?}");
     }
 }
 
@@ -1805,12 +2699,13 @@ mod snapshot_doc_tests {
     use super::*;
     use serde_json::json;
 
-    /// Local copy at seq 1 with one pending append; the snapshot (seq 5) already contains it,
-    /// as it does when the upload landed but its reply was lost.
+    /// Local copy at seq 1 with one pending append that was sent and never acknowledged; the
+    /// snapshot (seq 5) already contains it, as it does when the reply was lost.
     fn pending_append() -> (DocSnapshot, DocEnvelope) {
         let mut s = synced(json!({"items": ["a"]}), 1);
         s.content = json!({"items": ["a", "b"]});
         s.rows = vec![row(1, RowKind::Update)];
+        s.unacked_upload = Some(m(1));
         (s, env(json!({"items": ["a", "b"], "theirs": 1}), 5))
     }
 
@@ -1828,6 +2723,44 @@ mod snapshot_doc_tests {
         assert_eq!(after.content, json!({"items": ["a", "b"], "theirs": 1}));
         assert!(after.rows.is_empty());
         assert_eq!(after.shadow.unwrap().seq, 5);
+    }
+
+    #[test]
+    fn snapshot_doc_rebases_never_sent_pending_edits() {
+        // A returning user: an edit made offline and never sent; another device changed the doc.
+        let mut s = synced(json!({"items": ["a"]}), 1);
+        s.content = json!({"items": ["a", "b"]});
+        s.rows = vec![row(1, RowKind::Update)];
+        let doc = env(json!({"items": ["a"], "theirs": 1}), 5);
+        let ops = apply_snapshot_doc(&s, "own", &doc, ME);
+        assert!(!ops
+            .iter()
+            .any(|op| matches!(op, DocOp::Recover { .. } | DocOp::Emit(_))));
+        let after = s.project(&ops);
+        assert_eq!(after.content, json!({"items": ["a", "b"], "theirs": 1}));
+        assert_eq!(
+            after.rows.len(),
+            1,
+            "the edit is still pending, now on the new base"
+        );
+        assert_eq!(after.shadow.unwrap().seq, 5);
+    }
+
+    #[test]
+    fn settling_the_sent_rows_forgets_the_unacked_upload() {
+        let mut s = synced(json!({}), 1);
+        s.rows = vec![row(1, RowKind::Update), row(2, RowKind::Update)];
+        s.unacked_upload = Some(m(1));
+        assert_eq!(
+            s.project(&[DocOp::DeleteRows(vec![m(2)])]).unacked_upload,
+            Some(m(1)),
+            "the sent row is still pending"
+        );
+        assert_eq!(
+            s.project(&[DocOp::DeleteRows(vec![m(1)])]).unacked_upload,
+            None
+        );
+        assert_eq!(s.project(&[DocOp::DropAllRows]).unacked_upload, None);
     }
 
     #[test]
@@ -1900,5 +2833,82 @@ mod snapshot_doc_tests {
             op,
             DocOp::SetShadow(_) | DocOp::SetContent(_) | DocOp::Recover { .. }
         )));
+    }
+}
+
+#[cfg(test)]
+mod equal_content_tests {
+    use super::change_fixtures::*;
+    use super::fixtures::*;
+    use super::*;
+    use serde_json::json;
+
+    /// A create that landed but whose reply was lost: no shadow, pending rows.
+    fn lost_create(content: Value, rows: Vec<OutboxRow>) -> DocSnapshot {
+        let mut s = synced(content, 0);
+        s.shadow = None;
+        s.rows = rows;
+        s
+    }
+
+    fn assert_adopted(s: &DocSnapshot, ops: &[DocOp], seq: Seq) {
+        assert!(!ops.iter().any(|op| matches!(
+            op,
+            DocOp::Recover { .. } | DocOp::Emit(DocEvent::ConflictDetected)
+        )));
+        let after = s.project(ops);
+        assert_eq!(after.content, s.content, "local content is unchanged");
+        assert!(
+            after.rows.is_empty(),
+            "every row is already in the envelope"
+        );
+        assert_eq!(after.shadow.expect("adopted shadow").seq, seq);
+    }
+
+    #[test]
+    fn no_shadow_change_with_equal_content_adopts_and_settles() {
+        let s = lost_create(json!({"items": ["a"]}), vec![row(1, RowKind::Create)]);
+        let mut change = upsert("own", json!({"items": ["a"]}), 4);
+        change.doc.as_mut().unwrap().hash = "server-hash".into();
+        let ops = apply_change(&s, &change, ME);
+        assert_adopted(&s, &ops, 4);
+        assert_eq!(
+            s.project(&ops).shadow.unwrap().hash,
+            "server-hash",
+            "the server hash is stored verbatim, never compared"
+        );
+    }
+
+    #[test]
+    fn no_shadow_snapshot_with_equal_content_adopts_and_settles() {
+        let s = lost_create(
+            json!({"items": ["a"]}),
+            vec![row(1, RowKind::Create), row(2, RowKind::Update)],
+        );
+        let ops = apply_snapshot_doc(&s, "own", &env(json!({"items": ["a"]}), 4), ME);
+        assert_adopted(&s, &ops, 4);
+        assert!(!ops.iter().any(|op| matches!(op, DocOp::InsertMarker(_))));
+    }
+
+    #[test]
+    fn no_shadow_server_copy_with_equal_content_adopts_and_settles() {
+        let s = lost_create(json!({"n": 1}), vec![row(1, RowKind::Create)]);
+        let ops = apply_server_copy(&s, &env(json!({"n": 1}), 2), ME);
+        assert_adopted(&s, &ops, 2);
+    }
+
+    #[test]
+    fn no_shadow_with_a_later_edit_still_recovers() {
+        // The create landed as ["a"]; a later local edit made it ["a", "b"]: not equal.
+        let s = lost_create(
+            json!({"items": ["a", "b"]}),
+            vec![row(1, RowKind::Create), row(2, RowKind::Update)],
+        );
+        let ops = apply_change(&s, &upsert("own", json!({"items": ["a"]}), 4), ME);
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"items": ["a", "b"]}),
+            reason: RecoverReason::Conflict,
+        }));
+        assert!(ops.contains(&DocOp::Emit(DocEvent::ConflictDetected)));
     }
 }

@@ -1,6 +1,8 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
+
+use super::hash::canonicalise_numbers;
 
 #[cfg(test)]
 mod tests {
@@ -43,6 +45,19 @@ mod tests {
         assert!(!e.is_fatal);
         assert_eq!(e.retry_after_ms, None);
     }
+
+    #[test]
+    fn envelope_content_decodes_to_canonical_numbers() {
+        // The server prints 1200.0 as Jason does: 1.2e3.
+        let envelope: DocEnvelope = serde_json::from_str(
+            r#"{"doc_id": "00000000-0000-0000-0000-000000000001", "owner_id": null,
+                "author_id": null, "read_only": false, "source_doc_id": null,
+                "derived_from": null, "title": null,
+                "content": {"n": 1.2e3, "x": 1.5, "list": [2.0]}, "hash": "h", "seq": 1}"#,
+        )
+        .unwrap();
+        assert_eq!(envelope.content, json!({"n": 1200, "x": 1.5, "list": [2]}));
+    }
 }
 
 pub type Seq = i64;
@@ -71,9 +86,16 @@ pub struct DocEnvelope {
     pub source_doc_id: Option<Uuid>,
     pub derived_from: Option<Uuid>,
     pub title: Option<String>,
+    #[serde(deserialize_with = "canonical_content")]
     pub content: Value,
     pub hash: String,
     pub seq: Seq,
+}
+
+fn canonical_content<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Value, D::Error> {
+    let mut content = Value::deserialize(deserializer)?;
+    canonicalise_numbers(&mut content);
+    Ok(content)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -119,6 +141,8 @@ pub struct ServerError {
     pub current_seq: Option<Seq>,
     /// Set on a rejected create (`exists`).
     pub existing_owner: Option<Uuid>,
+    /// Set on `clock_skew`: the server's clock, unix seconds.
+    pub server_time: Option<i64>,
 }
 
 impl ServerError {
@@ -130,6 +154,7 @@ impl ServerError {
             current_hash: None,
             current_seq: None,
             existing_owner: None,
+            server_time: None,
         }
     }
 }

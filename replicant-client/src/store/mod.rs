@@ -16,7 +16,6 @@ use crate::queries::Queries;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_SIZE: u32 = 4;
 const TOMBSTONE_RETENTION_SECS: i64 = 90 * 24 * 3600;
-const RECOVERED_RETENTION_SECS: i64 = 30 * 24 * 3600;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -40,6 +39,8 @@ pub enum StoreError {
     Corrupt(String),
     #[error("server user id must not be nil")]
     NilServerUserId,
+    #[error("no field-conflict copy with id {0}")]
+    NoFieldConflict(i64),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -175,10 +176,6 @@ async fn prepare(pool: &SqlitePool) -> StoreResult<()> {
         .bind(now - TOMBSTONE_RETENTION_SECS)
         .execute(pool)
         .await?;
-    sqlx::query("DELETE FROM recovered WHERE recovered_at < ?")
-        .bind(now - RECOVERED_RETENTION_SECS)
-        .execute(pool)
-        .await?;
     Ok(())
 }
 
@@ -194,8 +191,11 @@ pub(crate) fn now_rfc3339() -> String {
 pub mod change_log;
 mod docs;
 mod feed;
+mod recovered;
 mod uploads;
 mod writes;
+
+pub use recovered::RecoveredCopy;
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -327,7 +327,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_trims_expired_tombstones_and_recovered_content() {
+    async fn open_trims_expired_tombstones_but_keeps_recovered_copies() {
         let t = temp_store().await;
         let now = now_unix();
         sqlx::query(
@@ -349,7 +349,11 @@ mod tests {
 
         let reopened = Store::open(&t.path()).await.unwrap();
         assert_eq!(count(&reopened, "SELECT COUNT(*) FROM tombstones").await, 1);
-        assert_eq!(count(&reopened, "SELECT COUNT(*) FROM recovered").await, 0);
+        assert_eq!(
+            count(&reopened, "SELECT COUNT(*) FROM recovered").await,
+            1,
+            "a kept copy stays until the user dismisses it"
+        );
     }
 
     #[tokio::test]

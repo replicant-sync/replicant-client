@@ -44,6 +44,19 @@ impl Store {
         Ok(outcome)
     }
 
+    /// Marks the rows an upload covers as sent in it, before the upload can reach the server.
+    /// The mark goes away with the row; an error reply leaves it, because an earlier send of
+    /// the same rows may have landed.
+    pub async fn mark_sent(&self, doc_id: Uuid, upload_id: Uuid) -> StoreResult<()> {
+        sqlx::query("UPDATE outbox SET sent_upload_id = ? WHERE doc_id = ? AND mutation_id <= ?")
+            .bind(upload_id.to_string())
+            .bind(doc_id.to_string())
+            .bind(upload_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// `Effect::SettleUpload`.
     pub async fn settle_upload(
         &self,
@@ -146,6 +159,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lost_create_of_an_integral_float_adopts_the_servers_copy() {
+        let t = temp_store().await;
+        t.store
+            .create_document(ME, Some(DOC), json!({"n": 1200.0}))
+            .await
+            .unwrap();
+        let (_, inflight) = sent(&t.store, DOC).await;
+        t.store.mark_sent(DOC, inflight.upload_id).await.unwrap();
+        // The create landed but its reply was lost; the resync reads the server's jsonb row.
+        let server = envelope(DOC, Some(ME), json!({"n": 1200}), 4);
+        let notices = t
+            .store
+            .apply_snapshot_page(ME, SCOPE_OWN, std::slice::from_ref(&server))
+            .await
+            .unwrap();
+        assert_eq!(notices, vec![]);
+        assert!(recovered(&t).await.is_empty());
+        assert_eq!(count(&t.store, "SELECT COUNT(*) FROM outbox").await, 0);
+        let shadow = snapshot(&t.store, DOC).await.shadow.unwrap();
+        assert_eq!(shadow.seq, 4);
+        assert_eq!(shadow.content, json!({"n": 1200}));
+    }
+
+    #[tokio::test]
     async fn load_pending_skips_parked_docs_and_lists_oldest_first() {
         let t = temp_store().await;
         let first = t
@@ -169,6 +206,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(t.store.load_pending().await.unwrap(), vec![first, last]);
+    }
+
+    #[tokio::test]
+    async fn mark_sent_marks_only_the_rows_the_upload_covers() {
+        let t = temp_store().await;
+        let doc_id = t
+            .store
+            .create_document(ME, None, json!({"n": 1}))
+            .await
+            .unwrap();
+        t.store
+            .update_document(ME, doc_id, json!({"n": 2}))
+            .await
+            .unwrap();
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT mutation_id FROM outbox WHERE doc_id = ? ORDER BY mutation_id",
+        )
+        .bind(doc_id.to_string())
+        .fetch_all(&t.store.pool)
+        .await
+        .unwrap();
+        let first = Uuid::parse_str(&rows[0]).unwrap();
+        t.store.mark_sent(doc_id, first).await.unwrap();
+        let marked: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT sent_upload_id FROM outbox WHERE doc_id = ? ORDER BY mutation_id",
+        )
+        .bind(doc_id.to_string())
+        .fetch_all(&t.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(marked, vec![Some(first.to_string()), None]);
+        assert_eq!(snapshot(&t.store, doc_id).await.unacked_upload, Some(first));
     }
 
     #[tokio::test]
@@ -358,6 +427,60 @@ mod tests {
         );
         assert_eq!(recovered(&t).await, vec![(local, "conflict".to_string())]);
         assert_eq!(snapshot(&t.store, DOC).await.content, json!({"n": 0}));
+    }
+
+    #[tokio::test]
+    async fn validation_error_leaves_the_sent_mark_and_a_later_snapshot_still_conflicts() {
+        let t = temp_store().await;
+        seed_synced(&t.store, DOC, SCOPE_OWN, Some(ME), json!({"n": 0}), 1).await;
+        t.store
+            .update_document(ME, DOC, json!({"n": 1}))
+            .await
+            .unwrap();
+        let (_, inflight) = sent(&t.store, DOC).await;
+        t.store.mark_sent(DOC, inflight.upload_id).await.unwrap();
+
+        let (outcome, notices) = t
+            .store
+            .settle_upload(ME, DOC, &inflight, &Err(ServerError::new("validation")), 0)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, SettleOutcome::Done { rows_remain: true });
+        assert_eq!(
+            notices,
+            vec![DocNotice {
+                doc_id: DOC,
+                event: DocEvent::SyncError {
+                    code: "validation".into()
+                }
+            }]
+        );
+        // An error reply does not clear the mark: an earlier send of the same rows may have
+        // landed, and only the row's eventual settlement proves which version did.
+        let marked: Option<String> =
+            sqlx::query_scalar("SELECT sent_upload_id FROM outbox WHERE doc_id = ?")
+                .bind(DOC.to_string())
+                .fetch_one(&t.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(marked, Some(inflight.upload_id.to_string()));
+
+        // A later snapshot with a changed server doc must still take the conflict path for the
+        // parked, still-marked row: it may already be applied there.
+        let server = envelope(DOC, Some(ME), json!({"n": 9}), 5);
+        let notices = t
+            .store
+            .apply_snapshot_page(ME, SCOPE_OWN, std::slice::from_ref(&server))
+            .await
+            .unwrap();
+        assert_eq!(
+            notices,
+            vec![DocNotice {
+                doc_id: DOC,
+                event: DocEvent::ConflictDetected
+            }]
+        );
     }
 
     #[tokio::test]

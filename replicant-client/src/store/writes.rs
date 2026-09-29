@@ -8,8 +8,8 @@ use super::docs::{
     append_change_log, insert_marker, load_snapshot, refresh_search, title_of, LogOrigin,
 };
 use super::{now_rfc3339, Store, StoreError, StoreResult};
-use crate::engine::doc::{DocSnapshot, RowKind};
-use crate::engine::hash::content_hash;
+use crate::engine::doc::{DocSnapshot, FieldConflict, RowKind};
+use crate::engine::hash::{canonicalise_numbers, content_hash};
 
 impl Store {
     /// Creates a document owned by `me`, returning its id.
@@ -17,8 +17,9 @@ impl Store {
         &self,
         me: Uuid,
         doc_id: Option<Uuid>,
-        content: Value,
+        mut content: Value,
     ) -> StoreResult<Uuid> {
+        canonicalise_numbers(&mut content);
         let doc_id = doc_id.unwrap_or_else(Uuid::new_v4);
         let mut tx = self.begin().await?;
         let snap = load_snapshot(&mut tx, doc_id).await?;
@@ -48,7 +49,48 @@ impl Store {
 
     pub async fn update_document(&self, me: Uuid, doc_id: Uuid, content: Value) -> StoreResult<()> {
         let mut tx = self.begin().await?;
-        let snap = load_snapshot(&mut tx, doc_id).await?;
+        self.update_in(&mut tx, me, doc_id, content).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Writes a field conflict's kept local values back at their paths as a local edit and
+    /// deletes the kept copy, in one transaction. Other paths keep the server's values.
+    pub async fn restore_fields(&self, me: Uuid, recovered_id: i64) -> StoreResult<()> {
+        let mut tx = self.begin().await?;
+        let kept: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT doc_id, fields FROM recovered WHERE id = ? AND reason = 'field_conflict'",
+        )
+        .bind(recovered_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((doc_id, Some(fields))) = kept else {
+            return Err(StoreError::NoFieldConflict(recovered_id));
+        };
+        let doc_id = Uuid::parse_str(&doc_id)?;
+        let fields: Vec<FieldConflict> = serde_json::from_str(&fields)?;
+        let mut content = load_snapshot(&mut tx, doc_id).await?.content;
+        for field in &fields {
+            put_field(&mut content, field)?;
+        }
+        self.update_in(&mut tx, me, doc_id, content).await?;
+        sqlx::query("DELETE FROM recovered WHERE id = ?")
+            .bind(recovered_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn update_in(
+        &self,
+        conn: &mut SqliteConnection,
+        me: Uuid,
+        doc_id: Uuid,
+        mut content: Value,
+    ) -> StoreResult<()> {
+        canonicalise_numbers(&mut content);
+        let snap = load_snapshot(&mut *conn, doc_id).await?;
         check_writable(&snap, me)?;
         sqlx::query(
             "UPDATE documents SET content = ?, hash = ?, title = COALESCE(?, title), updated_at = ? \
@@ -59,13 +101,12 @@ impl Store {
         .bind(title_of(&content, None))
         .bind(now_rfc3339())
         .bind(doc_id.to_string())
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-        unpark(&mut tx, doc_id).await?;
-        insert_marker(&mut tx, doc_id, RowKind::Update).await?;
-        append_change_log(&mut tx, &self.writer(LogOrigin::Local), doc_id, false).await?;
-        refresh_search(&mut tx, doc_id).await?;
-        tx.commit().await?;
+        unpark(&mut *conn, doc_id).await?;
+        insert_marker(&mut *conn, doc_id, RowKind::Update).await?;
+        append_change_log(&mut *conn, &self.writer(LogOrigin::Local), doc_id, false).await?;
+        refresh_search(&mut *conn, doc_id).await?;
         Ok(())
     }
 
@@ -109,9 +150,59 @@ async fn unpark(conn: &mut SqliteConnection, doc_id: Uuid) -> StoreResult<()> {
     Ok(())
 }
 
+/// Sets `field.path` to the kept local value (removes it where the local side had removed it),
+/// creating missing object parents; an array index past the end appends.
+fn put_field(content: &mut Value, field: &FieldConflict) -> StoreResult<()> {
+    let unrestorable = || StoreError::Corrupt(format!("cannot restore {} here", field.path));
+    let tokens: Vec<String> = field
+        .path
+        .split('/')
+        .skip(1)
+        .map(|token| token.replace("~1", "/").replace("~0", "~"))
+        .collect();
+    let Some((last, parents)) = tokens.split_last() else {
+        return Err(unrestorable());
+    };
+    let mut target = content;
+    for token in parents {
+        target = match target {
+            Value::Object(fields) => fields
+                .entry(token.clone())
+                .or_insert_with(|| Value::Object(Default::default())),
+            Value::Array(items) => {
+                let index: usize = token.parse().map_err(|_| unrestorable())?;
+                items.get_mut(index).ok_or_else(unrestorable)?
+            }
+            _ => return Err(unrestorable()),
+        };
+    }
+    match target {
+        Value::Object(fields) if field.local_removed => {
+            fields.remove(last);
+        }
+        Value::Object(fields) => {
+            fields.insert(last.clone(), field.local_value.clone());
+        }
+        Value::Array(items) => {
+            let index: usize = last.parse().map_err(|_| unrestorable())?;
+            if field.local_removed {
+                if index < items.len() {
+                    items.remove(index);
+                }
+            } else if index < items.len() {
+                items[index] = field.local_value.clone();
+            } else {
+                items.push(field.local_value.clone());
+            }
+        }
+        _ => return Err(unrestorable()),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{json, Value};
     use uuid::Uuid;
 
     use super::*;
@@ -124,6 +215,29 @@ mod tests {
 
     fn doc(n: u128) -> Uuid {
         Uuid::from_u128(0xD000 + n)
+    }
+
+    #[tokio::test]
+    async fn host_writes_store_integral_floats_as_integers() {
+        let t = temp_store().await;
+        let doc_id = t
+            .store
+            .create_document(ME, None, json!({"n": 1200.0, "x": 1.5, "list": [2.0]}))
+            .await
+            .unwrap();
+        let canonical = json!({"n": 1200, "x": 1.5, "list": [2]});
+        assert_eq!(snapshot(&t.store, doc_id).await.content, canonical);
+        let hash: String = sqlx::query_scalar("SELECT hash FROM documents WHERE id = ?")
+            .bind(doc_id.to_string())
+            .fetch_one(&t.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(hash, content_hash(&canonical));
+        t.store
+            .update_document(ME, doc_id, json!({"n": 1300.0}))
+            .await
+            .unwrap();
+        assert_eq!(snapshot(&t.store, doc_id).await.content, json!({"n": 1300}));
     }
 
     #[tokio::test]
@@ -407,5 +521,122 @@ mod tests {
         }
         let reopened = open_again(&t.path()).await;
         assert_eq!(count(&reopened, "SELECT COUNT(*) FROM documents").await, 20);
+    }
+
+    /// A synced doc edited locally at `local`, then another device's `theirs` arrives.
+    async fn collide(t: &TempStore, local: Value, theirs: Value) -> Vec<crate::store::DocNotice> {
+        seed_synced(
+            &t.store,
+            doc(1),
+            SCOPE_OWN,
+            Some(ME),
+            json!({"s": "old", "k": 1}),
+            1,
+        )
+        .await;
+        t.store.update_document(ME, doc(1), local).await.unwrap();
+        let change = upsert_change(SCOPE_OWN, envelope(doc(1), Some(ME), theirs, 2));
+        t.store
+            .apply_changes(ME, SCOPE_OWN, &[change], 2)
+            .await
+            .unwrap()
+    }
+
+    async fn kept_copy_id(t: &TempStore) -> i64 {
+        sqlx::query_scalar("SELECT id FROM recovered WHERE reason = 'field_conflict'")
+            .fetch_one(&t.store.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn field_conflict_is_kept_with_its_paths() {
+        let t = temp_store().await;
+        let notices = collide(
+            &t,
+            json!({"s": "mine", "k": 2}),
+            json!({"s": "theirs", "k": 1}),
+        )
+        .await;
+        assert_eq!(
+            notices,
+            vec![crate::store::DocNotice {
+                doc_id: doc(1),
+                event: crate::engine::doc::DocEvent::FieldConflict {
+                    paths: vec!["/s".into()]
+                }
+            }]
+        );
+        let fields: String = sqlx::query_scalar("SELECT fields FROM recovered WHERE doc_id = ?")
+            .bind(doc(1).to_string())
+            .fetch_one(&t.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&fields).unwrap(),
+            json!([{"path": "/s", "local_value": "mine", "local_removed": false}])
+        );
+        assert_eq!(
+            snapshot(&t.store, doc(1)).await.content,
+            json!({"s": "theirs", "k": 2})
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_fields_writes_the_kept_values_back_as_a_local_edit() {
+        let t = temp_store().await;
+        collide(
+            &t,
+            json!({"s": "mine", "k": 2}),
+            json!({"s": "theirs", "k": 1}),
+        )
+        .await;
+        let rows_before = count(&t.store, "SELECT COUNT(*) FROM outbox").await;
+        t.store
+            .restore_fields(ME, kept_copy_id(&t).await)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot(&t.store, doc(1)).await.content,
+            json!({"s": "mine", "k": 2})
+        );
+        assert_eq!(count(&t.store, "SELECT COUNT(*) FROM recovered").await, 0);
+        assert_eq!(
+            count(&t.store, "SELECT COUNT(*) FROM outbox").await,
+            rows_before + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_fields_of_a_removed_value_removes_the_path() {
+        let t = temp_store().await;
+        collide(&t, json!({"k": 1}), json!({"s": "theirs", "k": 1})).await;
+        t.store
+            .restore_fields(ME, kept_copy_id(&t).await)
+            .await
+            .unwrap();
+        assert_eq!(snapshot(&t.store, doc(1)).await.content, json!({"k": 1}));
+    }
+
+    #[tokio::test]
+    async fn restore_fields_refuses_a_whole_document_copy() {
+        let t = temp_store().await;
+        seed_synced(&t.store, doc(1), SCOPE_OWN, Some(ME), json!({}), 1).await;
+        exec(
+            &t.store,
+            &format!(
+                "INSERT INTO recovered (doc_id, content, reason, recovered_at) VALUES ('{}', '{{}}', 'conflict', 0)",
+                doc(1)
+            ),
+        )
+        .await;
+        let id: i64 = sqlx::query_scalar("SELECT id FROM recovered")
+            .fetch_one(&t.store.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            t.store.restore_fields(ME, id).await,
+            Err(StoreError::NoFieldConflict(refused)) if refused == id
+        ));
     }
 }

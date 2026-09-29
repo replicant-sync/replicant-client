@@ -77,11 +77,16 @@ pub(crate) async fn load_snapshot(
         }
     }
 
-    let rows = sqlx::query("SELECT mutation_id, kind, parked_error FROM outbox WHERE doc_id = ?")
-        .bind(&id)
-        .fetch_all(&mut *conn)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT mutation_id, kind, parked_error, sent_upload_id FROM outbox WHERE doc_id = ?",
+    )
+    .bind(&id)
+    .fetch_all(&mut *conn)
+    .await?;
     for row in rows {
+        if let Some(sent) = row.try_get::<Option<String>, _>("sent_upload_id")? {
+            snap.unacked_upload = snap.unacked_upload.max(Some(Uuid::parse_str(&sent)?));
+        }
         snap.rows.push(OutboxRow {
             mutation_id: Uuid::parse_str(&row.try_get::<String, _>("mutation_id")?)?,
             kind: parse_row_kind(&row.try_get::<String, _>("kind")?)?,
@@ -186,6 +191,18 @@ pub(crate) async fn apply_ops(
                 .bind(content.to_string())
                 .bind(reason_str(*reason))
                 .bind(now_unix())
+                .execute(&mut *conn)
+                .await?;
+            }
+            DocOp::RecoverFields { content, fields } => {
+                sqlx::query(
+                    "INSERT INTO recovered (doc_id, content, reason, recovered_at, fields) \
+                     VALUES (?, ?, 'field_conflict', ?, ?)",
+                )
+                .bind(&id)
+                .bind(content.to_string())
+                .bind(now_unix())
+                .bind(serde_json::to_string(fields)?)
                 .execute(&mut *conn)
                 .await?;
             }

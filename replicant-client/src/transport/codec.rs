@@ -11,7 +11,7 @@ use super::wire::{
     SnapshotPage, UploadRequest, CHANNEL_TOPIC,
 };
 use crate::engine::machine::{Request, Response};
-use crate::engine::types::{Change, DocEnvelope, ServerError};
+use crate::engine::types::{Change, DocEnvelope, Scope, ServerError};
 
 const PHOENIX_TOPIC: &str = "phoenix";
 
@@ -27,6 +27,10 @@ pub enum Incoming {
         user_id: Uuid,
     },
     Push(Change),
+    /// A `change` push that did not decode; `scope` if its payload named one.
+    UnreadablePush {
+        scope: Option<Scope>,
+    },
     /// The server closed or crashed the channel; the socket is no longer usable.
     ChannelClosed,
 }
@@ -137,7 +141,14 @@ impl Codec {
                 Some(decode_reply(req, kind, payload))
             }
             "change" if topic == CHANNEL_TOPIC => {
-                serde_json::from_value(payload).ok().map(Incoming::Push)
+                let scope = payload
+                    .get("scope")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                Some(match serde_json::from_value(payload) {
+                    Ok(change) => Incoming::Push(change),
+                    Err(_) => Incoming::UnreadablePush { scope },
+                })
             }
             "phx_error" | "phx_close" if topic == CHANNEL_TOPIC => Some(Incoming::ChannelClosed),
             _ => None,
@@ -332,7 +343,61 @@ mod tests {
         assert_eq!(codec.decode(&presence.to_string()), None);
         assert_eq!(codec.decode("not json"), None);
         assert_eq!(codec.decode(&json!({"topic": "sync:v2"}).to_string()), None);
-        let bad_change = json!(["1", null, "sync:v2", "change", {"seq": "x"}]);
-        assert_eq!(codec.decode(&bad_change.to_string()), None);
+    }
+
+    #[test]
+    fn unreadable_push_reports_its_scope() {
+        let mut codec = Codec::new();
+        let scoped = json!(["1", null, "sync:v2", "change", {"scope": "own", "seq": "x"}]);
+        assert_eq!(
+            codec.decode(&scoped.to_string()),
+            Some(Incoming::UnreadablePush {
+                scope: Some("own".into())
+            })
+        );
+        let unscoped = json!(["1", null, "sync:v2", "change", {"seq": "x"}]);
+        assert_eq!(
+            codec.decode(&unscoped.to_string()),
+            Some(Incoming::UnreadablePush { scope: None })
+        );
+    }
+
+    #[test]
+    fn join_ok_without_user_id_is_a_protocol_error() {
+        let mut codec = Codec::new();
+        codec.encode(1, &Request::Join, &auth(), 1);
+        let reply = json!(["1", "1", "sync:v2", "phx_reply",
+            {"status": "ok", "response": {"protocol_version": 2}}]);
+        let Some(Incoming::Reply {
+            req: 1,
+            result: Err(error),
+        }) = codec.decode(&reply.to_string())
+        else {
+            panic!("expected the join to fail");
+        };
+        assert_eq!(error.code, "protocol_error");
+        assert!(!error.is_fatal);
+    }
+
+    #[test]
+    fn non_envelope_reply_payload_is_a_protocol_error() {
+        let mut codec = Codec::new();
+        codec.encode(2, &changes_request(), &auth(), 1);
+        let reply = json!(["1", "2", "sync:v2", "phx_reply", ["not", "an", "envelope"]]);
+        let Some(Incoming::Reply {
+            req: 2,
+            result: Err(error),
+        }) = codec.decode(&reply.to_string())
+        else {
+            panic!("expected an error reply");
+        };
+        assert_eq!(error.code, "protocol_error");
+    }
+
+    #[test]
+    fn phx_error_on_the_phoenix_topic_is_ignored() {
+        let mut codec = Codec::new();
+        let frame = json!([null, null, "phoenix", "phx_error", {}]);
+        assert_eq!(codec.decode(&frame.to_string()), None);
     }
 }

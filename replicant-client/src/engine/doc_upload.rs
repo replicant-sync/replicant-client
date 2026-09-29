@@ -343,7 +343,7 @@ mod upload_tests {
         s.content = json!({"n": 100});
         s.rows = vec![row(1, RowKind::Update)];
         let f = inflight_update(vec![m(1)], json!({"n": 100}));
-        // Server returns normalised content (float) and its own hash.
+        // The reply's content and hash differ from what was sent; the shadow keeps the sent content.
         let mut reply = env(json!({"n": 100.0}), 2);
         reply.hash = "server-hash".into();
         let SettleResult::Ops(ops) = settle(&s, &f, &Ok(reply), ME, 0) else {
