@@ -35,6 +35,8 @@ mod event_tests;
 #[cfg(test)]
 mod owner_support;
 #[cfg(test)]
+mod storm_tests;
+#[cfg(test)]
 mod tests;
 
 const COMMAND_BUFFER: usize = 32;
