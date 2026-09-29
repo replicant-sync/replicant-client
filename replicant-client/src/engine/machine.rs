@@ -605,7 +605,10 @@ impl Core {
         fx.push(Effect::Cancel(TimerId::ConnectTimeout));
         self.conn = Conn::Connected(Session {
             phase: Some(Phase::LoadingCursors),
-            own_snapshot_resync_pending: true,
+            // `own` might have been dropped (subscription_forbidden) on an earlier connection:
+            // scope_names no longer lists it, so no SnapshotFinish or cursors-loaded branch for
+            // it will ever arrive to clear this — only hold uploads for it if it can still sync.
+            own_snapshot_resync_pending: self.scope_names.iter().any(|n| n == SCOPE_OWN),
             ..Default::default()
         });
         fx.push(Effect::Emit(Lifecycle::ConnectionSucceeded));
@@ -3636,6 +3639,66 @@ mod upload_orchestration_tests {
         assert!(c
             .step(Input::PendingDocs(vec![doc(1)]))
             .contains(&Effect::BuildUpload { doc_id: doc(1) }));
+    }
+
+    #[test]
+    fn reconnect_after_own_dropped_does_not_hang_uploads_forever() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (join_req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        c.step(Input::Reply {
+            req: join_req,
+            result: Ok(Response::Joined),
+        });
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        let (own_req, _) = sends(&fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetChangesSince { scope, .. } if scope == "own"))
+            .expect("own catches up via changes");
+        c.step(Input::Reply {
+            req: own_req,
+            result: Err(ServerError::new("subscription_forbidden")),
+        });
+        // `own` is dropped for the rest of this `Core`'s life; simulate a lost connection and
+        // reconnect, the way a real client would after any transient network blip.
+        c.step(closed(&c));
+        c.step(Input::Timer(TimerId::Reconnect));
+        let (rejoin_req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        c.step(Input::Reply {
+            req: rejoin_req,
+            result: Ok(Response::Joined),
+        });
+        c.step(Input::Cursors(vec![("collection:curated".into(), 5)]));
+        assert!(
+            c.step(Input::PendingDocs(vec![doc(1)]))
+                .contains(&Effect::BuildUpload { doc_id: doc(1) }),
+            "own was dropped before the reconnect and can never sync again on this Core; \
+             uploads must not hang waiting for a resync that will never happen"
+        );
+    }
+
+    #[test]
+    fn core_without_own_in_its_scope_list_builds_after_join() {
+        let mut c = Core::new(vec!["collection:curated".into()], 7);
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (join_req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        c.step(Input::Reply {
+            req: join_req,
+            result: Ok(Response::Joined),
+        });
+        c.step(Input::Cursors(vec![("collection:curated".into(), 5)]));
+        assert!(
+            c.step(Input::PendingDocs(vec![doc(1)]))
+                .contains(&Effect::BuildUpload { doc_id: doc(1) }),
+            "own not being subscribed at all must not hold uploads forever"
+        );
     }
 }
 
