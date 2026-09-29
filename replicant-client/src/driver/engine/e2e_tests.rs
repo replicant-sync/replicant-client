@@ -323,9 +323,10 @@ async fn untouched_float_field_converges_after_the_server_rounds_it() {
     );
     let uploads = server.uploads_for(doc_id);
     assert_eq!(
-        // One upload for the create, one for the edit: the patch only touches "m", so the
-        // rounded echo of "n" never needs a base_hash comparison against the client's own
-        // 1200.0 and no retry is triggered.
+        // ScriptedServer sends the upload reply before the push, so settle() sets the shadow
+        // from the client's own sent content (1200.0) and the later push is dropped as
+        // already seen. This pins that ordering: a push-before-reply would set the shadow to
+        // the rounded echo instead and force a third upload.
         uploads.len(),
         2,
         "unexpected upload count: {uploads:#?}"
