@@ -48,6 +48,13 @@ impl Timers {
 }
 
 #[cfg(test)]
+impl Timers {
+    pub fn is_scheduled(&self, timer: &TimerId) -> bool {
+        self.keys.contains_key(timer)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tokio::time::{timeout, Instant};

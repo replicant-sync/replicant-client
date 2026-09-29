@@ -136,6 +136,30 @@ impl Connection {
 }
 
 #[cfg(test)]
+impl Connection {
+    pub fn has_socket(&self) -> bool {
+        self.current.is_some()
+    }
+
+    /// Whether the current socket's task has ended (its last event may still be queued).
+    pub fn socket_finished(&self) -> bool {
+        self.current
+            .as_ref()
+            .is_some_and(|(socket, _)| socket.is_finished())
+    }
+
+    pub fn pending_events(&self) -> usize {
+        self.events_rx.len()
+    }
+
+    pub fn inject(&self, event: SocketEvent) {
+        self.events_tx
+            .try_send(event)
+            .expect("room in the event buffer");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::machine::Response;
