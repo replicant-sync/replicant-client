@@ -243,6 +243,13 @@ fn apply_upsert(
         ops.push(DocOp::SetShadow(new_shadow));
         return ops;
     }
+    // No base, but the envelope already holds exactly our content (a create whose reply was
+    // lost): adopt it. Both sides are hashed locally, never against the server's hash.
+    if snap.shadow.is_none() && content_hash(&snap.content) == content_hash(&doc.content) {
+        ops.push(DocOp::SetShadow(new_shadow));
+        ops.push(DocOp::DropAllRows);
+        return ops;
+    }
     let rebased = match &snap.shadow {
         Some(old) if local_base_known => match rebase(&old.content, &doc.content, &snap.content) {
             Rebased::Clean(v) => Some(v),
@@ -1324,6 +1331,7 @@ mod property_tests {
         mismatch_retries: u32,
         delete_wins: u32,
         local_deletes_settled: u32,
+        equal_content_adopts: u32,
     }
 
     impl Hits {
@@ -1335,6 +1343,7 @@ mod property_tests {
             self.mismatch_retries += other.mismatch_retries;
             self.delete_wins += other.delete_wins;
             self.local_deletes_settled += other.local_deletes_settled;
+            self.equal_content_adopts += other.equal_content_adopts;
         }
     }
 
@@ -1621,6 +1630,33 @@ mod property_tests {
             }
         }
 
+        /// A pending document with no shadow whose content the envelope already holds (hashed
+        /// locally on both sides) must be adopted, never recovered.
+        fn equal_content_adoptable(&self, doc: &DocEnvelope, guard_seq: Seq) -> bool {
+            self.snap.exists
+                && self.snap.shadow.is_none()
+                && !self.snap.rows.is_empty()
+                && !delete_pending(&self.snap)
+                && !doc.read_only
+                && guard_seq > self.snap.server_seq()
+                && content_hash(&self.snap.content) == content_hash(&doc.content)
+        }
+
+        fn check_adopted(&mut self, adoptable: bool, ops: &[DocOp]) {
+            if !adoptable {
+                return;
+            }
+            assert!(
+                !ops.iter().any(|op| matches!(op, DocOp::Recover { .. })),
+                "equal content must be adopted, not recovered"
+            );
+            assert!(
+                self.snap.project(ops).rows.is_empty(),
+                "adopting equal content settles every row"
+            );
+            self.hits.equal_content_adopts += 1;
+        }
+
         fn deliver(&mut self, server: &Server, as_page: bool) {
             let Some(&committed) = server.changes.get(self.delivered) else {
                 return;
@@ -1660,7 +1696,12 @@ mod property_tests {
             let before_server_seq = self.snap.server_seq();
             let old_shadow_content = self.snap.shadow.as_ref().map(|s| s.content.clone());
             let local_content_before = self.snap.content.clone();
+            let adoptable = !is_echo_for_us
+                && doc
+                    .as_ref()
+                    .is_some_and(|doc| self.equal_content_adoptable(doc, committed.seq));
             let ops = apply_change(&self.snap, &change, ME);
+            self.check_adopted(adoptable, &ops);
             self.count_rebase_conflict(rebase_possible && !is_echo_for_us, &ops, false);
             if rebase_possible
                 && !is_echo_for_us
@@ -1717,7 +1758,9 @@ mod property_tests {
                 // Only a migrated v1 base (shadow seq 0) rebases; no shadow at all is also a
                 // conflict (a create whose reply was lost cannot tell what the snapshot has).
                 let migrated_v1_base = self.snap.shadow.as_ref().is_some_and(|s| s.seq == 0);
-                let recovers = self.snap.exists
+                let adoptable = self.equal_content_adoptable(&doc, doc.seq);
+                let recovers = !adoptable
+                    && self.snap.exists
                     && !self.snap.rows.is_empty()
                     && !delete_pending(&self.snap)
                     && !doc.read_only
@@ -1725,6 +1768,7 @@ mod property_tests {
                     && doc.seq > self.snap.server_seq();
                 let pre_content = self.snap.content.clone();
                 let ops = apply_snapshot_doc(&self.snap, "own", &doc, ME);
+                self.check_adopted(adoptable, &ops);
                 if recovers {
                     assert!(
                         ops.contains(&DocOp::Recover {
@@ -2094,6 +2138,9 @@ mod property_tests {
             // The model server takes no creates, so a lost create can never settle once the
             // document is deleted server-side.
             let other_deletes = !lost_create && seed % 7 == 0;
+            if lost_create && seed % 3 == 0 {
+                client.snapshot(&server);
+            }
             // Advanced only by a write to `shared`, from either side, the moment it happens —
             // not the server seq (a dropped local write never reaches one) and not the step
             // index (most steps never touch `shared`).
@@ -2143,6 +2190,18 @@ mod property_tests {
                 }
                 check_shared_key_preserved(seed, &client, &server);
             }
+            // A lost create with no later edit on either side is identical to what landed.
+            if lost_create
+                && client.local_edits == 0
+                && server.other_edits == 0
+                && !server.deleted
+                && !client.deleted_locally
+            {
+                assert!(
+                    client.recovered.is_empty(),
+                    "seed {seed}: a lost create with no later edit was recovered"
+                );
+            }
             totals.add(&client.hits);
         }
         // Each branch must actually run, or the model has stopped testing it.
@@ -2152,6 +2211,7 @@ mod property_tests {
         assert!(totals.mismatch_retries > 0, "{totals:?}");
         assert!(totals.delete_wins > 0, "{totals:?}");
         assert!(totals.local_deletes_settled > 0, "{totals:?}");
+        assert!(totals.equal_content_adopts > 0, "{totals:?}");
     }
 }
 
@@ -2314,5 +2374,96 @@ mod snapshot_doc_tests {
             op,
             DocOp::SetShadow(_) | DocOp::SetContent(_) | DocOp::Recover { .. }
         )));
+    }
+}
+
+#[cfg(test)]
+mod equal_content_tests {
+    use super::change_fixtures::*;
+    use super::fixtures::*;
+    use super::*;
+    use serde_json::json;
+
+    /// A create that landed but whose reply was lost: no shadow, pending rows.
+    fn lost_create(content: Value, rows: Vec<OutboxRow>) -> DocSnapshot {
+        let mut s = synced(content, 0);
+        s.shadow = None;
+        s.rows = rows;
+        s
+    }
+
+    fn assert_adopted(s: &DocSnapshot, ops: &[DocOp], seq: Seq) {
+        assert!(!ops.iter().any(|op| matches!(
+            op,
+            DocOp::Recover { .. } | DocOp::Emit(DocEvent::ConflictDetected)
+        )));
+        let after = s.project(ops);
+        assert_eq!(after.content, s.content, "local content is unchanged");
+        assert!(
+            after.rows.is_empty(),
+            "every row is already in the envelope"
+        );
+        assert_eq!(after.shadow.expect("adopted shadow").seq, seq);
+    }
+
+    #[test]
+    fn no_shadow_change_with_equal_content_adopts_and_settles() {
+        let s = lost_create(json!({"items": ["a"]}), vec![row(1, RowKind::Create)]);
+        let mut change = upsert("own", json!({"items": ["a"]}), 4);
+        change.doc.as_mut().unwrap().hash = "server-hash".into();
+        let ops = apply_change(&s, &change, ME);
+        assert_adopted(&s, &ops, 4);
+        assert_eq!(
+            s.project(&ops).shadow.unwrap().hash,
+            "server-hash",
+            "the server hash is stored verbatim, never compared"
+        );
+    }
+
+    #[test]
+    fn no_shadow_snapshot_with_equal_content_adopts_and_settles() {
+        let s = lost_create(
+            json!({"items": ["a"]}),
+            vec![row(1, RowKind::Create), row(2, RowKind::Update)],
+        );
+        let ops = apply_snapshot_doc(&s, "own", &env(json!({"items": ["a"]}), 4), ME);
+        assert_adopted(&s, &ops, 4);
+        assert!(!ops.iter().any(|op| matches!(op, DocOp::InsertMarker(_))));
+    }
+
+    #[test]
+    fn no_shadow_server_copy_with_equal_content_adopts_and_settles() {
+        let s = lost_create(json!({"n": 1}), vec![row(1, RowKind::Create)]);
+        let ops = apply_server_copy(&s, &env(json!({"n": 1}), 2), ME);
+        assert_adopted(&s, &ops, 2);
+    }
+
+    #[test]
+    fn no_shadow_with_a_later_edit_still_recovers() {
+        // The create landed as ["a"]; a later local edit made it ["a", "b"]: not equal.
+        let s = lost_create(
+            json!({"items": ["a", "b"]}),
+            vec![row(1, RowKind::Create), row(2, RowKind::Update)],
+        );
+        let ops = apply_change(&s, &upsert("own", json!({"items": ["a"]}), 4), ME);
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"items": ["a", "b"]}),
+            reason: RecoverReason::Conflict,
+        }));
+        assert!(ops.contains(&DocOp::Emit(DocEvent::ConflictDetected)));
+    }
+
+    #[test]
+    fn float_forms_adopt_only_when_local_hashes_agree() {
+        let local = json!({"n": 1.0});
+        let server = json!({"n": 1});
+        let s = lost_create(local.clone(), vec![row(1, RowKind::Create)]);
+        let ops = apply_snapshot_doc(&s, "own", &env(server.clone(), 4), ME);
+        let recovered = ops.iter().any(|op| matches!(op, DocOp::Recover { .. }));
+        let equal = content_hash(&local) == content_hash(&server);
+        assert_eq!(
+            recovered, !equal,
+            "adopt exactly when the two local hashes agree"
+        );
     }
 }
