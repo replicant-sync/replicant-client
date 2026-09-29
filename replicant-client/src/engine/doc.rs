@@ -662,12 +662,19 @@ fn changed_indices(old: &[Value], side: &[Value]) -> std::collections::HashSet<u
         .collect()
 }
 
+/// Whether any two elements of `values` are equal (deep equality for objects/arrays).
+fn has_repeated_values(values: &[Value]) -> bool {
+    values
+        .iter()
+        .enumerate()
+        .any(|(i, v)| values[i + 1..].contains(v))
+}
+
 /// Whether the list at `path` collides as one value: always under `Atomic`; under `Append`
-/// once positions stop lining up. Same-length edits on both sides merge by position unless
-/// both sides changed an overlapping index and ended with different lists — a shifted diff
-/// (a remove and an insert, or a reorder) can otherwise read as agreement at indices neither
-/// side actually agreed on. One side only appending while the other keeps the length always
-/// merges by position.
+/// once positions stop lining up, or when the base list has a repeated value and both sides
+/// changed it — with a repeat, "which twin" is ambiguous, so a disjoint-looking edit may
+/// really be retargeted at the other side's twin. A list changed on only one side, or a
+/// same-length edit on both sides at disjoint indices with no repeat, merges by position.
 fn merges_as_one_value(
     old_base: &Value,
     local: &Value,
@@ -681,13 +688,17 @@ fn merges_as_one_value(
     match lists.policy_for(path) {
         ListMergePolicy::Atomic => true,
         ListMergePolicy::Append => {
-            match (
-                list_shape(old, local.pointer(path)),
-                list_shape(old, new_base.pointer(path)),
-            ) {
+            let old_value = old_base.pointer(path);
+            let local_value = local.pointer(path);
+            let their_value = new_base.pointer(path);
+            let both_changed = local_value != old_value && their_value != old_value;
+            if both_changed && local_value != their_value && has_repeated_values(old) {
+                return true;
+            }
+            match (list_shape(old, local_value), list_shape(old, their_value)) {
                 (ListShape::SameLength, ListShape::SameLength) => {
                     let (Some(Value::Array(local)), Some(Value::Array(theirs))) =
-                        (local.pointer(path), new_base.pointer(path))
+                        (local_value, their_value)
                     else {
                         unreachable!("ListShape::SameLength implies an array of the same length")
                     };
@@ -2171,6 +2182,51 @@ mod rebase_tests {
         let old = json!([0, 200, 400, 500]);
         let mine = json!([0, 400, 500]);
         let theirs = json!([0, 400, 500]);
+        assert_eq!(
+            rebase(&old, &theirs, &mine, &APPEND),
+            Rebased::Clean(theirs)
+        );
+    }
+
+    #[test]
+    fn removing_one_twin_while_retuning_the_other_collides_at_the_array() {
+        // With a repeated value, "which twin" is ambiguous: the disjoint index sets here would
+        // otherwise merge, silently retargeting the removal at the wrong twin.
+        let old = pitches(json!([0, 200, 200, 500]));
+        let mine = pitches(json!([0, 200, 500, 800]));
+        let theirs = pitches(json!([0, 204, 200, 500]));
+        assert_eq!(
+            rebase(&old, &theirs, &mine, &APPEND),
+            list_kept_aside(theirs, mine)
+        );
+    }
+
+    #[test]
+    fn an_append_against_a_disjoint_retune_of_a_repeated_value_collides_at_the_array() {
+        let old = pitches(json!([0, 200, 200, 500]));
+        let mine = pitches(json!([0, 200, 200, 500, 800]));
+        let theirs = pitches(json!([0, 200, 200, 501]));
+        assert_eq!(
+            rebase(&old, &theirs, &mine, &APPEND),
+            list_kept_aside(theirs, mine)
+        );
+    }
+
+    #[test]
+    fn a_disjoint_retune_with_no_repeated_values_still_merges() {
+        let mine = pitches(json!([0, 200, 386, 500, 700, 900]));
+        let theirs = pitches(json!([0, 200, 400, 500, 700, 884]));
+        assert_eq!(
+            rebase(&scale(), &theirs, &mine, &APPEND),
+            Rebased::Clean(pitches(json!([0, 200, 386, 500, 700, 884])))
+        );
+    }
+
+    #[test]
+    fn both_sides_removing_the_same_element_from_a_repeated_value_list_is_clean() {
+        let old = pitches(json!([0, 200, 200, 500]));
+        let mine = pitches(json!([0, 200, 500]));
+        let theirs = pitches(json!([0, 200, 500]));
         assert_eq!(
             rebase(&old, &theirs, &mine, &APPEND),
             Rebased::Clean(theirs)
