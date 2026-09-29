@@ -159,6 +159,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lost_create_of_an_integral_float_adopts_the_servers_copy() {
+        let t = temp_store().await;
+        t.store
+            .create_document(ME, Some(DOC), json!({"n": 1200.0}))
+            .await
+            .unwrap();
+        let (_, inflight) = sent(&t.store, DOC).await;
+        t.store.mark_sent(DOC, inflight.upload_id).await.unwrap();
+        // The create landed but its reply was lost; the resync reads the server's jsonb row.
+        let server = envelope(DOC, Some(ME), json!({"n": 1200}), 4);
+        let notices = t
+            .store
+            .apply_snapshot_page(ME, SCOPE_OWN, std::slice::from_ref(&server))
+            .await
+            .unwrap();
+        assert_eq!(notices, vec![]);
+        assert!(recovered(&t).await.is_empty());
+        assert_eq!(count(&t.store, "SELECT COUNT(*) FROM outbox").await, 0);
+        assert_eq!(snapshot(&t.store, DOC).await.shadow.map(|s| s.seq), Some(4));
+    }
+
+    #[tokio::test]
     async fn load_pending_skips_parked_docs_and_lists_oldest_first() {
         let t = temp_store().await;
         let first = t

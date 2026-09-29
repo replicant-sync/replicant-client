@@ -2883,18 +2883,4 @@ mod equal_content_tests {
         }));
         assert!(ops.contains(&DocOp::Emit(DocEvent::ConflictDetected)));
     }
-
-    #[test]
-    fn float_forms_adopt_only_when_local_hashes_agree() {
-        let local = json!({"n": 1.0});
-        let server = json!({"n": 1});
-        let s = lost_create(local.clone(), vec![row(1, RowKind::Create)]);
-        let ops = apply_snapshot_doc(&s, "own", &env(server.clone(), 4), ME);
-        let recovered = ops.iter().any(|op| matches!(op, DocOp::Recover { .. }));
-        let equal = content_hash(&local) == content_hash(&server);
-        assert_eq!(
-            recovered, !equal,
-            "adopt exactly when the two local hashes agree"
-        );
-    }
 }

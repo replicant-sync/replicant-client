@@ -15,7 +15,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
 
-use crate::engine::hash::content_hash;
+use crate::engine::hash::{canonicalise_numbers, content_hash};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Mode {
@@ -528,13 +528,23 @@ impl Model {
     }
 }
 
-/// What Postgres jsonb gives back: integral floats become integers.
+/// What the real server reads back from Postgres. It writes through Jason, which prints a float
+/// in the shorter of fixed and scientific notation, and jsonb keeps the printed scale: `1.2e3`
+/// reads back as the integer 1200, `1234.0` stays a float, `-0.0` becomes `0.0`.
 fn jsonb(value: &Value) -> Value {
     match value {
-        Value::Number(number) if number.is_f64() => match number.as_f64() {
-            Some(float) if float.fract() == 0.0 && float.abs() < 9.0e15 => json!(float as i64),
-            _ => value.clone(),
-        },
+        Value::Number(number) if number.is_f64() => {
+            let float = number.as_f64().expect("an f64 number");
+            if float == 0.0 {
+                json!(0.0)
+            } else if float.fract() == 0.0 && jason_prints_scientific(float) {
+                let mut read_back = value.clone();
+                canonicalise_numbers(&mut read_back);
+                read_back
+            } else {
+                value.clone()
+            }
+        }
         Value::Array(items) => Value::Array(items.iter().map(jsonb).collect()),
         Value::Object(fields) => Value::Object(
             fields
@@ -544,6 +554,20 @@ fn jsonb(value: &Value) -> Value {
         ),
         other => other.clone(),
     }
+}
+
+/// Jason prints the shortest round-trip digits; for an integral float the scientific form
+/// (`1.0e3`, `1.2e3`) wins only when strictly shorter than the fixed one (`1000.0`).
+fn jason_prints_scientific(float: f64) -> bool {
+    let shortest = format!("{:e}", float.abs());
+    let (mantissa, exponent) = shortest.split_once('e').expect("LowerExp has an exponent");
+    let digits = mantissa.replace('.', "").len();
+    let exponent: usize = exponent
+        .parse()
+        .expect("an integral float's exponent is not negative");
+    let scientific = digits.max(2) + 2 + exponent.to_string().len();
+    let fixed = exponent + 1 + 2;
+    scientific < fixed
 }
 
 fn uuid_field(payload: &Value, name: &str) -> Option<Uuid> {
@@ -837,6 +861,51 @@ mod tests {
         assert_eq!(server.stats.upgrades(), 1);
     }
 
+    #[test]
+    fn jsonb_matches_the_servers_postgres_round_trip() {
+        // Measured 2026-09-29: Jason prints the float, Postgres jsonb stores that text's scale.
+        let cases = [
+            (json!(1200.0), json!(1200)),
+            (json!(1000.0), json!(1000)),
+            (json!(-1200.0), json!(-1200)),
+            (json!(100000.0), json!(100000)),
+            (json!(1.0e16), json!(10_000_000_000_000_000_i64)),
+            (json!(1.0e19), json!(10_000_000_000_000_000_000_u64)),
+            (json!(1.0e20), json!(1.0e20)),
+            (json!(1234.0), json!(1234.0)),
+            (json!(123456.0), json!(123456.0)),
+            (json!(100.0), json!(100.0)),
+            (json!(10.0), json!(10.0)),
+            (json!(1.0), json!(1.0)),
+            (json!(1.5), json!(1.5)),
+            (json!(1200.5), json!(1200.5)),
+            (json!(1.0e-5), json!(1.0e-5)),
+            (json!(7), json!(7)),
+        ];
+        for (written, read_back) in cases {
+            let got = jsonb(&written);
+            assert_eq!(got, read_back, "{written}");
+            assert_eq!(got.is_f64(), read_back.is_f64(), "{written}: number kind");
+        }
+        let zero = jsonb(&json!(-0.0));
+        assert!(zero.is_f64() && !zero.as_f64().unwrap().is_sign_negative());
+        for written in [
+            json!(1200.0),
+            json!(1234.0),
+            json!(-0.0),
+            json!(1.0e19),
+            json!(1.0e20),
+        ] {
+            let mut canonical = written.clone();
+            canonicalise_numbers(&mut canonical);
+            assert_eq!(
+                jsonb(&canonical),
+                canonical,
+                "{written}: canonical content survives"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn upload_is_applied_pushed_and_its_reply_stored() {
         let server = ScriptedServer::start(ME).await;
@@ -853,8 +922,8 @@ mod tests {
         assert_eq!(reply_doc.seq, 1);
         assert_eq!(
             reply_doc.content,
-            json!({"n": 1200.0}),
-            "replies carry content as uploaded"
+            json!({"n": 1200}),
+            "the client decodes every envelope to canonical numbers"
         );
         let Received::Input(Input::Push(change)) = received(&mut connection).await else {
             panic!("expected the create's push");

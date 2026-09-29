@@ -9,7 +9,7 @@ use super::docs::{
 };
 use super::{now_rfc3339, Store, StoreError, StoreResult};
 use crate::engine::doc::{DocSnapshot, FieldConflict, RowKind};
-use crate::engine::hash::content_hash;
+use crate::engine::hash::{canonicalise_numbers, content_hash};
 
 impl Store {
     /// Creates a document owned by `me`, returning its id.
@@ -17,8 +17,9 @@ impl Store {
         &self,
         me: Uuid,
         doc_id: Option<Uuid>,
-        content: Value,
+        mut content: Value,
     ) -> StoreResult<Uuid> {
+        canonicalise_numbers(&mut content);
         let doc_id = doc_id.unwrap_or_else(Uuid::new_v4);
         let mut tx = self.begin().await?;
         let snap = load_snapshot(&mut tx, doc_id).await?;
@@ -86,8 +87,9 @@ impl Store {
         conn: &mut SqliteConnection,
         me: Uuid,
         doc_id: Uuid,
-        content: Value,
+        mut content: Value,
     ) -> StoreResult<()> {
+        canonicalise_numbers(&mut content);
         let snap = load_snapshot(&mut *conn, doc_id).await?;
         check_writable(&snap, me)?;
         sqlx::query(
@@ -213,6 +215,29 @@ mod tests {
 
     fn doc(n: u128) -> Uuid {
         Uuid::from_u128(0xD000 + n)
+    }
+
+    #[tokio::test]
+    async fn host_writes_store_integral_floats_as_integers() {
+        let t = temp_store().await;
+        let doc_id = t
+            .store
+            .create_document(ME, None, json!({"n": 1200.0, "x": 1.5, "list": [2.0]}))
+            .await
+            .unwrap();
+        let canonical = json!({"n": 1200, "x": 1.5, "list": [2]});
+        assert_eq!(snapshot(&t.store, doc_id).await.content, canonical);
+        let hash: String = sqlx::query_scalar("SELECT hash FROM documents WHERE id = ?")
+            .bind(doc_id.to_string())
+            .fetch_one(&t.store.pool)
+            .await
+            .unwrap();
+        assert_eq!(hash, content_hash(&canonical));
+        t.store
+            .update_document(ME, doc_id, json!({"n": 1300.0}))
+            .await
+            .unwrap();
+        assert_eq!(snapshot(&t.store, doc_id).await.content, json!({"n": 1300}));
     }
 
     #[tokio::test]

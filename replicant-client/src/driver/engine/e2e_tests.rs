@@ -60,6 +60,23 @@ fn conflicts(events: &mut mpsc::UnboundedReceiver<EngineEvent>) -> usize {
     conflicts
 }
 
+/// No rows left and the shadow is at the server's latest seq for the document.
+async fn in_sync(store: &Store, server: &ScriptedServer, doc_id: Uuid) -> bool {
+    outbox_rows(store).await == 0
+        && snapshot(store, doc_id).await.shadow.map(|s| s.seq)
+            == server.doc(doc_id).map(|(_, seq, _)| seq)
+}
+
+/// Waits for the document's `uploads`-th upload to be held, then releases it: a released
+/// upload's push reaches the client before its reply.
+async fn release_when_held(server: &ScriptedServer, doc_id: Uuid, uploads: usize) {
+    eventually("the upload is held", || async {
+        server.uploads_for(doc_id).len() == uploads
+    })
+    .await;
+    server.release_held();
+}
+
 #[tokio::test]
 async fn startup_emits_succeeded_started_completed_in_order() {
     let server = ScriptedServer::start(ME).await;
@@ -238,7 +255,7 @@ async fn cursor_too_old_resync_sweeps_missing_docs() {
 }
 
 #[tokio::test]
-async fn float_round_trip_converges_with_at_most_one_extra_upload() {
+async fn integral_float_create_uploads_once_after_a_lost_reply() {
     let server = ScriptedServer::start(ME).await;
     server.put_doc(Uuid::from_u128(0xF0), json!({"seed": 1}));
     let (_dir, path) = seeded_db(ME, true).await;
@@ -255,81 +272,221 @@ async fn float_round_trip_converges_with_at_most_one_extra_upload() {
     })
     .await;
     jump(Duration::from_millis(1100)).await;
-    eventually("settled after the reconnect", || async {
-        outbox_rows(&store).await == 0
+    eventually("in sync after the reconnect", || async {
+        in_sync(&store, &server, doc_id).await
     })
     .await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
     let uploads = server.uploads_for(doc_id);
     assert!(
-        uploads.len() <= 2,
-        "more than one extra upload: {uploads:#?}"
+        uploads.iter().all(|upload| *upload == uploads[0]),
+        "only the create, resent at most: {uploads:#?}"
     );
-    if uploads.len() == 2 {
-        assert_eq!(
-            uploads[1]["kind"], "update",
-            "the retry re-sends as an update: {uploads:#?}"
-        );
-    }
-    assert_eq!(outbox_rows(&store).await, 0);
-    assert_eq!(snapshot(&store, doc_id).await.content, json!({"n": 1200.0}));
+    assert_eq!(
+        uploads[0]["payload"],
+        json!({"n": 1200}),
+        "the create carries the integer"
+    );
+    assert_eq!(snapshot(&store, doc_id).await.content, json!({"n": 1200}));
+    assert_eq!(conflicts(&mut events), 0);
     engine.stop().await;
 }
 
-#[tokio::test]
-async fn untouched_float_field_converges_after_the_server_rounds_it() {
-    // Editing "m" alone still touches "n"'s round trip: the server patches its jsonb-rounded
-    // row, so the update's push/reply carries "n" as 1200, not the 1200.0 this client sent.
+/// Creates {"n": 1200.0, "m": 1}, then edits "m" alone. With `push_first`, each upload's push
+/// reaches the client before its reply.
+async fn integral_float_edits_upload_once_per_edit(push_first: bool) {
     let server = ScriptedServer::start(ME).await;
     server.put_doc(Uuid::from_u128(0xF0), json!({"seed": 1}));
     let (_dir, path) = seeded_db(ME, true).await;
     let (engine, mut events) = live_engine(&server, &path).await;
     let store = engine.store();
+    if push_first {
+        server.hold_uploads();
+    }
     let doc_id = store
         .create_document(ME, None, json!({"n": 1200.0, "m": 1}))
         .await
         .unwrap();
     engine.notify_outbox();
+    if push_first {
+        release_when_held(&server, doc_id, 1).await;
+    }
     eventually("the create settles", || async {
-        outbox_rows(&store).await == 0
+        in_sync(&store, &server, doc_id).await
     })
     .await;
 
+    if push_first {
+        server.hold_uploads();
+    }
     store
         .update_document(ME, doc_id, json!({"n": 1200.0, "m": 2}))
         .await
         .unwrap();
     engine.notify_outbox();
+    if push_first {
+        release_when_held(&server, doc_id, 2).await;
+    }
     eventually("the edit settles", || async {
-        outbox_rows(&store).await == 0
+        in_sync(&store, &server, doc_id).await
     })
     .await;
 
-    assert_eq!(
-        recovered_rows(&store, doc_id).await,
-        0,
-        "nothing was in conflict"
-    );
+    assert_eq!(recovered_rows(&store, doc_id).await, 0);
     assert_eq!(conflicts(&mut events), 0);
     assert_eq!(
         server_content(&server, doc_id),
-        Some(json!({"n": 1200, "m": 2})),
-        "the server's jsonb rounds the untouched float"
+        Some(json!({"n": 1200, "m": 2}))
     );
     assert_eq!(
         snapshot(&store, doc_id).await.content,
-        json!({"n": 1200.0, "m": 2}),
-        "the client keeps its own float"
+        json!({"n": 1200, "m": 2})
+    );
+    let uploads = server.uploads_for(doc_id);
+    assert_eq!(uploads.len(), 2, "one upload per edit: {uploads:#?}");
+    assert_eq!(uploads[0]["payload"], json!({"n": 1200, "m": 1}));
+    assert_eq!(
+        uploads[1]["payload"],
+        json!([{"op": "replace", "path": "/m", "value": 2}]),
+        "the patch never touches the float"
+    );
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn integral_float_edits_upload_once_per_edit_reply_first() {
+    integral_float_edits_upload_once_per_edit(false).await;
+}
+
+#[tokio::test]
+async fn integral_float_edits_upload_once_per_edit_push_first() {
+    integral_float_edits_upload_once_per_edit(true).await;
+}
+
+/// The client settles {"n": 1200.0, "m": 2} and edits "n" while that upload is held; another
+/// device changes "m" meanwhile. With `push_first`, the create's push arrives before its reply.
+async fn local_float_edit_survives_another_devices_edit(push_first: bool) {
+    let server = ScriptedServer::start(ME).await;
+    server.put_doc(Uuid::from_u128(0xF0), json!({"seed": 1}));
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, mut events) = live_engine(&server, &path).await;
+    let store = engine.store();
+    if push_first {
+        server.hold_uploads();
+    }
+    let doc_id = store
+        .create_document(ME, None, json!({"n": 1200.0, "m": 2}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    if push_first {
+        release_when_held(&server, doc_id, 1).await;
+    }
+    eventually("the create settles", || async {
+        in_sync(&store, &server, doc_id).await
+    })
+    .await;
+
+    server.hold_uploads();
+    store
+        .update_document(ME, doc_id, json!({"n": 1300.0, "m": 2}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    eventually("the edit is held", || async {
+        server.uploads_for(doc_id).len() == 2
+    })
+    .await;
+    // Another device changes "m"; the server patched the row it read back, so "n" is 1200.
+    server.put_doc(doc_id, json!({"n": 1200, "m": 3}));
+    eventually(
+        "the other device's edit merges under the local one",
+        || async { snapshot(&store, doc_id).await.content == json!({"n": 1300, "m": 3}) },
+    )
+    .await;
+    // The held edit's base is stale now: hash_mismatch, then a retry on the new version.
+    server.release_held();
+    eventually("the local edit lands", || async {
+        in_sync(&store, &server, doc_id).await
+    })
+    .await;
+
+    assert_eq!(recovered_rows(&store, doc_id).await, 0);
+    assert_eq!(conflicts(&mut events), 0);
+    assert_eq!(
+        server_content(&server, doc_id),
+        Some(json!({"n": 1300, "m": 3}))
     );
     let uploads = server.uploads_for(doc_id);
     assert_eq!(
-        // ScriptedServer sends the upload reply before the push, so settle() sets the shadow
-        // from the client's own sent content (1200.0) and the later push is dropped as
-        // already seen. This pins that ordering: a push-before-reply would set the shadow to
-        // the rounded echo instead and force a third upload.
         uploads.len(),
-        2,
-        "unexpected upload count: {uploads:#?}"
+        3,
+        "the create, the held edit and its retry: {uploads:#?}"
+    );
+    for upload in &uploads[1..] {
+        assert_eq!(
+            upload["payload"],
+            json!([{"op": "replace", "path": "/n", "value": 1300}])
+        );
+    }
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn local_float_edit_survives_another_devices_edit_reply_first() {
+    local_float_edit_survives_another_devices_edit(false).await;
+}
+
+#[tokio::test]
+async fn local_float_edit_survives_another_devices_edit_push_first() {
+    local_float_edit_survives_another_devices_edit(true).await;
+}
+
+#[tokio::test]
+async fn another_devices_integral_float_does_not_collide_with_a_local_edit() {
+    let server = ScriptedServer::start(ME).await;
+    server.put_doc(Uuid::from_u128(0xF0), json!({"seed": 1}));
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, mut events) = live_engine(&server, &path).await;
+    let store = engine.store();
+    let doc_id = Uuid::from_u128(0xD1);
+    // A writer that does not canonicalise: the push carries the float as written.
+    server.put_doc(doc_id, json!({"n": 1200.0, "m": 1}));
+    eventually("the other device's document arrives", || async {
+        snapshot(&store, doc_id).await.exists
+    })
+    .await;
+    assert_eq!(
+        snapshot(&store, doc_id).await.content,
+        json!({"n": 1200, "m": 1})
+    );
+
+    server.hold_uploads();
+    store
+        .update_document(ME, doc_id, json!({"n": 1300, "m": 1}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    eventually("the edit is held", || async {
+        server.uploads_for(doc_id).len() == 1
+    })
+    .await;
+    server.put_doc(doc_id, json!({"n": 1200, "m": 2}));
+    eventually(
+        "the other device's edit merges under the local one",
+        || async { snapshot(&store, doc_id).await.content == json!({"n": 1300, "m": 2}) },
+    )
+    .await;
+    server.release_held();
+    eventually("the local edit lands", || async {
+        in_sync(&store, &server, doc_id).await
+    })
+    .await;
+
+    assert_eq!(recovered_rows(&store, doc_id).await, 0);
+    assert_eq!(conflicts(&mut events), 0);
+    assert_eq!(
+        server_content(&server, doc_id),
+        Some(json!({"n": 1300, "m": 2}))
     );
     engine.stop().await;
 }
