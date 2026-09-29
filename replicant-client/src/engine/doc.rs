@@ -2238,11 +2238,14 @@ mod rebase_tests {
 mod property_tests {
     //! One writable document against a model server that applies updates and deletes
     //! (deduplicated by `(upload_id, base_hash)`) and that another device edits or deletes.
-    //! Changes reach the client as pushes (envelope at the change's seq) or catch-up pages
-    //! (current envelope). A lost reply is either a reconnect (every committed change is
-    //! delivered before the next build) or silent (the client learns of it only through
-    //! `hash_mismatch`). Like the machine, the client applies a server copy only once it has
-    //! been delivered every change up to the copy's seq; otherwise it catches up and rebuilds.
+    //! Both sides edit `pitches` with random inserts, removes, retunes, moves and appends; the
+    //! client also appends to `items` and both write the scalar `shared`. Every seed runs under
+    //! the `Append` and the `Atomic` list policy. Changes reach the client as pushes (envelope
+    //! at the change's seq) or catch-up pages (current envelope). A lost reply is either a
+    //! reconnect (every committed change is delivered before the next build) or silent (the
+    //! client learns of it only through `hash_mismatch`). Like the machine, the client applies
+    //! a server copy only once it has been delivered every change up to the copy's seq;
+    //! otherwise it catches up and rebuilds.
     use std::collections::HashMap;
 
     use super::change_fixtures::env;
@@ -2256,6 +2259,11 @@ mod property_tests {
     const STEPS: usize = 80;
     const MAX_LOCAL_EDITS: u32 = 12;
     const MAX_OTHER_EDITS: u32 = 8;
+
+    static ATOMIC: ListMergeConfig = ListMergeConfig {
+        default: ListMergePolicy::Atomic,
+        rules: Vec::new(),
+    };
 
     #[derive(Debug, Clone, Copy)]
     struct Committed {
@@ -2279,6 +2287,12 @@ mod property_tests {
         equal_content_adopts: u32,
         never_sent_rebases: u32,
         field_conflicts: u32,
+        /// Rebases where both sides changed `pitches` at the same length and it merged.
+        list_merges: u32,
+        /// Rebases where one side only appended to `pitches` and it merged.
+        append_merges: u32,
+        /// Rebases that kept the server's `pitches` and set the local list aside.
+        list_conflicts: u32,
     }
 
     impl Hits {
@@ -2293,6 +2307,9 @@ mod property_tests {
             self.equal_content_adopts += other.equal_content_adopts;
             self.never_sent_rebases += other.never_sent_rebases;
             self.field_conflicts += other.field_conflicts;
+            self.list_merges += other.list_merges;
+            self.append_merges += other.append_merges;
+            self.list_conflicts += other.list_conflicts;
         }
     }
 
@@ -2357,6 +2374,9 @@ mod property_tests {
             self.other_edits += 1;
             let mut next = self.current().clone();
             next["theirs"] = json!(self.other_edits);
+            if rng.next_unit() < 0.5 {
+                edit_pitches(&mut next, rng, "q", self.other_edits);
+            }
             let shared_write = if rng.next_unit() < 0.5 {
                 let value = format!("theirs{}", self.other_edits);
                 next["shared"] = json!(value);
@@ -2434,6 +2454,8 @@ mod property_tests {
         deleted_locally: bool,
         recovered: Vec<Value>,
         hits: Hits,
+        /// The list merge configuration every rule this client applies uses.
+        lists: &'static ListMergeConfig,
         /// (order, value) of every local write to `shared`, in the order they happened —
         /// recorded in `edit`, the moment the write is made, whether or not it ever reaches an
         /// upload (a rebase can silently drop a pending edit before it is ever built). Used to
@@ -2454,7 +2476,7 @@ mod property_tests {
     }
 
     impl Client {
-        fn new(content: Value) -> Client {
+        fn new(content: Value, lists: &'static ListMergeConfig) -> Client {
             Client {
                 snap: synced(content, 1),
                 next_row: 0,
@@ -2468,6 +2490,7 @@ mod property_tests {
                 deleted_locally: false,
                 recovered: Vec::new(),
                 hits: Hits::default(),
+                lists,
                 local_shared_writes: Vec::new(),
                 landed_shared: None,
                 field_recovered: Vec::new(),
@@ -2479,8 +2502,8 @@ mod property_tests {
         /// `Create` row. Fuzzes the no-shadow branch of `apply_snapshot_doc` and of
         /// `apply_change`'s non-echo arm, plus its echo arm on the seeds where `server.changes`
         /// carries a matching entry.
-        fn new_lost_create(content: Value) -> Client {
-            let mut c = Client::new(content);
+        fn new_lost_create(content: Value, lists: &'static ListMergeConfig) -> Client {
+            let mut c = Client::new(content, lists);
             c.snap.shadow = None;
             c.cursor = 0;
             c.next_row = 1;
@@ -2491,6 +2514,15 @@ mod property_tests {
             }];
             c.snap.unacked_upload = Some(m(1));
             c
+        }
+
+        fn count_pitch_merge(&mut self, merge: Option<PitchMerge>) {
+            match merge {
+                Some(PitchMerge::Positional) => self.hits.list_merges += 1,
+                Some(PitchMerge::Appended) => self.hits.append_merges += 1,
+                Some(PitchMerge::WholeList) => self.hits.list_conflicts += 1,
+                None => {}
+            }
         }
 
         fn push_row(&mut self, kind: RowKind) {
@@ -2538,17 +2570,20 @@ mod property_tests {
             }
             self.local_edits += 1;
             let n = self.local_edits;
-            if rng.next_unit() < 0.3 {
+            let roll = rng.next_unit();
+            if roll < 0.3 {
                 let value = format!("mine{n}");
                 self.snap.content["shared"] = json!(value);
                 *order += 1;
                 self.local_shared_writes.push((*order, value));
-            } else {
+            } else if roll < 0.6 {
                 self.snap.content["items"]
                     .as_array_mut()
                     .expect("items array")
                     .push(token(n));
                 self.tokens.push(n);
+            } else {
+                edit_pitches(&mut self.snap.content, rng, "p", n);
             }
             self.push_row(RowKind::Update);
         }
@@ -2674,7 +2709,7 @@ mod property_tests {
                 && doc
                     .as_ref()
                     .is_some_and(|doc| self.equal_content_adoptable(doc, committed.seq));
-            let ops = apply_change(&self.snap, &change, ME, &APPEND);
+            let ops = apply_change(&self.snap, &change, ME, self.lists);
             self.check_adopted(adoptable, &ops);
             self.count_rebase_conflict(rebase_possible && !is_echo_for_us, &ops, false);
             if rebase_possible
@@ -2691,6 +2726,15 @@ mod property_tests {
                         &doc.content,
                         &ops,
                     );
+                    let merge = check_pitches(
+                        "deliver",
+                        self,
+                        shadow_content,
+                        &local_content_before,
+                        &doc.content,
+                        &ops,
+                    );
+                    self.count_pitch_merge(merge);
                 }
             }
             self.apply(&ops);
@@ -2751,12 +2795,17 @@ mod property_tests {
                     && self.snap.unacked_upload.is_none()
                     && self.snap.shadow.as_ref().is_some_and(|shadow| {
                         matches!(
-                            rebase(&shadow.content, &doc.content, &self.snap.content, &APPEND),
+                            rebase(
+                                &shadow.content,
+                                &doc.content,
+                                &self.snap.content,
+                                self.lists
+                            ),
                             Rebased::Clean(_) | Rebased::Fields { .. }
                         )
                     });
                 let pre_content = self.snap.content.clone();
-                let ops = apply_snapshot_doc(&self.snap, "own", &doc, ME, &APPEND);
+                let ops = apply_snapshot_doc(&self.snap, "own", &doc, ME, self.lists);
                 self.check_adopted(adoptable, &ops);
                 if never_sent_rebase {
                     assert!(
@@ -2858,7 +2907,7 @@ mod property_tests {
                     let before_server_seq = self.snap.server_seq();
                     let old_shadow_content = self.snap.shadow.as_ref().map(|s| s.content.clone());
                     let local_content_before = self.snap.content.clone();
-                    let ops = apply_server_copy(&self.snap, &doc, ME, &APPEND);
+                    let ops = apply_server_copy(&self.snap, &doc, ME, self.lists);
                     self.count_rebase_conflict(rebase_possible, &ops, true);
                     if rebase_possible && !pending_delete_before && doc.seq > before_server_seq {
                         if let Some(shadow_content) = &old_shadow_content {
@@ -2870,6 +2919,15 @@ mod property_tests {
                                 &doc.content,
                                 &ops,
                             );
+                            let merge = check_pitches(
+                                "server copy",
+                                self,
+                                shadow_content,
+                                &local_content_before,
+                                &doc.content,
+                                &ops,
+                            );
+                            self.count_pitch_merge(merge);
                         }
                     }
                     self.apply(&ops);
@@ -2908,6 +2966,142 @@ mod property_tests {
 
     fn token(n: u32) -> Value {
         json!(format!("t{n}"))
+    }
+
+    /// One random retune (replace), remove, insert, move or append on `pitches`. A new element
+    /// is `{side}{n}`, unique across the run; a move keeps its element.
+    fn edit_pitches(content: &mut Value, rng: &mut Jitter, side: &str, n: u32) {
+        let pitches = content["pitches"].as_array_mut().expect("pitches array");
+        let element = json!(format!("{side}{n}"));
+        let len = pitches.len();
+        match (rng.next_unit() * 5.0) as u32 {
+            0 if len > 0 => {
+                let at = index_below(rng, len);
+                pitches[at] = element;
+            }
+            1 if len > 0 => {
+                let at = index_below(rng, len);
+                pitches.remove(at);
+            }
+            2 => {
+                let at = index_below(rng, len + 1);
+                pitches.insert(at, element);
+            }
+            3 if len >= 2 => {
+                let from = index_below(rng, len);
+                let moved = pitches.remove(from);
+                let to = index_below(rng, len - 1);
+                pitches.insert(to, moved);
+            }
+            _ => pitches.push(element),
+        }
+    }
+
+    fn index_below(rng: &mut Jitter, len: usize) -> usize {
+        ((rng.next_unit() * len as f64) as usize).min(len - 1)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum PitchMerge {
+        /// Both sides kept the length; merged position by position.
+        Positional,
+        /// One side only appended, the other kept the length.
+        Appended,
+        /// The server's list was kept and the local list set aside.
+        WholeList,
+    }
+
+    fn pitches(content: &Value) -> Vec<Value> {
+        content["pitches"].as_array().cloned().unwrap_or_default()
+    }
+
+    fn only_appends(old: &[Value], list: &[Value]) -> bool {
+        list.len() > old.len() && list[..old.len()] == old[..]
+    }
+
+    /// At a rebase, `pitches` is either set aside whole (the server's list taken) or merged so
+    /// that every element either side added, or both kept, is there once, unless a same-index
+    /// collision set the local element aside. Nothing comes from neither side, and with no
+    /// collision an element removed on one side stays removed. An atomic list both sides
+    /// changed to different lists is always set aside whole.
+    fn check_pitches(
+        what: &str,
+        client: &Client,
+        old_shadow: &Value,
+        local_before: &Value,
+        incoming: &Value,
+        ops: &[DocOp],
+    ) -> Option<PitchMerge> {
+        if ops.iter().any(|op| matches!(op, DocOp::Recover { .. })) {
+            return None;
+        }
+        let old = pitches(old_shadow);
+        let mine = pitches(local_before);
+        let theirs = pitches(incoming);
+        let result = pitches(&client.snap.project(ops).content);
+        let fields: Vec<&FieldConflict> = ops
+            .iter()
+            .filter_map(|op| match op {
+                DocOp::RecoverFields { fields, .. } => Some(fields),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let both_changed = mine != old && theirs != old && mine != theirs;
+        if both_changed && client.lists.policy_for("/pitches") == ListMergePolicy::Atomic {
+            assert!(
+                fields.iter().any(|f| f.path == "/pitches"),
+                "{what}: an atomic list both sides changed is set aside whole"
+            );
+        }
+        if let Some(whole) = fields.iter().find(|f| f.path == "/pitches") {
+            assert_eq!(
+                result, theirs,
+                "{what}: a list set aside takes the server's list"
+            );
+            assert_eq!(
+                whole.local_value,
+                Value::Array(mine.clone()),
+                "{what}: the whole local list is kept aside"
+            );
+            return Some(PitchMerge::WholeList);
+        }
+        let set_aside: Vec<&Value> = fields
+            .iter()
+            .filter(|f| f.path.starts_with("/pitches/"))
+            .map(|f| &f.local_value)
+            .collect();
+        for element in mine.iter().chain(&theirs) {
+            let copies = result.iter().filter(|e| *e == element).count();
+            assert!(copies <= 1, "{what}: {element} duplicated: {result:?}");
+            let wanted =
+                !old.contains(element) || (mine.contains(element) && theirs.contains(element));
+            if wanted {
+                assert!(
+                    copies == 1 || set_aside.contains(&element),
+                    "{what}: {element} lost without a field conflict \
+                     (old {old:?}, mine {mine:?}, theirs {theirs:?}, result {result:?})"
+                );
+            } else if set_aside.is_empty() {
+                assert_eq!(
+                    copies, 0,
+                    "{what}: {element} was removed on one side but is back: {result:?}"
+                );
+            }
+        }
+        for element in &result {
+            assert!(
+                mine.contains(element) || theirs.contains(element),
+                "{what}: {element} came from neither side"
+            );
+        }
+        if !both_changed {
+            None
+        } else if only_appends(&old, &mine) || only_appends(&old, &theirs) {
+            Some(PitchMerge::Appended)
+        } else {
+            Some(PitchMerge::Positional)
+        }
     }
 
     /// Whether a JSON Patch upload payload includes an operation on `/shared`.
@@ -3085,6 +3279,13 @@ mod property_tests {
                 "seed {seed}: t{n} applied {copies} times: {items:?}"
             );
         }
+        let list = pitches(&client.snap.content);
+        for (at, element) in list.iter().enumerate() {
+            assert!(
+                !list[at + 1..].contains(element),
+                "seed {seed}: {element} twice in pitches: {list:?}"
+            );
+        }
         if client.snap.rows.is_empty() {
             let shadow = client.snap.shadow.as_ref().expect("shadow");
             assert_eq!(
@@ -3117,19 +3318,24 @@ mod property_tests {
         panic!("seed {seed}: rows never settled: {:?}", client.snap.rows);
     }
 
-    #[test]
-    fn random_echo_rebase_and_page_sequences_lose_and_duplicate_nothing() {
+    /// Runs every seed with `lists`; returns the hits after asserting the ones every policy
+    /// must reach.
+    fn run_model(lists: &'static ListMergeConfig) -> Hits {
         let mut totals = Hits::default();
         for seed in 1..=SEEDS {
             let mut rng = Jitter::new(seed * 104_729);
-            let start = json!({"items": [], "theirs": 0});
+            let start = json!({
+                "items": [],
+                "theirs": 0,
+                "pitches": ["b0", "b1", "b2", "b3", "b4", "b5"]
+            });
             let mut server = Server::new(start.clone());
             // Half the seeds start as a lost-create client (no shadow, one pending Create row).
             let lost_create = seed % 2 == 0;
             let mut client = if lost_create {
-                Client::new_lost_create(start)
+                Client::new_lost_create(start, lists)
             } else {
-                Client::new(start)
+                Client::new(start, lists)
             };
             if lost_create && seed % 4 == 0 {
                 // The create landed as the doc's starting content but our reply was lost;
@@ -3221,6 +3427,25 @@ mod property_tests {
         assert!(totals.equal_content_adopts > 0, "{totals:?}");
         assert!(totals.never_sent_rebases > 0, "{totals:?}");
         assert!(totals.field_conflicts > 0, "{totals:?}");
+        assert!(totals.list_conflicts > 0, "{totals:?}");
+        totals
+    }
+
+    #[test]
+    fn random_echo_rebase_and_page_sequences_lose_and_duplicate_nothing() {
+        let totals = run_model(&APPEND);
+        assert!(totals.list_merges > 0, "{totals:?}");
+        assert!(totals.append_merges > 0, "{totals:?}");
+    }
+
+    #[test]
+    fn random_sequences_with_atomic_lists_lose_and_duplicate_nothing() {
+        let totals = run_model(&ATOMIC);
+        assert_eq!(
+            (totals.list_merges, totals.append_merges),
+            (0, 0),
+            "an atomic list both sides changed never merges: {totals:?}"
+        );
     }
 }
 
