@@ -170,7 +170,9 @@ impl ScriptedServer {
         self.model().hold_uploads = true;
     }
 
-    /// Stops holding and processes every held upload in order; replies go to sockets still open.
+    /// Stops holding and processes every held upload in order; replies go to sockets still
+    /// open. `Model::upload`'s push (if any) goes out on the same mpsc channel before the
+    /// reply, so the push is always seen first.
     pub fn release_held(&self) {
         let mut model = self.model();
         model.hold_uploads = false;
@@ -502,9 +504,13 @@ impl Model {
                 let Ok(patch) = serde_json::from_value::<json_patch::Patch>(body) else {
                     return error("validation");
                 };
-                if json_patch::patch(&mut doc.content, &patch).is_err() {
+                // The real server patches the row it loaded from Postgres: jsonb-rounded.
+                // Untouched fields stay rounded; only the patch's own values are as sent.
+                let mut rounded = jsonb(&doc.content);
+                if json_patch::patch(&mut rounded, &patch).is_err() {
                     return error("validation");
                 }
+                doc.content = rounded;
             }
             ("delete", Some(doc)) if !doc.deleted => {}
             _ => return error("not_found"),
@@ -914,6 +920,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_patches_the_rounded_stored_content() {
+        let server = ScriptedServer::start(ME).await;
+        let mut connection = joined(&server, "k1").await;
+        let doc_id = Uuid::from_u128(0xD1);
+        let create = upload(
+            0x71,
+            doc_id,
+            UploadKind::Create,
+            None,
+            json!({"n": 1200.0, "m": 1}),
+        );
+        let Received::Input(Input::Reply {
+            req: 2,
+            result: Ok(Response::Uploaded(created)),
+        }) = reply(&mut connection, 2, create).await
+        else {
+            panic!("expected the create to succeed");
+        };
+        let Received::Input(Input::Push(_)) = received(&mut connection).await else {
+            panic!("expected the create's push");
+        };
+        let patch = json!([{"op": "replace", "path": "/m", "value": 2}]);
+        let update = upload(
+            0x72,
+            doc_id,
+            UploadKind::Update,
+            Some(created.hash.clone()),
+            patch,
+        );
+        let Received::Input(Input::Reply {
+            req: 3,
+            result: Ok(Response::Uploaded(updated)),
+        }) = reply(&mut connection, 3, update).await
+        else {
+            panic!("expected the update to succeed");
+        };
+        assert_eq!(
+            updated.content,
+            json!({"n": 1200, "m": 2}),
+            "an untouched field carries the jsonb-rounded stored form; only the patch's own \
+             value is as sent, as the real server patches the row it loaded from Postgres"
+        );
+        let Received::Input(Input::Push(change)) = received(&mut connection).await else {
+            panic!("expected the update's push");
+        };
+        assert_eq!(
+            change.doc.map(|doc| doc.content),
+            Some(json!({"n": 1200, "m": 2}))
+        );
+    }
+
+    #[tokio::test]
     async fn other_device_writes_are_pushed_paged_and_trimmed() {
         let server = ScriptedServer::start(ME).await;
         let mut connection = joined(&server, "k1").await;
@@ -1044,22 +1102,19 @@ mod tests {
         assert!(nothing_within(&mut connection, Duration::from_millis(300)).await);
         assert_eq!(server.commits_for(held), 0);
         server.release_held();
-        // held uploads: push before reply — release_held sends the change to every joined
-        // socket before the held connection's own reply, so either order below is accepted.
-        let mut replied = false;
-        for _ in 0..2 {
-            if matches!(
-                received(&mut connection).await,
-                Received::Input(Input::Reply {
-                    req: 4,
-                    result: Ok(Response::Uploaded(_))
-                })
-            ) {
-                replied = true;
-                break;
-            }
-        }
-        assert!(replied, "the held upload is answered once released");
+        // held uploads: push before reply — both go out on the same mpsc channel to this
+        // connection, the push queued first inside `Model::upload`, so it always arrives first.
+        let Received::Input(Input::Push(change)) = received(&mut connection).await else {
+            panic!("expected the held upload's push before its reply");
+        };
+        assert_eq!(change.doc_id, held);
+        let Received::Input(Input::Reply {
+            req: 4,
+            result: Ok(Response::Uploaded(_)),
+        }) = received(&mut connection).await
+        else {
+            panic!("expected the held upload's reply after its push");
+        };
         assert_eq!(server.commits_for(held), 1);
 
         server.drop_after_next_upload();
@@ -1077,14 +1132,11 @@ mod tests {
             ),
             None
         );
-        let mut closed = false;
-        for _ in 0..3 {
-            if received(&mut connection).await == Received::Input(Input::SocketClosed { gen: 1 }) {
-                closed = true;
-                break;
-            }
-        }
-        assert!(closed, "the connection closes after the upload is applied");
+        assert_eq!(
+            received(&mut connection).await,
+            Received::Input(Input::SocketClosed { gen: 1 }),
+            "the connection closes after the upload is applied, with no reply and no push"
+        );
     }
 
     #[tokio::test]
@@ -1148,11 +1200,11 @@ mod tests {
             "frames record the connection index that sent them"
         );
 
-        // serve() marks the inherited watch::Receiver unchanged at the top; without that, a
-        // join after drop_connections() would be killed by the same generation bump.
+        // A join after drop_connections() still succeeds.
         server.set_mode(Mode::Normal);
         let mut after_drop = joined(&server, "k2").await;
-        after_drop.close(4);
+        after_drop.close(1);
+        no_live_connections(&server).await;
     }
 
     async fn no_live_connections(server: &ScriptedServer) {
