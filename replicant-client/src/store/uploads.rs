@@ -44,6 +44,19 @@ impl Store {
         Ok(outcome)
     }
 
+    /// Marks the rows an upload covers as sent in it, before the upload can reach the server.
+    /// The mark goes away with the row; an error reply leaves it, because an earlier send of
+    /// the same rows may have landed.
+    pub async fn mark_sent(&self, doc_id: Uuid, upload_id: Uuid) -> StoreResult<()> {
+        sqlx::query("UPDATE outbox SET sent_upload_id = ? WHERE doc_id = ? AND mutation_id <= ?")
+            .bind(upload_id.to_string())
+            .bind(doc_id.to_string())
+            .bind(upload_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// `Effect::SettleUpload`.
     pub async fn settle_upload(
         &self,
@@ -169,6 +182,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(t.store.load_pending().await.unwrap(), vec![first, last]);
+    }
+
+    #[tokio::test]
+    async fn mark_sent_marks_only_the_rows_the_upload_covers() {
+        let t = temp_store().await;
+        let doc_id = t
+            .store
+            .create_document(ME, None, json!({"n": 1}))
+            .await
+            .unwrap();
+        t.store
+            .update_document(ME, doc_id, json!({"n": 2}))
+            .await
+            .unwrap();
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT mutation_id FROM outbox WHERE doc_id = ? ORDER BY mutation_id",
+        )
+        .bind(doc_id.to_string())
+        .fetch_all(&t.store.pool)
+        .await
+        .unwrap();
+        let first = Uuid::parse_str(&rows[0]).unwrap();
+        t.store.mark_sent(doc_id, first).await.unwrap();
+        let marked: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT sent_upload_id FROM outbox WHERE doc_id = ? ORDER BY mutation_id",
+        )
+        .bind(doc_id.to_string())
+        .fetch_all(&t.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(marked, vec![Some(first.to_string()), None]);
+        assert_eq!(snapshot(&t.store, doc_id).await.unacked_upload, Some(first));
     }
 
     #[tokio::test]

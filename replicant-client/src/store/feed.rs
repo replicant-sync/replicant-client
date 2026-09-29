@@ -254,6 +254,8 @@ mod tests {
             .update_document(ME, doc(1), local.clone())
             .await
             .unwrap();
+        // The append went out and its reply was lost.
+        t.store.mark_sent(doc(1), Uuid::max()).await.unwrap();
         // The snapshot already holds the append (its upload landed, the reply was lost).
         let snapshot_doc = envelope(doc(1), Some(ME), json!({"items": ["a", "b"], "t": 1}), 9);
 
@@ -285,6 +287,37 @@ mod tests {
         let after = snapshot(&t.store, doc(1)).await;
         assert_eq!(after.content, snapshot_doc.content);
         assert!(after.rows.is_empty(), "no marker, nothing re-uploaded");
+    }
+
+    #[tokio::test]
+    async fn returning_user_with_never_sent_edits_rebases_onto_the_snapshot() {
+        let t = temp_store().await;
+        seed_synced(
+            &t.store,
+            doc(1),
+            SCOPE_OWN,
+            Some(ME),
+            json!({"a": 1, "b": 1}),
+            1,
+        )
+        .await;
+        t.store
+            .update_document(ME, doc(1), json!({"a": 2, "b": 1}))
+            .await
+            .unwrap();
+        // Months later: another device changed `b`; the resync delivers it as a snapshot.
+        let snapshot_doc = envelope(doc(1), Some(ME), json!({"a": 1, "b": 2}), 9);
+        let notices = t
+            .store
+            .apply_snapshot_page(ME, SCOPE_OWN, std::slice::from_ref(&snapshot_doc))
+            .await
+            .unwrap();
+        assert!(notices.is_empty(), "no ConflictDetected: {notices:?}");
+        assert_eq!(count(&t.store, "SELECT COUNT(*) FROM recovered").await, 0);
+        let after = snapshot(&t.store, doc(1)).await;
+        assert_eq!(after.content, json!({"a": 2, "b": 2}));
+        assert_eq!(after.rows.len(), 1, "the offline edit still uploads");
+        assert_eq!(after.shadow.unwrap().seq, 9);
     }
 
     #[tokio::test]

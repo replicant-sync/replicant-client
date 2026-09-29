@@ -1239,6 +1239,17 @@ impl Core {
         if busy {
             return;
         }
+        // A snapshot page applied while an upload is out would find its rows sent and not yet
+        // acknowledged; the finish requests a pump, so these wait only for the resync.
+        let own_resyncing = matches!(
+            s.scopes.get(SCOPE_OWN),
+            Some(ScopeSync::SnapshotRequesting { .. })
+                | Some(ScopeSync::SnapshotApplying { .. })
+                | Some(ScopeSync::SnapshotFinishing { .. })
+        );
+        if own_resyncing {
+            return;
+        }
         if s.slots_used() >= MAX_IN_FLIGHT {
             s.pump_deferred = true;
             return;
@@ -3447,6 +3458,51 @@ mod upload_orchestration_tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn builds_wait_while_own_is_resynced_by_snapshot() {
+        let mut c = core();
+        connected(&mut c);
+        let fx = c.step(Input::Cursors(vec![("collection:curated".into(), 5)]));
+        let (snapshot_req, _) = sends(&fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetSnapshot { scope, .. } if scope == "own"))
+            .expect("own resyncs by snapshot");
+        let fx = c.step(Input::PendingDocs(vec![doc(1)]));
+        assert!(
+            !fx.contains(&Effect::BuildUpload { doc_id: doc(1) }),
+            "a snapshot page applied during an upload would find its rows sent and unacknowledged"
+        );
+        c.step(Input::Reply {
+            req: snapshot_req,
+            result: Ok(Response::SnapshotPage {
+                docs: vec![],
+                snapshot_seq: 5,
+                next_page_token: None,
+            }),
+        });
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::SnapshotPage(snapshot_req),
+        });
+        let finish = fx
+            .iter()
+            .find_map(|e| match e {
+                Effect::FinishSnapshot { tag, .. } => Some(tag.clone()),
+                _ => None,
+            })
+            .expect("finish snapshot");
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: finish,
+        });
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::Pump,
+            after: Duration::from_millis(200)
+        }));
+        let fx = c.step(Input::PendingDocs(vec![doc(1)]));
+        assert!(fx.contains(&Effect::BuildUpload { doc_id: doc(1) }));
     }
 }
 

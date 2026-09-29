@@ -77,11 +77,16 @@ pub(crate) async fn load_snapshot(
         }
     }
 
-    let rows = sqlx::query("SELECT mutation_id, kind, parked_error FROM outbox WHERE doc_id = ?")
-        .bind(&id)
-        .fetch_all(&mut *conn)
-        .await?;
+    let rows = sqlx::query(
+        "SELECT mutation_id, kind, parked_error, sent_upload_id FROM outbox WHERE doc_id = ?",
+    )
+    .bind(&id)
+    .fetch_all(&mut *conn)
+    .await?;
     for row in rows {
+        if let Some(sent) = row.try_get::<Option<String>, _>("sent_upload_id")? {
+            snap.unacked_upload = snap.unacked_upload.max(Some(Uuid::parse_str(&sent)?));
+        }
         snap.rows.push(OutboxRow {
             mutation_id: Uuid::parse_str(&row.try_get::<String, _>("mutation_id")?)?,
             kind: parse_row_kind(&row.try_get::<String, _>("kind")?)?,

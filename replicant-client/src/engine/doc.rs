@@ -51,6 +51,9 @@ pub struct DocSnapshot {
     pub rows: Vec<OutboxRow>,
     pub memberships: Vec<Membership>,
     pub tombstone_seq: Option<Seq>,
+    /// The greatest upload id a pending row was sent in and that is not yet acknowledged: that
+    /// upload may already be applied on the server.
+    pub unacked_upload: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,8 +127,14 @@ impl DocSnapshot {
                     s.owner_id = *owner_id;
                     s.read_only = *read_only;
                 }
-                DocOp::DeleteRows(ids) => s.rows.retain(|r| !ids.contains(&r.mutation_id)),
-                DocOp::DropAllRows => s.rows.clear(),
+                DocOp::DeleteRows(ids) => {
+                    s.rows.retain(|r| !ids.contains(&r.mutation_id));
+                    s.forget_settled_upload();
+                }
+                DocOp::DropAllRows => {
+                    s.rows.clear();
+                    s.unacked_upload = None;
+                }
                 DocOp::InsertMarker(kind) => s.rows.push(OutboxRow {
                     mutation_id: PROJECTED_MARKER,
                     kind: *kind,
@@ -153,6 +162,15 @@ impl DocSnapshot {
             }
         }
         s
+    }
+
+    /// A sent upload covers the rows up to its id; once none of them is left it is settled.
+    fn forget_settled_upload(&mut self) {
+        if let Some(upload_id) = self.unacked_upload {
+            if !self.rows.iter().any(|r| r.mutation_id <= upload_id) {
+                self.unacked_upload = None;
+            }
+        }
     }
 }
 
@@ -415,12 +433,10 @@ pub fn sweep_doc(snap: &DocSnapshot, scope: &str, snapshot_seq: Seq) -> Vec<DocO
     ops
 }
 
-/// A full-resync snapshot document. It carries no `upload_id`, so it may already contain a v2
-/// upload of ours; array patch ops are index-based, so pending edits are never rebased onto it
-/// unless the local shadow is a migrated v1 base (`seq == 0`): they go to `recovered` instead.
-/// A doc with no shadow at all (a v2 create whose reply was lost, or a migrated v1 create never
-/// synced) cannot tell whether the snapshot already holds its pending content, so it also takes
-/// the conflict path.
+/// A full-resync snapshot document. It carries no `upload_id`, so it may already contain a sent
+/// upload of ours whose reply was lost: pending rows rebase onto it only when none of them was
+/// sent without acknowledgement (or the shadow is a migrated v1 base at seq 0); otherwise they go
+/// to `recovered`.
 pub fn apply_snapshot_doc(
     snap: &DocSnapshot,
     scope: &str,
@@ -444,8 +460,11 @@ pub fn apply_snapshot_doc(
         .iter()
         .any(|m| m.scope == scope && m.member);
     if member {
+        // Rows never sent cannot be in the snapshot, so they rebase onto it from the shadow. A
+        // sent, unacknowledged upload may already be applied there, so its rows conflict.
         let migrated_v1_base = snap.shadow.as_ref().is_some_and(|s| s.seq == 0);
-        ops.extend(apply_upsert(snap, doc, doc.seq, migrated_v1_base));
+        let base_known = migrated_v1_base || snap.unacked_upload.is_none();
+        ops.extend(apply_upsert(snap, doc, doc.seq, base_known));
     }
     with_settle_invariant(snap, ops, me)
 }
@@ -512,6 +531,7 @@ pub(crate) mod fixtures {
                 seq,
             }],
             tombstone_seq: None,
+            unacked_upload: None,
         }
     }
 
@@ -1332,6 +1352,7 @@ mod property_tests {
         delete_wins: u32,
         local_deletes_settled: u32,
         equal_content_adopts: u32,
+        never_sent_rebases: u32,
     }
 
     impl Hits {
@@ -1344,6 +1365,7 @@ mod property_tests {
             self.delete_wins += other.delete_wins;
             self.local_deletes_settled += other.local_deletes_settled;
             self.equal_content_adopts += other.equal_content_adopts;
+            self.never_sent_rebases += other.never_sent_rebases;
         }
     }
 
@@ -1534,6 +1556,7 @@ mod property_tests {
                 kind: RowKind::Create,
                 parked: false,
             }];
+            c.snap.unacked_upload = Some(m(1));
             c
         }
 
@@ -1765,10 +1788,31 @@ mod property_tests {
                     && !delete_pending(&self.snap)
                     && !doc.read_only
                     && !migrated_v1_base
-                    && doc.seq > self.snap.server_seq();
+                    && doc.seq > self.snap.server_seq()
+                    && (self.snap.shadow.is_none() || self.snap.unacked_upload.is_some());
+                // Rows never sent cannot be in the snapshot: a clean rebase must not recover them.
+                let never_sent_rebase = self.snap.exists
+                    && !self.snap.rows.is_empty()
+                    && !delete_pending(&self.snap)
+                    && !doc.read_only
+                    && doc.seq > self.snap.server_seq()
+                    && self.snap.unacked_upload.is_none()
+                    && self.snap.shadow.as_ref().is_some_and(|shadow| {
+                        matches!(
+                            rebase(&shadow.content, &doc.content, &self.snap.content),
+                            Rebased::Clean(_)
+                        )
+                    });
                 let pre_content = self.snap.content.clone();
                 let ops = apply_snapshot_doc(&self.snap, "own", &doc, ME);
                 self.check_adopted(adoptable, &ops);
+                if never_sent_rebase {
+                    assert!(
+                        !ops.iter().any(|op| matches!(op, DocOp::Recover { .. })),
+                        "never-sent edits were recovered instead of rebased"
+                    );
+                    self.hits.never_sent_rebases += 1;
+                }
                 if recovers {
                     assert!(
                         ops.contains(&DocOp::Recover {
@@ -1808,6 +1852,7 @@ mod property_tests {
             }
             match build_upload(&self.snap, ME) {
                 BuildResult::Send { upload, inflight } => {
+                    self.snap.unacked_upload = self.snap.unacked_upload.max(Some(upload.upload_id));
                     // Captured now, not from `snap.content` on the reply: content can move on
                     // (a later local edit) before the reply for this exact upload comes back.
                     let shared_at_build = (upload.kind == UploadKind::Update
@@ -2212,6 +2257,7 @@ mod property_tests {
         assert!(totals.delete_wins > 0, "{totals:?}");
         assert!(totals.local_deletes_settled > 0, "{totals:?}");
         assert!(totals.equal_content_adopts > 0, "{totals:?}");
+        assert!(totals.never_sent_rebases > 0, "{totals:?}");
     }
 }
 
@@ -2279,12 +2325,13 @@ mod snapshot_doc_tests {
     use super::*;
     use serde_json::json;
 
-    /// Local copy at seq 1 with one pending append; the snapshot (seq 5) already contains it,
-    /// as it does when the upload landed but its reply was lost.
+    /// Local copy at seq 1 with one pending append that was sent and never acknowledged; the
+    /// snapshot (seq 5) already contains it, as it does when the reply was lost.
     fn pending_append() -> (DocSnapshot, DocEnvelope) {
         let mut s = synced(json!({"items": ["a"]}), 1);
         s.content = json!({"items": ["a", "b"]});
         s.rows = vec![row(1, RowKind::Update)];
+        s.unacked_upload = Some(m(1));
         (s, env(json!({"items": ["a", "b"], "theirs": 1}), 5))
     }
 
@@ -2302,6 +2349,44 @@ mod snapshot_doc_tests {
         assert_eq!(after.content, json!({"items": ["a", "b"], "theirs": 1}));
         assert!(after.rows.is_empty());
         assert_eq!(after.shadow.unwrap().seq, 5);
+    }
+
+    #[test]
+    fn snapshot_doc_rebases_never_sent_pending_edits() {
+        // A returning user: an edit made offline and never sent; another device changed the doc.
+        let mut s = synced(json!({"items": ["a"]}), 1);
+        s.content = json!({"items": ["a", "b"]});
+        s.rows = vec![row(1, RowKind::Update)];
+        let doc = env(json!({"items": ["a"], "theirs": 1}), 5);
+        let ops = apply_snapshot_doc(&s, "own", &doc, ME);
+        assert!(!ops
+            .iter()
+            .any(|op| matches!(op, DocOp::Recover { .. } | DocOp::Emit(_))));
+        let after = s.project(&ops);
+        assert_eq!(after.content, json!({"items": ["a", "b"], "theirs": 1}));
+        assert_eq!(
+            after.rows.len(),
+            1,
+            "the edit is still pending, now on the new base"
+        );
+        assert_eq!(after.shadow.unwrap().seq, 5);
+    }
+
+    #[test]
+    fn settling_the_sent_rows_forgets_the_unacked_upload() {
+        let mut s = synced(json!({}), 1);
+        s.rows = vec![row(1, RowKind::Update), row(2, RowKind::Update)];
+        s.unacked_upload = Some(m(1));
+        assert_eq!(
+            s.project(&[DocOp::DeleteRows(vec![m(2)])]).unacked_upload,
+            Some(m(1)),
+            "the sent row is still pending"
+        );
+        assert_eq!(
+            s.project(&[DocOp::DeleteRows(vec![m(1)])]).unacked_upload,
+            None
+        );
+        assert_eq!(s.project(&[DocOp::DropAllRows]).unacked_upload, None);
     }
 
     #[test]
