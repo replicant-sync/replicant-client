@@ -2245,7 +2245,8 @@ mod property_tests {
     //! reconnect (every committed change is delivered before the next build) or silent (the
     //! client learns of it only through `hash_mismatch`). Like the machine, the client applies
     //! a server copy only once it has been delivered every change up to the copy's seq;
-    //! otherwise it catches up and rebuilds.
+    //! otherwise it catches up and rebuilds. Elements are unique across the run, so the
+    //! repeated-values list rule is covered by unit tests, not by this model.
     use std::collections::HashMap;
 
     use super::change_fixtures::env;
@@ -2376,6 +2377,9 @@ mod property_tests {
             next["theirs"] = json!(self.other_edits);
             if rng.next_unit() < 0.5 {
                 edit_pitches(&mut next, rng, "q", self.other_edits);
+                if rng.next_unit() < 0.5 {
+                    edit_pitches(&mut next, rng, "r", self.other_edits);
+                }
             }
             let shared_write = if rng.next_unit() < 0.5 {
                 let value = format!("theirs{}", self.other_edits);
@@ -2454,7 +2458,7 @@ mod property_tests {
         deleted_locally: bool,
         recovered: Vec<Value>,
         hits: Hits,
-        /// The list merge configuration every rule this client applies uses.
+        /// List merge configuration passed to every apply and rebase call.
         lists: &'static ListMergeConfig,
         /// (order, value) of every local write to `shared`, in the order they happened —
         /// recorded in `edit`, the moment the write is made, whether or not it ever reaches an
@@ -2805,9 +2809,21 @@ mod property_tests {
                         )
                     });
                 let pre_content = self.snap.content.clone();
+                let old_shadow_content = self.snap.shadow.as_ref().map(|s| s.content.clone());
                 let ops = apply_snapshot_doc(&self.snap, "own", &doc, ME, self.lists);
                 self.check_adopted(adoptable, &ops);
                 if never_sent_rebase {
+                    if let Some(shadow_content) = &old_shadow_content {
+                        let merge = check_pitches(
+                            "page",
+                            self,
+                            shadow_content,
+                            &pre_content,
+                            &doc.content,
+                            &ops,
+                        );
+                        self.count_pitch_merge(merge);
+                    }
                     assert!(
                         !ops.iter().any(|op| matches!(op, DocOp::Recover { .. })),
                         "never-sent edits were recovered instead of rebased"
@@ -2990,7 +3006,7 @@ mod property_tests {
             3 if len >= 2 => {
                 let from = index_below(rng, len);
                 let moved = pitches.remove(from);
-                let to = index_below(rng, len - 1);
+                let to = index_below(rng, len);
                 pitches.insert(to, moved);
             }
             _ => pitches.push(element),
@@ -3019,11 +3035,10 @@ mod property_tests {
         list.len() > old.len() && list[..old.len()] == old[..]
     }
 
-    /// At a rebase, `pitches` is either set aside whole (the server's list taken) or merged so
-    /// that every element either side added, or both kept, is there once, unless a same-index
-    /// collision set the local element aside. Nothing comes from neither side, and with no
-    /// collision an element removed on one side stays removed. An atomic list both sides
-    /// changed to different lists is always set aside whole.
+    /// At a rebase, `pitches` is either set aside whole (the server's list taken) or merged with
+    /// nothing lost, duplicated or revived, and with the order both sides agree on kept. Nothing
+    /// comes from neither side. An atomic list both sides changed to different lists is always
+    /// set aside whole.
     fn check_pitches(
         what: &str,
         client: &Client,
@@ -3066,34 +3081,48 @@ mod property_tests {
             );
             return Some(PitchMerge::WholeList);
         }
-        let set_aside: Vec<&Value> = fields
-            .iter()
-            .filter(|f| f.path.starts_with("/pitches/"))
-            .map(|f| &f.local_value)
-            .collect();
+        assert!(
+            !fields.iter().any(|f| f.path.starts_with("/pitches/")),
+            "{what}: a list conflict is whole, never per element"
+        );
         for element in mine.iter().chain(&theirs) {
             let copies = result.iter().filter(|e| *e == element).count();
             assert!(copies <= 1, "{what}: {element} duplicated: {result:?}");
             let wanted =
                 !old.contains(element) || (mine.contains(element) && theirs.contains(element));
-            if wanted {
-                assert!(
-                    copies == 1 || set_aside.contains(&element),
-                    "{what}: {element} lost without a field conflict \
-                     (old {old:?}, mine {mine:?}, theirs {theirs:?}, result {result:?})"
-                );
-            } else if set_aside.is_empty() {
-                assert_eq!(
-                    copies, 0,
-                    "{what}: {element} was removed on one side but is back: {result:?}"
-                );
-            }
+            assert_eq!(
+                copies,
+                usize::from(wanted),
+                "{what}: {element} lost or revived \
+                 (old {old:?}, mine {mine:?}, theirs {theirs:?}, result {result:?})"
+            );
         }
         for element in &result {
             assert!(
                 mine.contains(element) || theirs.contains(element),
                 "{what}: {element} came from neither side"
             );
+        }
+        for (at, first) in result.iter().enumerate() {
+            for second in &result[at + 1..] {
+                let orders = [&mine, &theirs].map(|side| {
+                    let first_at = side.iter().position(|e| e == first)?;
+                    let second_at = side.iter().position(|e| e == second)?;
+                    Some(first_at < second_at)
+                });
+                if let [Some(in_mine), Some(in_theirs)] = orders {
+                    if in_mine != in_theirs {
+                        continue;
+                    }
+                }
+                if let Some(first_is_first) = orders.into_iter().flatten().next() {
+                    assert!(
+                        first_is_first,
+                        "{what}: {first} and {second} are out of order \
+                         (mine {mine:?}, theirs {theirs:?}, result {result:?})"
+                    );
+                }
+            }
         }
         if !both_changed {
             None
