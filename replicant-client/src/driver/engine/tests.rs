@@ -8,7 +8,7 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use super::owner_support::{connection, harness, is_live, Harness};
-use super::{retry_migrate_once, Command, Engine, EngineError, Queued};
+use super::{retry_migrate_once, twice, Command, Engine, EngineError, Queued};
 use crate::driver::test_server::{Mode, ScriptedServer};
 use crate::driver::test_support::{
     config, credentials, eventually, jump, seeded_db, SwitchableCredentials, WAIT,
@@ -203,6 +203,58 @@ async fn halted_auth_invalid_does_not_redial_with_the_same_credentials() {
 }
 
 #[tokio::test]
+async fn credentials_changed_while_a_join_is_outstanding_rejects_the_signer_not_the_new_ones() {
+    // A silent server never auto-replies, so the join stays genuinely outstanding: turning
+    // past "the join is sent" cannot also race past its (nonexistent) reply, unlike a live
+    // scripted server, which answers fast enough that both would land in the same turn.
+    let server = ScriptedServer::start(ME).await;
+    server.set_mode(Mode::SilentAfterUpgrade);
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = harness(&server.url, keys.loader(), ME, true).await;
+    h.start().await;
+    h.turn_until("the join is sent", |_| server.frames().len() == 1)
+        .await;
+    keys.set("k2");
+    assert!(h
+        .controls
+        .commands
+        .try_send(Command::CredentialsChanged)
+        .is_ok());
+    h.turns(2).await;
+    assert_eq!(
+        connection(&h.owner),
+        ConnectionView::Connecting,
+        "still waiting on the join k1 signed; the command must not touch it"
+    );
+    // Reject that outstanding, k1-signed join (req 1, the core's first request ever).
+    let gen = h.owner.socket_gen;
+    let rejection = json!([
+        null,
+        "1",
+        "sync:v2",
+        "phx_reply",
+        {"status": "error", "response": {"code": "auth_invalid", "is_fatal": true}}
+    ])
+    .to_string();
+    h.owner.connection.inject(SocketEvent::Text {
+        gen,
+        text: rejection,
+    });
+    h.turn_until("halted", |o| {
+        connection(o) == ConnectionView::Halted(HaltReason::AuthInvalid)
+    })
+    .await;
+    server.set_mode(Mode::Normal);
+    jump(Duration::from_secs(301)).await;
+    h.turn_until("live with k2", is_live).await;
+    assert_eq!(
+        server.join_keys(),
+        vec!["k1".to_string(), "k2".to_string()],
+        "k1 signed the rejected join, so only k1 is remembered as rejected"
+    );
+}
+
+#[tokio::test]
 async fn nothing_but_the_join_is_sent_while_connecting() {
     let server = ScriptedServer::start(ME).await;
     server.set_mode(Mode::SilentAfterUpgrade);
@@ -358,6 +410,29 @@ async fn cancel_stops_without_waiting_on_the_network() {
         server.stats.live() == 0
     })
     .await;
+}
+
+#[tokio::test]
+async fn twice_retries_a_failed_feed_effect_once_then_succeeds() {
+    let attempts = Cell::new(0);
+    let result = twice(|| {
+        attempts.set(attempts.get() + 1);
+        let attempt = attempts.get();
+        async move {
+            if attempt == 1 {
+                Err(StoreError::NoUserConfig)
+            } else {
+                Ok(attempt)
+            }
+        }
+    })
+    .await;
+    assert_eq!(result.unwrap(), 2);
+    assert_eq!(
+        attempts.get(),
+        2,
+        "exactly one retry after the first failure"
+    );
 }
 
 #[tokio::test]

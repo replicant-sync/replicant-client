@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use super::timers::Timers;
 use crate::engine::machine::{
-    BuildOutcome, ConnectionView, Core, Effect, EngineState, HaltReason, Input, Lifecycle,
+    BuildOutcome, ConnectionView, Core, Effect, EngineState, HaltReason, Input, Lifecycle, Request,
     Response, SettleOutcome, TimerId,
 };
 use crate::engine::types::ServerError;
@@ -167,6 +167,9 @@ struct Owner {
     credentials: CredentialLoader,
     /// Fingerprint of the credentials `connection` signs joins with.
     auth_fingerprint: Option<[u8; 32]>,
+    /// Fingerprint of the credentials that signed the most recently sent join; may differ from
+    /// `auth_fingerprint` if credentials changed while that join was outstanding.
+    join_fingerprint: Option<[u8; 32]>,
     /// Fingerprint of credentials the server rejected with `auth_invalid`.
     rejected: Option<[u8; 32]>,
     socket_gen: u64,
@@ -215,6 +218,7 @@ impl Owner {
             reader,
             credentials: config.credentials,
             auth_fingerprint,
+            join_fingerprint: None,
             rejected: None,
             socket_gen: 0,
             queue: VecDeque::new(),
@@ -416,6 +420,9 @@ impl Owner {
             }
             Effect::CloseSocket { gen } => self.connection.close(gen),
             Effect::Send { req, request } => {
+                if matches!(request, Request::Join) {
+                    self.join_fingerprint = self.auth_fingerprint;
+                }
                 return self.connection.send(req, &request, now_unix());
             }
             Effect::Schedule { timer, after } => self.timers.schedule(timer, after),
@@ -525,7 +532,7 @@ impl Owner {
             Effect::Emit(lifecycle) => self.emit(EngineEvent::Lifecycle(lifecycle)),
             Effect::SetState(state) => {
                 if state.connection == ConnectionView::Halted(HaltReason::AuthInvalid) {
-                    self.rejected = self.auth_fingerprint;
+                    self.rejected = self.join_fingerprint;
                 }
                 self.state.send_replace(state);
             }
