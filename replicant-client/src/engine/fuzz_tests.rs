@@ -90,6 +90,7 @@ fn next_input(rng: &mut Jitter, outstanding: &mut Vec<(u64, Request)>, socket_ge
             Input::Timer(TimerId::Pump),
             Input::Timer(TimerId::PumpCap),
             Input::Timer(TimerId::HaltRetry),
+            Input::Timer(TimerId::DialCooldown),
             Input::Timer(TimerId::CatchUpRetry("own".into())),
             Input::Timer(TimerId::CatchUpRetry("collection:curated".into())),
             Input::Cursors(vec![("own".into(), 3), ("collection:curated".into(), 0)]),

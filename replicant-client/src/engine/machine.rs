@@ -73,6 +73,8 @@ pub enum TimerId {
     DocRetry(Uuid),
     CatchUpRetry(Scope),
     HaltRetry,
+    /// Ends the second after a dial during which a `Reconnect` command waits.
+    DialCooldown,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -386,6 +388,7 @@ pub struct Core {
     jitter: Jitter,
     next_req: u64,
     socket_gen: u64,
+    dial_cooldown: bool,
 }
 
 impl Core {
@@ -397,6 +400,7 @@ impl Core {
             jitter: Jitter::new(seed),
             next_req: 1,
             socket_gen: 0,
+            dial_cooldown: false,
         }
     }
 
@@ -462,12 +466,12 @@ impl Core {
                 Conn::Disconnected => {
                     fx.push(Effect::Cancel(TimerId::Reconnect));
                     self.attempt = 0;
-                    self.connect_now(fx);
+                    self.reconnect_soon(fx);
                 }
                 Conn::Halted(_) => {
                     fx.push(Effect::Cancel(TimerId::HaltRetry));
                     self.attempt = 0;
-                    self.connect_now(fx);
+                    self.reconnect_soon(fx);
                 }
                 _ => {}
             },
@@ -532,6 +536,25 @@ impl Core {
             timer: TimerId::ConnectTimeout,
             after: CONNECT_TIMEOUT,
         });
+        self.dial_cooldown = true;
+        fx.push(Effect::Schedule {
+            timer: TimerId::DialCooldown,
+            after: MIN_CONNECT_DELAY,
+        });
+    }
+
+    /// A `Reconnect` command dials at once unless a dial started under `MIN_CONNECT_DELAY`
+    /// ago: a host that answers every lost connection with `Reconnect` must not storm.
+    fn reconnect_soon(&mut self, fx: &mut Vec<Effect>) {
+        if self.dial_cooldown {
+            self.conn = Conn::Disconnected;
+            fx.push(Effect::Schedule {
+                timer: TimerId::Reconnect,
+                after: MIN_CONNECT_DELAY,
+            });
+        } else {
+            self.connect_now(fx);
+        }
     }
 
     fn close_socket(&self, fx: &mut Vec<Effect>) {
@@ -666,6 +689,7 @@ impl Core {
 
     fn on_timer(&mut self, timer: TimerId, fx: &mut Vec<Effect>) {
         match (&mut self.conn, timer) {
+            (_, TimerId::DialCooldown) => self.dial_cooldown = false,
             (Conn::Disconnected, TimerId::Reconnect) => self.connect_now(fx),
             (Conn::Connecting { .. }, TimerId::ConnectTimeout) => {
                 self.close_socket(fx);
@@ -1948,6 +1972,7 @@ mod connection_tests {
             .pop()
             .unwrap();
         c.step(closed(&c));
+        c.step(Input::Timer(TimerId::DialCooldown));
         c.step(Input::Reconnect);
         open_and_join(&mut c);
         let fx = c.step(Input::Timer(TimerId::HeartbeatTimeout(old_req)));
@@ -2004,9 +2029,52 @@ mod connection_tests {
             c.state().connection,
             ConnectionView::Halted(HaltReason::AuthInvalid)
         );
+        c.step(Input::Timer(TimerId::DialCooldown));
         c.step(Input::Reconnect);
         let fx = c.step(Input::Timer(TimerId::ConnectTimeout));
         assert!(fx.iter().any(|e| matches!(e, Effect::Schedule { timer: TimerId::Reconnect, after } if *after == Duration::from_secs(1))));
+    }
+
+    #[test]
+    fn reconnect_within_a_second_of_a_dial_waits_for_the_cooldown() {
+        let mut c = core();
+        let fx = c.step(Input::Start {
+            has_credentials: true,
+        });
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::DialCooldown,
+            after: Duration::from_secs(1)
+        }));
+        c.step(closed(&c));
+        let fx = c.step(Input::Reconnect);
+        assert!(!opens(&fx), "a dial started less than a second ago");
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::Reconnect,
+            after: Duration::from_secs(1)
+        }));
+        c.step(Input::Timer(TimerId::DialCooldown));
+        assert!(opens(&c.step(Input::Reconnect)));
+    }
+
+    #[test]
+    fn reconnect_from_halted_during_the_cooldown_dials_a_second_later() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        c.step(Input::Reply {
+            req,
+            result: Err(ServerError {
+                is_fatal: true,
+                ..ServerError::new("auth_invalid")
+            }),
+        });
+        let fx = c.step(Input::Reconnect);
+        assert!(!opens(&fx));
+        assert!(fx.contains(&Effect::Cancel(TimerId::HaltRetry)));
+        assert_eq!(c.state().connection, ConnectionView::Disconnected);
+        assert!(opens(&c.step(Input::Timer(TimerId::Reconnect))));
     }
 
     #[test]
