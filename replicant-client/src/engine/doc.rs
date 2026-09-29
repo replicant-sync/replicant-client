@@ -234,7 +234,8 @@ fn membership_seq(snap: &DocSnapshot, scope: &str) -> Seq {
 /// envelope is only attempted when a shadow exists and the caller says it is that base
 /// (`local_base_known`); with no shadow at all there is no trustworthy base to rebase from — the
 /// envelope may already hold our own upload whose reply was lost, or another device's edit the
-/// shadow never captured — so it settles as a conflict, same as when `local_base_known` is false.
+/// shadow never captured. With no shadow, an envelope whose content equals the local content is
+/// adopted; anything else settles as a conflict, same as when `local_base_known` is false.
 fn apply_upsert(
     snap: &DocSnapshot,
     doc: &DocEnvelope,
@@ -571,6 +572,10 @@ pub fn rebase(old_base: &Value, new_base: &Value, local: &Value) -> Rebased {
     let mut appends = Vec::new();
     for op in local_ops {
         if is_append(old_base, &op) {
+            // `<parent>/-` on an object would add a key named "-".
+            if !matches!(new_base.pointer(append_parent(&op)), Some(Value::Array(_))) {
+                return Rebased::Conflict;
+            }
             appends.push(to_end(op));
         } else if !outermost.iter().any(|p| contains(p, op_path(&op))) {
             kept.push(op);
@@ -624,15 +629,19 @@ fn is_append(old_base: &Value, op: &PatchOperation) -> bool {
     }
 }
 
+fn append_parent(op: &PatchOperation) -> &str {
+    op_path(op)
+        .rsplit_once('/')
+        .map_or("", |(parent, _)| parent)
+}
+
 fn to_end(op: PatchOperation) -> PatchOperation {
+    let path = format!("{}/-", append_parent(&op));
     match op {
-        PatchOperation::Add(add) => {
-            let parent = add.path.rsplit_once('/').map_or("", |(parent, _)| parent);
-            PatchOperation::Add(AddOperation {
-                path: format!("{parent}/-"),
-                value: add.value,
-            })
-        }
+        PatchOperation::Add(add) => PatchOperation::Add(AddOperation {
+            path,
+            value: add.value,
+        }),
         other => other,
     }
 }
@@ -1493,6 +1502,16 @@ mod rebase_tests {
             &json!({"a": 1, "c": 3}),
         );
         assert_eq!(r, Rebased::Clean(json!({"a": 1, "b": 2, "c": 3})));
+    }
+
+    #[test]
+    fn append_to_an_array_the_server_made_an_object_is_a_conflict() {
+        let r = rebase(
+            &json!({"items": ["a"]}),
+            &json!({"items": {"k": 1}}),
+            &json!({"items": ["a", "b"]}),
+        );
+        assert_eq!(r, Rebased::Conflict);
     }
 
     #[test]
