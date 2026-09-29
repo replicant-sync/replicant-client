@@ -448,4 +448,42 @@ mod tests {
         assert!(!after.exists);
         assert_eq!(after.tombstone_seq, Some(10));
     }
+
+    #[tokio::test]
+    async fn a_full_snapshot_page_leaves_host_writes_well_inside_the_busy_timeout() {
+        let t = temp_store().await;
+        let other = open_again(&t.path()).await;
+        let items: Vec<u32> = (0..50).collect();
+        let docs: Vec<_> = (0..500u128)
+            .map(|n| {
+                envelope(
+                    doc(n),
+                    Some(ME),
+                    json!({"title": format!("t{n}"), "items": items}),
+                    10,
+                )
+            })
+            .collect();
+        let bound = crate::store::BUSY_TIMEOUT / 2;
+        let started = std::time::Instant::now();
+        let (page, write) =
+            tokio::join!(t.store.apply_snapshot_page(ME, SCOPE_OWN, &docs), async {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                let began = std::time::Instant::now();
+                let created = other.create_document(ME, None, json!({"n": 1})).await;
+                (created, began.elapsed())
+            });
+        page.unwrap();
+        let page_took = started.elapsed();
+        let (created, waited) = write;
+        created.unwrap();
+        assert!(
+            page_took < bound,
+            "a 500-document page held the write lock for {page_took:?}"
+        );
+        assert!(
+            waited < bound,
+            "a host write in another process waited {waited:?} behind a snapshot page"
+        );
+    }
 }

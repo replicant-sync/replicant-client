@@ -29,6 +29,8 @@ use crate::transport::socket::SocketEvent;
 use crate::transport::wire::{socket_url, user_agent, JoinAuth};
 
 #[cfg(test)]
+mod event_tests;
+#[cfg(test)]
 mod owner_support;
 #[cfg(test)]
 mod tests;

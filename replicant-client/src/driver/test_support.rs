@@ -40,6 +40,11 @@ pub(crate) fn credentials(api_key: &str) -> CredentialLoader {
     Arc::new(move || Some(auth(&api_key)))
 }
 
+/// No stored credentials: the engine halts as not enrolled and never touches the network.
+pub(crate) fn no_credentials() -> CredentialLoader {
+    Arc::new(|| None)
+}
+
 /// Credentials a test can change while the engine runs.
 #[derive(Clone)]
 pub(crate) struct SwitchableCredentials(Arc<Mutex<String>>);
