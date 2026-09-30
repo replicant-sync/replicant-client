@@ -690,3 +690,161 @@ fn destroy_inside_a_callback_is_deferred_until_the_pump_returns() {
         "the batch stops at the destroy; the handle is freed after it"
     );
 }
+
+fn keep_whole(dir: &Path, title: &str) {
+    sql(
+        dir,
+        &format!(
+            "INSERT INTO recovered (doc_id, content, reason, recovered_at) \
+             VALUES ('{}', '{{\"title\":\"{title}\"}}', 'delete_wins', 100)",
+            Uuid::new_v4()
+        ),
+    );
+}
+
+fn keep_field(dir: &Path, doc_id: &str, path: &str, local_value: Value) {
+    let fields = json!([{"path": path, "local_value": local_value, "local_removed": false}]);
+    sql(
+        dir,
+        &format!(
+            "INSERT INTO recovered (doc_id, content, reason, recovered_at, fields) \
+             VALUES ('{doc_id}', '{{}}', 'field_conflict', 200, '{fields}')"
+        ),
+    );
+}
+
+fn listed(handle: *mut Replicant) -> Value {
+    json_out(|out| unsafe { replicant_list_recovered(handle, out) })
+}
+
+#[test]
+fn kept_copies_are_listed_restored_and_dismissed() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = open(dir.path());
+    let doc_id = create_doc(handle, r#"{"s":"theirs","k":1}"#);
+    keep_whole(dir.path(), "Lost");
+    keep_field(dir.path(), &doc_id, "/s", json!("mine"));
+    let copies = listed(handle);
+    assert_eq!(copies.as_array().unwrap().len(), 2);
+    assert_eq!(copies[0]["reason"], "field_conflict", "newest first");
+    assert_eq!(copies[0]["doc_id"], doc_id);
+    assert_eq!(copies[0]["fields"][0]["path"], "/s");
+    assert_eq!(copies[1]["title"], "Lost");
+    assert!(copies[1]["fields"].is_null());
+    let whole = copies[1]["recovered_id"].as_i64().unwrap();
+    let field = copies[0]["recovered_id"].as_i64().unwrap();
+    let mut restored = [0 as c_char; 37];
+    assert_eq!(
+        unsafe { replicant_restore_document(handle, whole, restored.as_mut_ptr()) },
+        SyncResult::Success
+    );
+    assert_eq!(
+        get_doc(handle, &read(restored.as_ptr())).unwrap()["content"],
+        json!({"title": "Lost"})
+    );
+    assert_eq!(
+        unsafe { replicant_dismiss_recovered(handle, field) },
+        SyncResult::Success
+    );
+    assert_eq!(
+        unsafe { replicant_dismiss_recovered(handle, field) },
+        SyncResult::ErrorNotFound
+    );
+    assert_eq!(listed(handle), json!([]));
+    close(handle);
+}
+
+#[test]
+fn restore_fields_writes_the_kept_value_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = open(dir.path());
+    let doc_id = create_doc(handle, r#"{"s":"theirs","k":1}"#);
+    keep_field(dir.path(), &doc_id, "/s", json!("mine"));
+    let field = listed(handle)[0]["recovered_id"].as_i64().unwrap();
+    assert_eq!(
+        unsafe { replicant_restore_fields(handle, field) },
+        SyncResult::Success
+    );
+    assert_eq!(
+        get_doc(handle, &doc_id).unwrap()["content"],
+        json!({"s": "mine", "k": 1})
+    );
+    assert_eq!(
+        unsafe { replicant_restore_fields(handle, field) },
+        SyncResult::ErrorNotFound
+    );
+    close(handle);
+}
+
+#[test]
+fn a_field_copy_of_a_deleted_document_is_reported_gone_and_restores_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = open(dir.path());
+    let doc_id = create_doc(handle, r#"{"s":"theirs"}"#);
+    keep_field(dir.path(), &doc_id, "/s", json!("mine"));
+    let field = listed(handle)[0]["recovered_id"].as_i64().unwrap();
+    let id = c(&doc_id);
+    assert_eq!(
+        unsafe { replicant_delete_document(handle, id.as_ptr()) },
+        SyncResult::Success
+    );
+    assert_eq!(
+        unsafe { replicant_restore_fields(handle, field) },
+        SyncResult::ErrorDocumentGone,
+        "the document is gone, not the copy"
+    );
+    let mut restored = [0 as c_char; 37];
+    assert_eq!(
+        unsafe { replicant_restore_document(handle, field, restored.as_mut_ptr()) },
+        SyncResult::Success,
+        "any copy can come back as a new document"
+    );
+    assert_eq!(listed(handle), json!([]));
+    close(handle);
+}
+
+#[test]
+fn parked_documents_are_listed_with_their_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = open(dir.path());
+    let doc_id = create_doc(handle, "{}");
+    sql(
+        dir.path(),
+        &format!("UPDATE outbox SET parked_error = 'too_large' WHERE doc_id = '{doc_id}'"),
+    );
+    assert_eq!(
+        json_out(|out| unsafe { replicant_list_parked(handle, out) }),
+        json!([{"doc_id": doc_id, "code": "too_large"}])
+    );
+    let mut pending = 9;
+    assert_eq!(
+        unsafe { replicant_count_pending_sync(handle, &mut pending) },
+        SyncResult::Success
+    );
+    assert_eq!(pending, 0, "parked is not syncing");
+    close(handle);
+}
+
+#[test]
+fn restoring_a_list_field_restores_the_whole_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = open(dir.path());
+    let doc_id = create_doc(handle, r#"{"items":["a","b","c"]}"#);
+    keep_field(dir.path(), &doc_id, "/items", json!(["a", "B", "c"]));
+    // The list changes shape after the conflict: a new element at the front.
+    assert_eq!(
+        update(handle, &doc_id, r#"{"items":["x","a","b","c"]}"#),
+        SyncResult::Success
+    );
+    let field = listed(handle)[0]["recovered_id"].as_i64().unwrap();
+    assert_eq!(
+        unsafe { replicant_restore_fields(handle, field) },
+        SyncResult::Success
+    );
+    assert_eq!(
+        get_doc(handle, &doc_id).unwrap()["content"],
+        json!({"items": ["a", "B", "c"]}),
+        "list conflicts are whole-list, so the kept list comes back exactly"
+    );
+    close(handle);
+}

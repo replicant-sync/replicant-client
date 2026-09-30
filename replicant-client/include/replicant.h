@@ -580,6 +580,66 @@ enum ReplicantSyncResult replicant_search_documents(struct Replicant *handle,
 enum ReplicantSyncResult replicant_rebuild_search_index(struct Replicant *handle);
 
 /**
+ * Kept copies (local content sync set aside), newest first, as a JSON array of
+ * `{recovered_id, doc_id, title, reason, recovered_at, content, fields}`. `reason` is
+ * `conflict`, `field_conflict`, `delete_wins`, `delete_superseded`, `delete_refused`,
+ * `delete_publication`, `became_publication`, `create_rejected` or `unmigratable` (set aside
+ * while upgrading the database). `fields` is null for a whole-document copy, else `[{path, local_value, local_removed}]`.
+ * Copies never expire: they stay until dismissed or restored.
+ *
+ * # Safety
+ * Valid handle and out pointer; free the result with `replicant_string_free`.
+ */
+enum ReplicantSyncResult replicant_list_recovered(struct Replicant *handle,
+                                                  char **out_json);
+
+/**
+ * Deletes a kept copy for good; `ErrorNotFound` when it is already gone.
+ *
+ * # Safety
+ * Valid handle.
+ */
+enum ReplicantSyncResult replicant_dismiss_recovered(struct Replicant *handle,
+                                                     int64_t recovered_id);
+
+/**
+ * Re-creates a kept copy's full content as a new document, with a new id written to
+ * `out_document_id` (37 bytes), and removes the copy. Works for any copy, a field copy too
+ * (the way out when its document is gone). `ErrorNotFound` when the copy is gone (another
+ * process may have dismissed or restored it).
+ *
+ * # Safety
+ * Valid handle and a 37-byte buffer.
+ */
+enum ReplicantSyncResult replicant_restore_document(struct Replicant *handle,
+                                                    int64_t recovered_id,
+                                                    char *out_document_id);
+
+/**
+ * Writes a field copy's kept values back at their paths as a local edit (every other field
+ * keeps its current value) and removes the copy.
+ *
+ * A list conflict is kept as the whole list, so restoring it puts that list back exactly.
+ * `ErrorNotFound`: the copy is gone. `ErrorDocumentGone`: its document was deleted, and
+ * `ErrorNotWritable`: it became read-only; the copy stays in both cases, and
+ * `replicant_restore_document` brings it back as a new document.
+ *
+ * # Safety
+ * Valid handle.
+ */
+enum ReplicantSyncResult replicant_restore_fields(struct Replicant *handle, int64_t recovered_id);
+
+/**
+ * Documents that stopped uploading until their next local edit, as a JSON array of
+ * `{doc_id, code}` (`validation`, `forbidden`, `too_large`, `diverged`). Parked documents are
+ * not counted in `replicant_count_pending_sync`; a new local edit un-parks one.
+ *
+ * # Safety
+ * Valid handle and out pointer; free the result with `replicant_string_free`.
+ */
+enum ReplicantSyncResult replicant_list_parked(struct Replicant *handle, char **out_json);
+
+/**
  * `event_filter`: -1 every document event, 1 `DocumentChanged` only, 2 `DocumentDeleted` only.
  * The first registration on a handle fixes the thread that must call `replicant_process_events`.
  *

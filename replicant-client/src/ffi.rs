@@ -13,6 +13,7 @@ use serde_json::Value;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
+use crate::engine::doc::FieldConflict;
 use crate::engine::list_merge::{ListMergeConfig, ListMergePolicy, PathPattern};
 use crate::engine::machine::{ConnectionView, EngineState, HaltReason, SyncView};
 use crate::events::{
@@ -886,6 +887,176 @@ pub unsafe extern "C" fn replicant_rebuild_search_index(handle: *mut Replicant) 
     })
 }
 
+/// One kept copy as the host lists it.
+#[derive(Serialize)]
+struct KeptCopyJson<'a> {
+    recovered_id: i64,
+    doc_id: Uuid,
+    title: Option<&'a str>,
+    reason: &'a str,
+    recovered_at: i64,
+    content: &'a Value,
+    fields: &'a Option<Vec<FieldConflict>>,
+}
+
+/// Kept copies (local content sync set aside), newest first, as a JSON array of
+/// `{recovered_id, doc_id, title, reason, recovered_at, content, fields}`. `reason` is
+/// `conflict`, `field_conflict`, `delete_wins`, `delete_superseded`, `delete_refused`,
+/// `delete_publication`, `became_publication`, `create_rejected` or `unmigratable` (set aside
+/// while upgrading the database). `fields` is null for a whole-document copy, else `[{path, local_value, local_removed}]`.
+/// Copies never expire: they stay until dismissed or restored.
+///
+/// # Safety
+/// Valid handle and out pointer; free the result with `replicant_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_list_recovered(
+    handle: *mut Replicant,
+    out_json: *mut *mut c_char,
+) -> SyncResult {
+    guard(|| {
+        if handle.is_null() || out_json.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant.handle.block_on(store.list_recovered()) {
+            Ok(copies) => {
+                let listed: Vec<KeptCopyJson> = copies
+                    .iter()
+                    .map(|copy| KeptCopyJson {
+                        recovered_id: copy.id,
+                        doc_id: copy.doc_id,
+                        title: copy.content.get("title").and_then(Value::as_str),
+                        reason: &copy.reason,
+                        recovered_at: copy.recovered_at,
+                        content: &copy.content,
+                        fields: &copy.fields,
+                    })
+                    .collect();
+                write_json(out_json, &listed)
+            }
+            Err(error) => store_result(&error),
+        }
+    })
+}
+
+/// Deletes a kept copy for good; `ErrorNotFound` when it is already gone.
+///
+/// # Safety
+/// Valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_dismiss_recovered(
+    handle: *mut Replicant,
+    recovered_id: i64,
+) -> SyncResult {
+    guard(|| {
+        if handle.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant
+            .handle
+            .block_on(store.dismiss_recovered(recovered_id))
+        {
+            Ok(true) => SyncResult::Success,
+            Ok(false) => SyncResult::ErrorNotFound,
+            Err(error) => store_result(&error),
+        }
+    })
+}
+
+/// Re-creates a kept copy's full content as a new document, with a new id written to
+/// `out_document_id` (37 bytes), and removes the copy. Works for any copy, a field copy too
+/// (the way out when its document is gone). `ErrorNotFound` when the copy is gone (another
+/// process may have dismissed or restored it).
+///
+/// # Safety
+/// Valid handle and a 37-byte buffer.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_restore_document(
+    handle: *mut Replicant,
+    recovered_id: i64,
+    out_document_id: *mut c_char,
+) -> SyncResult {
+    guard(|| {
+        if handle.is_null() || out_document_id.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant
+            .handle
+            .block_on(store.restore_document(recovered_id))
+        {
+            Ok(doc_id) => {
+                replicant.handle.notify_outbox();
+                write_id(out_document_id, doc_id);
+                SyncResult::Success
+            }
+            Err(error) => store_result(&error),
+        }
+    })
+}
+
+/// Writes a field copy's kept values back at their paths as a local edit (every other field
+/// keeps its current value) and removes the copy.
+///
+/// A list conflict is kept as the whole list, so restoring it puts that list back exactly.
+/// `ErrorNotFound`: the copy is gone. `ErrorDocumentGone`: its document was deleted, and
+/// `ErrorNotWritable`: it became read-only; the copy stays in both cases, and
+/// `replicant_restore_document` brings it back as a new document.
+///
+/// # Safety
+/// Valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_restore_fields(
+    handle: *mut Replicant,
+    recovered_id: i64,
+) -> SyncResult {
+    guard(|| {
+        if handle.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant
+            .handle
+            .block_on(store.restore_fields(recovered_id))
+        {
+            Ok(()) => {
+                replicant.handle.notify_outbox();
+                SyncResult::Success
+            }
+            Err(error) => store_result(&error),
+        }
+    })
+}
+
+/// Documents that stopped uploading until their next local edit, as a JSON array of
+/// `{doc_id, code}` (`validation`, `forbidden`, `too_large`, `diverged`). Parked documents are
+/// not counted in `replicant_count_pending_sync`; a new local edit un-parks one.
+///
+/// # Safety
+/// Valid handle and out pointer; free the result with `replicant_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_list_parked(
+    handle: *mut Replicant,
+    out_json: *mut *mut c_char,
+) -> SyncResult {
+    guard(|| {
+        if handle.is_null() || out_json.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant.handle.block_on(store.list_parked()) {
+            Ok(parked) => write_json(out_json, &parked),
+            Err(error) => store_result(&error),
+        }
+    })
+}
+
 /// `event_filter`: -1 every document event, 1 `DocumentChanged` only, 2 `DocumentDeleted` only.
 /// The first registration on a handle fixes the thread that must call `replicant_process_events`.
 ///
@@ -1446,5 +1617,86 @@ mod tests {
     #[test]
     fn a_panic_inside_an_entry_point_becomes_error_unknown() {
         assert_eq!(guard(|| panic!("boom")), SyncResult::ErrorUnknown);
+    }
+
+    #[test]
+    fn a_restored_document_is_uploaded_without_another_write() {
+        use crate::driver::test_server::ScriptedServer;
+        use crate::secret_store::{self, Credentials};
+        use crate::store::test_support::{exec, ME};
+
+        let server_runtime = Runtime::new().unwrap();
+        let server = server_runtime.block_on(ScriptedServer::start(ME));
+        let dir = tempfile::tempdir().unwrap();
+        secret_store::store(
+            dir.path(),
+            &Credentials {
+                api_key: "k1".into(),
+                secret: "rps_test".into(),
+                user_id: ME,
+                email: None,
+            },
+        )
+        .unwrap();
+        let strings = [
+            dir.path().to_str().unwrap(),
+            "replicant.sqlite3",
+            server.url.as_str(),
+            "a@b.c",
+            "Test Host",
+            "1.0",
+        ]
+        .map(|text| CString::new(text).unwrap());
+        let config = ReplicantConfig {
+            struct_size: std::mem::size_of::<ReplicantConfig>() as u32,
+            data_dir: strings[0].as_ptr(),
+            database_file: strings[1].as_ptr(),
+            server_url: strings[2].as_ptr(),
+            email: strings[3].as_ptr(),
+            host_app: strings[4].as_ptr(),
+            host_version: strings[5].as_ptr(),
+            list_merge: 0,
+            list_merge_rules_json: ptr::null(),
+        };
+        let mut handle = ptr::null_mut();
+        assert_eq!(
+            unsafe { replicant_create(&config, &mut handle) },
+            SyncResult::Success
+        );
+        let replicant = unsafe { &*handle };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while replicant.handle.state().sync != SyncView::Live {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "engine never went live"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        replicant.handle.block_on(exec(
+            &replicant.handle.store(),
+            "INSERT INTO recovered (doc_id, content, reason, recovered_at) \
+             VALUES ('00000000-0000-0000-0000-000000000001', '{\"title\":\"Kept\"}', 'delete_wins', 100)",
+        ));
+        let recovered_id = replicant
+            .handle
+            .block_on(replicant.handle.store().list_recovered())
+            .unwrap()[0]
+            .id;
+        let mut restored = [0 as c_char; 37];
+        assert_eq!(
+            unsafe { replicant_restore_document(handle, recovered_id, restored.as_mut_ptr()) },
+            SyncResult::Success
+        );
+        let doc_id: Uuid = unsafe { CStr::from_ptr(restored.as_ptr()) }
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while server.uploads_for(doc_id).is_empty() {
+            assert!(std::time::Instant::now() < deadline, "never uploaded");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(unsafe { replicant_destroy_and_wait(handle, 10_000) });
     }
 }
