@@ -95,12 +95,25 @@ impl EventQueue {
         if document && queued.lagged {
             return;
         }
+        if matches!(event, HostEvent::ConnectionAttempted { .. }) {
+            // Only the latest dial matters; a long offline spell must not push other events out.
+            if let Some(attempted) =
+                queued.events.iter_mut().rev().find(|queued_event| {
+                    matches!(queued_event, HostEvent::ConnectionAttempted { .. })
+                })
+            {
+                *attempted = event;
+                return;
+            }
+        }
         if queued.events.len() >= QUEUE_CAP {
-            queued
-                .events
-                .retain(|queued_event| !is_document_event(queued_event));
-            queued.events.push_back(HostEvent::DatabaseChanged);
-            queued.lagged = true;
+            if !queued.lagged {
+                queued
+                    .events
+                    .retain(|queued_event| !is_document_event(queued_event));
+                queued.events.push_back(HostEvent::DatabaseChanged);
+                queued.lagged = true;
+            }
             if document {
                 return;
             }
@@ -412,6 +425,30 @@ mod tests {
             queue.take(),
             vec![deleted(2)],
             "after a take, events flow again"
+        );
+    }
+
+    #[test]
+    fn dial_attempts_never_evict_a_kept_copy_notice() {
+        let queue = EventQueue::default();
+        let conflict = HostEvent::Conflict {
+            doc_id: Uuid::from_u128(1),
+            reason: "field_conflict".into(),
+            recovered_id: Some(7),
+            paths: vec![],
+        };
+        queue.push(conflict.clone());
+        for attempt in 0..=QUEUE_CAP as u32 {
+            queue.push(HostEvent::ConnectionAttempted { attempt });
+        }
+        assert_eq!(
+            queue.take(),
+            vec![
+                conflict,
+                HostEvent::ConnectionAttempted {
+                    attempt: QUEUE_CAP as u32
+                }
+            ]
         );
     }
 }

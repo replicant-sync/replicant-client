@@ -141,12 +141,17 @@ impl Engine {
     }
 
     /// Stops the owner without waiting on the network, then closes the store.
-    pub async fn stop(mut self) {
+    pub async fn stop(self) {
+        self.stop_owner().await.close().await;
+    }
+
+    /// Stops the owner without waiting on the network; the caller closes the returned store.
+    pub async fn stop_owner(mut self) -> Arc<Store> {
         self.controls.cancel.cancel();
         if let Err(error) = (&mut self.task).await {
             warn!(%error, "engine owner task failed");
         }
-        self.controls.store.close().await;
+        self.controls.store.clone()
     }
 }
 

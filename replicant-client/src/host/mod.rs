@@ -31,8 +31,9 @@ use fanout::{EventQueue, FanOut};
 const RUNTIME_JOIN: Duration = Duration::from_secs(2);
 const WORKER_THREADS: usize = 2;
 
-/// One per database key. Its lock is held while that key's engine starts or stops, so the
-/// registry lock itself is only ever held for a map lookup.
+/// One per database key. Its lock is held while that key's engine starts and while the slot is
+/// emptied, not while the engine stops (that runs on the teardown thread), so the registry lock
+/// itself is only ever held for a map lookup.
 #[derive(Default)]
 struct Slot(Mutex<Weak<Shared>>);
 
@@ -148,10 +149,11 @@ impl Shared {
             ..
         } = self;
         runtime.block_on(async {
-            engine.stop().await;
+            let store = engine.stop_owner().await;
             if let Err(error) = fanout_task.await {
                 tracing::warn!(%error, "the event fan-out ended abnormally");
             }
+            store.close().await;
         });
         runtime.shutdown_timeout(RUNTIME_JOIN);
     }
@@ -284,12 +286,12 @@ impl Handle {
         let Ok(shared) = Arc::try_unwrap(shared) else {
             unreachable!("slots hold only weak references, and this was the last handle");
         };
-        Teardown(
-            std::thread::Builder::new()
-                .name("replicant-teardown".into())
-                .spawn(move || shared.stop())
-                .ok(),
-        )
+        let worker = std::thread::Builder::new()
+            .name("replicant-teardown".into())
+            .spawn(move || shared.stop())
+            .inspect_err(|error| tracing::warn!(%error, "could not spawn the teardown thread"))
+            .ok();
+        Teardown(worker)
     }
 }
 
@@ -303,8 +305,10 @@ impl Drop for Handle {
 pub struct Teardown(Option<ThreadHandle<()>>);
 
 impl Teardown {
-    /// Waits up to `timeout`; true when the engine and its threads have ended, or when other
-    /// handles keep it running and there was nothing to stop.
+    /// Waits up to `timeout`; true when the engine has stopped, or when other handles keep it
+    /// running and there was nothing to stop. Blocking-pool threads (a DNS lookup) can outlive
+    /// the runtime's shutdown: a host that unloads the library after this must expect them to
+    /// finish on their own.
     pub fn wait(self, timeout: Duration) -> bool {
         let Some(worker) = self.0 else {
             return true;

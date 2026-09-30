@@ -380,6 +380,32 @@ fn the_first_join_announces_the_adopted_identity() {
 }
 
 #[test]
+fn a_fresh_engine_on_an_adopted_dir_announces_no_identity() {
+    let (_runtime, server) = live_server();
+    let dir = tempfile::tempdir().unwrap();
+    sign_in(dir.path(), "k1");
+    let handle = attach(config(dir.path(), &server.url)).unwrap();
+    events_until(&handle, "IdentityAdopted then SyncCompleted", |seen| {
+        seen.contains(&HostEvent::IdentityAdopted { user_id: ME })
+            && seen.contains(&HostEvent::SyncCompleted)
+    });
+    assert!(handle.close().wait(WAIT));
+    let again = attach(config(dir.path(), &server.url)).unwrap();
+    let mut seen = events_until(&again, "SyncCompleted", |seen| {
+        seen.contains(&HostEvent::SyncCompleted)
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    seen.extend(again.take_events());
+    assert!(
+        !seen
+            .iter()
+            .any(|event| matches!(event, HostEvent::IdentityAdopted { .. })),
+        "{seen:?}"
+    );
+    assert!(again.close().wait(WAIT));
+}
+
+#[test]
 fn the_join_email_comes_from_the_stored_credentials_before_the_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let with_fallback = credential_loader(dir.path().to_path_buf(), Some("fallback@x.io".into()));

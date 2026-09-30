@@ -52,7 +52,10 @@ fn load_or_create_key(dir: &Path) -> io::Result<[u8; 32]> {
     let linked = std::fs::hard_link(&temp, &key_path);
     let _ = std::fs::remove_file(&temp);
     match linked {
-        Ok(()) => Ok(key),
+        Ok(()) => {
+            sync_dir(dir);
+            Ok(key)
+        }
         Err(error) if error.kind() == ErrorKind::AlreadyExists => read_key(dir)?
             .ok_or_else(|| Error::new(ErrorKind::NotFound, "key removed while being created")),
         Err(error) => Err(error),
@@ -96,7 +99,21 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let temp = write_temp(path, bytes)?;
     std::fs::rename(&temp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&temp);
-    })
+    })?;
+    if let Some(dir) = path.parent() {
+        sync_dir(dir);
+    }
+    Ok(())
+}
+
+/// Makes a rename or link durable; best effort, since the file itself is already written.
+fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Err(error) = std::fs::File::open(dir).and_then(|dir| dir.sync_all()) {
+        tracing::warn!(%error, "could not sync the credentials directory");
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 pub fn store(dir: &Path, creds: &Credentials) -> io::Result<()> {
