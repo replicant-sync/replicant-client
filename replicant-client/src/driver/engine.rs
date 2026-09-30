@@ -51,7 +51,6 @@ pub type CredentialLoader = Arc<dyn Fn() -> Option<JoinAuth> + Send + Sync>;
 pub struct EngineConfig {
     /// http(s) or ws(s), with or without `/socket/websocket`.
     pub server_url: String,
-    pub client_id: Uuid,
     /// Names the host in the `User-Agent`, e.g. "Entonal Studio" and "2.0.1".
     pub host_app: String,
     pub host_version: String,
@@ -103,8 +102,8 @@ struct Controls {
 }
 
 impl Engine {
-    /// Opens the store at `db_path` (which needs a `user_config` row) and starts the owner.
-    /// Returns without waiting for the network.
+    /// Opens the store at `db_path` (creating its `user_config` row if needed) and starts the
+    /// owner. Returns without waiting for the network.
     pub async fn start(
         db_path: &Path,
         config: EngineConfig,
@@ -201,11 +200,27 @@ impl Owner {
         config: EngineConfig,
         events: mpsc::UnboundedSender<EngineEvent>,
     ) -> Result<(Owner, Controls), EngineError> {
-        let url = socket_url(&config.server_url, config.client_id).map_err(EngineError::Config)?;
         config.list_merge.validate().map_err(EngineError::Config)?;
-        let mut store = retry_migrate_once(|| Store::open(db_path)).await?;
-        store.list_merge = config.list_merge;
+        socket_url(&config.server_url, Uuid::nil()).map_err(EngineError::Config)?;
+        let mut store = retry_open(|| Store::open(db_path)).await?;
+        store.list_merge = config.list_merge.clone();
         let store = Arc::new(store);
+        match Self::prepare(store.clone(), config, events).await {
+            Ok(opened) => Ok(opened),
+            Err(error) => {
+                store.close().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn prepare(
+        store: Arc<Store>,
+        config: EngineConfig,
+        events: mpsc::UnboundedSender<EngineEvent>,
+    ) -> Result<(Owner, Controls), EngineError> {
+        let client_id = store.ensure_user_config(&config.server_url).await?;
+        let url = socket_url(&config.server_url, client_id).map_err(EngineError::Config)?;
         let me = store.user_id().await?;
         let scopes = store.subscribed_scopes().await?;
         let reader = ChangeLogReader::open(&store, now_unix()).await?;
@@ -672,17 +687,30 @@ where
     }
 }
 
-/// Two processes opening a pre-v2 data dir at once can race the migration (sqlx's SQLite
-/// migrator takes no lock); the loser's second attempt finds it applied.
-async fn retry_migrate_once<T, Fut>(mut open: impl FnMut() -> Fut) -> StoreResult<T>
+const OPEN_ATTEMPTS: u64 = 4;
+
+/// Two processes opening a pre-v2 data dir at once race the migrations (sqlx's SQLite migrator
+/// takes no lock) and the connect; the loser retries until the winner has finished.
+async fn retry_open<T, Fut>(mut open: impl FnMut() -> Fut) -> StoreResult<T>
 where
     Fut: Future<Output = StoreResult<T>>,
 {
-    match open().await {
-        Err(StoreError::Migrate(error)) => {
-            warn!(%error, "store migration failed; retrying once");
-            open().await
+    let mut attempt = 1;
+    loop {
+        match open().await {
+            Err(error) if attempt < OPEN_ATTEMPTS && lost_an_open_race(&error) => {
+                warn!(%error, attempt, "store open raced another process; retrying");
+                tokio::time::sleep(Duration::from_millis(50 * attempt)).await;
+                attempt += 1;
+            }
+            done => return done,
         }
-        done => done,
+    }
+}
+
+fn lost_an_open_race(error: &StoreError) -> bool {
+    match error {
+        StoreError::Migrate(_) => !error.is_newer_schema(),
+        _ => error.is_busy(),
     }
 }

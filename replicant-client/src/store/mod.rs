@@ -46,6 +46,23 @@ pub enum StoreError {
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
+impl StoreError {
+    /// A newer build migrated this database: it has a migration this build does not know.
+    pub fn is_newer_schema(&self) -> bool {
+        matches!(
+            self,
+            StoreError::Migrate(sqlx::migrate::MigrateError::VersionMissing(_))
+        )
+    }
+
+    /// SQLITE_BUSY: another connection held the lock past the busy timeout.
+    pub fn is_busy(&self) -> bool {
+        // sqlx reports the extended code, whose low byte is the primary code.
+        matches!(self, StoreError::Db(sqlx::Error::Database(db))
+            if db.code().and_then(|code| code.parse::<i32>().ok()).is_some_and(|code| code & 0xFF == 5))
+    }
+}
+
 /// An event a rule asked for (`DocOp::Emit`), for the driver to hand to the host.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DocNotice {
@@ -116,6 +133,34 @@ impl Store {
 
     pub async fn user_id(&self) -> StoreResult<Uuid> {
         read_user_id(&mut *self.pool.acquire().await?).await
+    }
+
+    /// Gives a new data dir a provisional identity (the server's id is adopted at the first
+    /// join) and returns the data dir's client id.
+    pub async fn ensure_user_config(&self, server_url: &str) -> StoreResult<Uuid> {
+        let mut tx = self.begin().await?;
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT client_id FROM user_config LIMIT 1")
+                .fetch_optional(&mut *tx)
+                .await?;
+        let client_id = match existing {
+            Some(client_id) => Uuid::parse_str(&client_id)?,
+            None => {
+                let client_id = Uuid::new_v4();
+                sqlx::query(
+                    "INSERT INTO user_config (user_id, client_id, server_url, identity_adopted) \
+                     VALUES (?, ?, ?, 0)",
+                )
+                .bind(Uuid::new_v4().to_string())
+                .bind(client_id.to_string())
+                .bind(server_url)
+                .execute(&mut *tx)
+                .await?;
+                client_id
+            }
+        };
+        tx.commit().await?;
+        Ok(client_id)
     }
 
     /// The join's user id against this data dir: adopt it if none was ever adopted.
@@ -215,6 +260,46 @@ mod tests {
     use super::test_support::*;
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn ensure_user_config_creates_one_provisional_row_and_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("fresh.sqlite3"))
+            .await
+            .unwrap();
+        let first = store.ensure_user_config("ws://one").await.unwrap();
+        let again = store.ensure_user_config("ws://two").await.unwrap();
+        assert_eq!(first, again, "one client id per data dir");
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM user_config").await, 1);
+        assert_eq!(
+            count(
+                &store,
+                "SELECT COUNT(*) FROM user_config WHERE identity_adopted = 0"
+            )
+            .await,
+            1,
+            "the server's id is adopted at the first join"
+        );
+        store.user_id().await.unwrap();
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_database_from_a_newer_build_is_reported_as_newer_schema() {
+        let t = temp_store().await;
+        exec(
+            &t.store,
+            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+             VALUES (99, 'from a newer build', 1, x'00', 0)",
+        )
+        .await;
+        t.store.close().await;
+        let error = Store::open(&t.path())
+            .await
+            .err()
+            .expect("a newer schema must not open");
+        assert!(error.is_newer_schema(), "{error}");
+    }
 
     #[tokio::test]
     async fn open_applies_the_v2_schema_in_wal_mode() {

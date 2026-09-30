@@ -69,7 +69,6 @@ impl SwitchableCredentials {
 pub(crate) fn config(server_url: &str, credentials: CredentialLoader) -> EngineConfig {
     EngineConfig {
         server_url: server_url.to_string(),
-        client_id: Uuid::from_u128(0xC11E),
         host_app: "Test Host".into(),
         host_version: "1.0".into(),
         credentials,

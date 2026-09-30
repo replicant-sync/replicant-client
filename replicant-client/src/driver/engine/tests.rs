@@ -8,17 +8,17 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use super::owner_support::{connection, harness, is_live, Harness};
-use super::{retry_migrate_once, twice, Command, Engine, EngineError, Queued};
+use super::{retry_open, twice, Command, Engine, EngineError, Queued};
 use crate::driver::test_server::{Mode, ScriptedServer};
 use crate::driver::test_support::{
-    config, credentials, eventually, jump, seeded_db, SwitchableCredentials, WAIT,
+    config, credentials, eventually, jump, no_credentials, seeded_db, SwitchableCredentials, WAIT,
 };
 use crate::engine::list_merge::{ListMergePolicy, PathPattern};
 use crate::engine::machine::{
     ConnectionView, HaltReason, Input, Lifecycle, SettleOutcome, TimerId,
 };
 use crate::store::test_support::{count, exec, ME};
-use crate::store::{Store, StoreError};
+use crate::store::StoreError;
 use crate::transport::socket::SocketEvent;
 use crate::transport::wire::user_agent;
 
@@ -439,28 +439,43 @@ async fn twice_retries_a_failed_feed_effect_once_then_succeeds() {
     );
 }
 
-#[tokio::test]
-async fn migrate_error_is_retried_once() {
+#[tokio::test(start_paused = true)]
+async fn an_open_race_is_retried_until_the_fourth_attempt() {
     let attempts = Cell::new(0);
-    let opened = retry_migrate_once(|| {
+    let opened = retry_open(|| {
         attempts.set(attempts.get() + 1);
         let attempt = attempts.get();
         async move {
-            if attempt == 1 {
-                Err(StoreError::Migrate(MigrateError::VersionMissing(13)))
+            if attempt < 4 {
+                Err(StoreError::Migrate(MigrateError::Dirty(13)))
             } else {
                 Ok(attempt)
             }
         }
     })
     .await;
-    assert_eq!(opened.unwrap(), 2);
+    assert_eq!(opened.unwrap(), 4);
+    let failing: Result<u32, StoreError> =
+        retry_open(|| async { Err(StoreError::Migrate(MigrateError::Dirty(13))) }).await;
+    assert!(failing.is_err(), "four attempts, then the error");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_newer_schema_is_not_retried() {
+    let attempts = Cell::new(0);
+    let opened: Result<u32, StoreError> = retry_open(|| {
+        attempts.set(attempts.get() + 1);
+        async { Err(StoreError::Migrate(MigrateError::VersionMissing(99))) }
+    })
+    .await;
+    assert!(opened.unwrap_err().is_newer_schema());
+    assert_eq!(attempts.get(), 1);
 }
 
 #[tokio::test]
 async fn other_open_errors_are_not_retried() {
     let attempts = Cell::new(0);
-    let opened: Result<u32, StoreError> = retry_migrate_once(|| {
+    let opened: Result<u32, StoreError> = retry_open(|| {
         attempts.set(attempts.get() + 1);
         async { Err(StoreError::NoUserConfig) }
     })
@@ -470,21 +485,82 @@ async fn other_open_errors_are_not_retried() {
 }
 
 #[tokio::test]
-async fn start_without_a_user_config_row_fails() {
+async fn a_busy_open_is_retried() {
+    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::{ConnectOptions, Connection};
+
+    let dir = tempfile::tempdir().unwrap();
+    let options = SqliteConnectOptions::new()
+        .filename(dir.path().join("locked.sqlite3"))
+        .create_if_missing(true)
+        .busy_timeout(Duration::from_millis(1));
+    let mut lock_holder = options.connect().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut lock_holder)
+        .await
+        .unwrap();
+    let lock_holder = tokio::sync::Mutex::new(Some(lock_holder));
+    let attempts = Cell::new(0);
+    let busy_errors = Cell::new(0);
+    let opened = retry_open(|| {
+        attempts.set(attempts.get() + 1);
+        let (lock_holder, options, busy_errors) = (&lock_holder, &options, &busy_errors);
+        let release_lock = attempts.get() == 2;
+        async move {
+            if release_lock {
+                let mut released = lock_holder.lock().await.take().unwrap();
+                sqlx::query("ROLLBACK").execute(&mut released).await?;
+            }
+            let mut contender = options.connect().await?;
+            let locked = sqlx::query("BEGIN IMMEDIATE").execute(&mut contender).await;
+            contender.close().await?;
+            locked.map(|_| ()).map_err(|error| {
+                let error = StoreError::from(error);
+                assert!(error.is_busy(), "{error}");
+                busy_errors.set(busy_errors.get() + 1);
+                error
+            })
+        }
+    })
+    .await;
+    opened.unwrap();
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(busy_errors.get(), 1);
+}
+
+#[tokio::test]
+async fn start_creates_the_user_config_row() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("replicant.sqlite3");
-    Store::open(&path).await.unwrap().close().await;
+    let (events_tx, _events) = mpsc::unbounded_channel();
+    let engine = Engine::start(
+        &path,
+        config("ws://127.0.0.1:9", no_credentials()),
+        events_tx,
+    )
+    .await
+    .unwrap();
+    engine.store().user_id().await.unwrap();
+    assert_eq!(
+        count(&engine.store(), "SELECT COUNT(*) FROM user_config").await,
+        1
+    );
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn a_bad_server_url_is_refused_before_the_database_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replicant.sqlite3");
     let (events_tx, _events) = mpsc::unbounded_channel();
     let started = Engine::start(
         &path,
-        config("ws://127.0.0.1:9", credentials("k1")),
+        config("wss://sync.example.com/?vsn=1", no_credentials()),
         events_tx,
     )
     .await;
-    assert!(matches!(
-        started,
-        Err(EngineError::Store(StoreError::NoUserConfig))
-    ));
+    assert!(matches!(started, Err(EngineError::Config(_))));
+    assert!(!path.exists(), "nothing opened, nothing migrated");
 }
 
 #[tokio::test]
