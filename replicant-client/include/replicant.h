@@ -18,252 +18,344 @@
 namespace replicant {
 #endif // __cplusplus
 
+#define MAX_MISMATCH_ATTEMPTS 3
+
 /**
- * Where a document event came from.
- *
- * Document events are emitted for this client's own writes as well as for
- * changes applied from the server, and the rest of the payload cannot tell the
- * two apart: `user_id` is the document owner, not the writer, and delivery is
- * asynchronous. Consumers that only care about changes made elsewhere should
- * ignore `Local` events.
+ * Consecutive replies whose content differs from what was sent before the document is parked.
  */
+#define MAX_DIVERGENT_REPLIES 3
+
+#define MAX_IN_FLIGHT 8
+
+#define PAGE_LIMIT 500
+
+/**
+ * The version of this C ABI: bumped on any change to a struct layout, enum value or
+ * signature. A host compares it with `REPLICANT_ABI_VERSION` from the header it compiled.
+ */
+#define REPLICANT_ABI_VERSION 1
+
 typedef enum ReplicantEventOrigin {
   /**
-   * This client wrote the document itself.
+   * A handle of this engine wrote it (this process, this copy of the library): another
+   * handle's write on the same engine is `Local` too.
    */
-  Local = 0,
+  ReplicantEventOrigin_Local = 0,
   /**
-   * The change was applied from the server: a broadcast from another client
-   * or instance, or a sync pass.
+   * Sync wrote it: a download, a settle, a conflict revert or a sweep, in any process.
    */
-  Remote = 1,
+  ReplicantEventOrigin_Remote = 1,
+  /**
+   * Another process, or another copy of the library in this process, on the same data dir.
+   */
+  ReplicantEventOrigin_OtherProcess = 2,
 } ReplicantEventOrigin;
 
-/**
- * Event types that can be emitted by the sync client
- */
 typedef enum ReplicantEventType {
   /**
-   * A new document was created.
-   *
-   * Fires for THIS client's own `create_document` call as well as for a
-   * document that arrived from the server. Check the event's origin before
-   * treating it as a change made elsewhere.
+   * A document was created or changed; `EventOrigin` says by whom.
    */
-  DocumentCreated = 0,
+  ReplicantEventType_DocumentChanged = 1,
+  ReplicantEventType_DocumentDeleted = 2,
+  ReplicantEventType_SyncStarted = 3,
   /**
-   * An existing document was updated.
-   *
-   * Fires for THIS client's own `update_document` call as well as for a
-   * patch applied from the server. Check the event's origin before treating
-   * it as a change made elsewhere.
+   * Every subscribed scope caught up, once per connection. Not a promise that uploads are done.
    */
-  DocumentUpdated = 1,
+  ReplicantEventType_SyncCompleted = 4,
+  ReplicantEventType_SyncError = 5,
   /**
-   * A document was deleted.
-   *
-   * Fires for THIS client's own `delete_document` call as well as for a
-   * deletion applied from the server. Check the event's origin before
-   * treating it as a change made elsewhere.
+   * Local content was set aside in Kept copies.
    */
-  DocumentDeleted = 2,
+  ReplicantEventType_ConflictDetected = 6,
+  ReplicantEventType_ConnectionLost = 7,
+  ReplicantEventType_ConnectionAttempted = 8,
+  ReplicantEventType_ConnectionSucceeded = 9,
   /**
-   * Synchronization process started
+   * Changes were trimmed before this engine read them, or this handle fell more than 4096
+   * events behind: reload every list.
    */
-  SyncStarted = 3,
+  ReplicantEventType_DatabaseChanged = 11,
   /**
-   * Synchronization completed successfully
+   * The data dir adopted the signed-in account's user id and restamped its documents:
+   * re-read `replicant_get_user_id` and reload lists. On the sync callback.
    */
-  SyncCompleted = 4,
-  /**
-   * An error occurred during synchronization
-   */
-  SyncError = 5,
-  /**
-   * A conflict was detected between document versions
-   */
-  ConflictDetected = 6,
-  /**
-   * Connection to server was lost
-   */
-  ConnectionLost = 7,
-  /**
-   * A connection attempt was made to the server
-   */
-  ConnectionAttempted = 8,
-  /**
-   * Successfully connected to the server
-   */
-  ConnectionSucceeded = 9,
-  /**
-   * The server-authoritative user id was adopted, replacing the local one
-   */
-  IdentityChanged = 10,
+  ReplicantEventType_IdentityAdopted = 12,
 } ReplicantEventType;
 
-/**
- * Structured error code carried by every `SyncError` event.
- *
- * The numeric values are STABLE and exported to C via cbindgen. They are
- * banded by the action a consumer should take:
- *
- * - `0` — unknown / uncategorized.
- * - `1xxx` — **credential rejected**: the stored credential is bad. The
- *   consumer should clear it and re-enroll. See [`is_credential_rejection`].
- * - `2xxx` — **transient**: retry later; NEVER clear credentials. This band
- *   includes the timestamp reasons (`2101`, `2102`), which are client/server
- *   clock skew — not a bad credential — and so must never trigger a clear.
- * - `3xxx` — **protocol**: the exchange was malformed or violated the contract.
- * - `4xxx` — **identity drift**: the local identity diverged from the account;
- *   refuse to sync, but do NOT clear credentials.
- * - `5xxx` — **unresolved divergence**: a local edit could not be reconciled
- *   with the server's copy. Retrying cannot help; surface it to the user.
- */
+typedef enum ReplicantConnection {
+  ConnectionIdle = 0,
+  ConnectionDisconnected = 1,
+  ConnectionConnecting = 2,
+  ConnectionConnected = 3,
+  /**
+   * Not retrying on its own; see `halt_reason`.
+   */
+  ConnectionHalted = 4,
+  ConnectionStopped = 5,
+} ReplicantConnection;
+
 enum ReplicantErrorCode
 #ifdef __cplusplus
   : int32_t
 #endif // __cplusplus
  {
+  ReplicantErrorCode_Unknown = 0,
   /**
-   * Unknown or uncategorized error.
+   * The server refused the credentials; the engine is halted until they change.
    */
-  Unknown = 0,
+  ReplicantErrorCode_AuthInvalid = 1001,
   /**
-   * The API key is not recognized by the server.
+   * No stored credentials; the engine is halted until someone signs in.
    */
-  InvalidApiKey = 1001,
+  ReplicantErrorCode_NotEnrolled = 1003,
   /**
-   * The HMAC signature did not verify.
+   * The server needs a newer client; halted.
    */
-  InvalidSignature = 1002,
+  ReplicantErrorCode_UpdateRequired = 2003,
   /**
-   * The credential authenticated but is not bound to an enrolled user.
+   * This computer's clock is off; not fatal, the engine keeps retrying.
    */
-  CredentialNotEnrolled = 1003,
+  ReplicantErrorCode_ClockSkew = 2101,
+  ReplicantErrorCode_ProtocolError = 3003,
   /**
-   * The socket/transport failed to connect.
+   * A subscribed scope was refused and dropped.
    */
-  ConnectionFailed = 2001,
+  ReplicantErrorCode_SubscriptionForbidden = 3004,
   /**
-   * A join or call timed out.
+   * The data dir belongs to another account; halted.
    */
-  Timeout = 2002,
+  ReplicantErrorCode_IdentityDrift = 4001,
+  ReplicantErrorCode_AccountDisabled = 4002,
   /**
-   * The signed timestamp was outside the server's acceptance window
-   * (client/server clock skew, not a bad credential).
+   * The server refused this document's changes; its next local edit retries them. If the
+   * refused change was a delete, the server's version is back instead, and edits made before
+   * the delete are in Kept copies (`recovered_id`). Also for `Forbidden` and `TooLarge`.
    */
-  TimestampExpired = 2101,
+  ReplicantErrorCode_Validation = 5002,
+  ReplicantErrorCode_Forbidden = 5003,
+  ReplicantErrorCode_TooLarge = 5004,
   /**
-   * The timestamp field was malformed or unparseable (treated as clock skew).
+   * The document became a read-only publication; unsent edits are in Kept copies.
    */
-  InvalidTimestamp = 2102,
+  ReplicantErrorCode_BecamePublication = 5005,
   /**
-   * A required join parameter was missing.
+   * Its id belongs to another account; the content is in Kept copies.
    */
-  MissingParams = 3001,
+  ReplicantErrorCode_CreateRejected = 5006,
   /**
-   * The join topic's user id did not match the credential's user.
+   * The server kept storing something other than what was uploaded; the document stops
+   * uploading until its next local edit. Local content is kept.
    */
-  TopicUserMismatch = 3002,
+  ReplicantErrorCode_Diverged = 5007,
   /**
-   * Generic malformed or unexpected server reply.
+   * Reserved: a delete the server refused (the document is back). Not emitted before 0.8;
+   * until then a refused delete arrives as `Validation`, `Forbidden` or `TooLarge`.
    */
-  ProtocolError = 3003,
+  ReplicantErrorCode_DeleteRefused = 5008,
   /**
-   * The server-reported user id diverged from the local identity.
+   * The local database failed while checking a join.
    */
-  IdentityDrift = 4001,
-  /**
-   * A local edit could not be rebased onto the server's current content.
-   * The server's copy is now local truth and the edit was discarded.
-   */
-  UpdateConflict = 5001,
+  ReplicantErrorCode_LocalDatabase = 6001,
 };
 #ifndef __cplusplus
 typedef int32_t ReplicantErrorCode;
 #endif // __cplusplus
 
+typedef enum ReplicantHaltReason {
+  HaltNone = 0,
+  /**
+   * No stored credentials: sign in.
+   */
+  HaltNotEnrolled = 1,
+  /**
+   * The server refused the credentials: sign in again.
+   */
+  HaltAuthInvalid = 2,
+  /**
+   * The server needs a newer client.
+   */
+  HaltUpdateRequired = 3,
+  HaltAccountDisabled = 4,
+  /**
+   * This data dir belongs to another account.
+   */
+  HaltIdentityDrift = 5,
+  HaltOther = 6,
+} ReplicantHaltReason;
+
 /**
- * Result codes for C API functions
+ * Merge policy for a list changed on both sides. `ListMergeFull` is refused for now.
  */
+typedef enum ReplicantListMerge {
+  /**
+   * Element by element while positions line up on both sides; otherwise the server's list is
+   * kept and the local one set aside.
+   */
+  ListMergeAppend = 0,
+  /**
+   * Any change on both sides keeps the server's list and sets the local one aside.
+   */
+  ListMergeAtomic = 1,
+  ListMergeFull = 2,
+} ReplicantListMerge;
+
+typedef enum ReplicantSync {
+  SyncIdle = 0,
+  SyncCatchingUp = 1,
+  SyncLive = 2,
+} ReplicantSync;
+
 typedef enum ReplicantSyncResult {
-  Success = 0,
-  ErrorInvalidInput = -1,
-  ErrorConnection = -2,
-  ErrorDatabase = -3,
-  ErrorSerialization = -4,
-  ErrorUnknown = -99,
+  ReplicantSyncResult_Success = 0,
+  ReplicantSyncResult_ErrorInvalidInput = -1,
+  /**
+   * Enrollment only: the server could not be reached.
+   */
+  ReplicantSyncResult_ErrorConnection = -2,
+  ReplicantSyncResult_ErrorDatabase = -3,
+  ReplicantSyncResult_ErrorSerialization = -4,
+  /**
+   * A newer build migrated the database; this build cannot open it.
+   */
+  ReplicantSyncResult_ErrorNewerSchema = -5,
+  /**
+   * An engine is open on this data dir with a different server, host or list merge config.
+   * A programming error: every binary on a data dir must pass the same config. Never fall
+   * back to a temporary library.
+   */
+  ReplicantSyncResult_ErrorConfigMismatch = -6,
+  ReplicantSyncResult_ErrorNotFound = -7,
+  /**
+   * Another account's document, or a read-only publication.
+   */
+  ReplicantSyncResult_ErrorNotWritable = -8,
+  /**
+   * The id exists here or was deleted. An import should skip the id, not count a failure.
+   */
+  ReplicantSyncResult_ErrorAlreadyExists = -9,
+  /**
+   * Migrating a v1 library failed; nothing was changed and a `.v1-backup` copy sits next to
+   * the database. Show "Your library needs attention"; never fall back to a temporary library.
+   */
+  ReplicantSyncResult_ErrorMigrationFailed = -10,
+  /**
+   * Another process kept the database locked; try `replicant_create` again shortly.
+   */
+  ReplicantSyncResult_ErrorBusy = -11,
+  /**
+   * `replicant_process_events` was called on another thread than the one that registered.
+   */
+  ReplicantSyncResult_ErrorWrongThread = -12,
+  /**
+   * `replicant_process_events` was called before any callback was registered.
+   */
+  ReplicantSyncResult_ErrorNoCallbacks = -13,
+  /**
+   * The kept copy's document was deleted: `replicant_restore_document` re-creates the copy.
+   */
+  ReplicantSyncResult_ErrorDocumentGone = -14,
+  ReplicantSyncResult_ErrorUnknown = -99,
 } ReplicantSyncResult;
 
 /**
- * Opaque handle to a Replicant client instance
+ * Opaque handle. Every call except `replicant_process_events` is thread-safe. Never call from an
+ * audio thread: every read and write is a SQLite transaction.
  */
 typedef struct Replicant Replicant;
 
 /**
- * Document event callback for DocumentCreated, DocumentUpdated, DocumentDeleted
- *
- * Fires for this client's OWN writes as well as for changes applied from the
- * server. Check `origin` before treating an event as a change made elsewhere.
- *
- * # Parameters
- * * `event_type` - The specific document event type
- * * `document_id` - UUID of the document (always non-null)
- * * `title` - Document title (null for Deleted events)
- * * `content` - Full document JSON (null for Deleted events)
- * * `user_id` - Owner UUID (null if unknown)
- * * `author_name` - Author display name (null if unknown)
- * * `visibility` - "private"/"public" (null if unknown)
- * * `origin` - `Local` if this client wrote the document, `Remote` if the
- *   change was applied from the server
- * * `context` - User-defined context pointer
+ * Every string is UTF-8 and copied by `replicant_create`.
+ */
+typedef struct ReplicantConfig {
+  /**
+   * `sizeof(ReplicantConfig)`; any other value is refused (`ErrorInvalidInput`), so a later
+   * version can add fields without reading past an older host's struct.
+   */
+  uint32_t struct_size;
+  /**
+   * Holds the database file and the stored credentials.
+   */
+  const char *data_dir;
+  /**
+   * File name inside `data_dir`, e.g. "tonaldb.sqlite3".
+   */
+  const char *database_file;
+  const char *server_url;
+  /**
+   * May be null. Signs joins when the stored credentials carry no email.
+   */
+  const char *email;
+  /**
+   * Named in the User-Agent, e.g. "Entonal Studio" and "2.0.1 CLAP".
+   */
+  const char *host_app;
+  const char *host_version;
+  /**
+   * A `ReplicantListMerge`: how a list both sides changed is merged when no rule matches.
+   * An `int32_t` so that a value from C outside the enum is refused, not undefined.
+   */
+  int32_t list_merge;
+  /**
+   * May be null. A JSON array of `{"path": "/pitches", "policy": "atomic"}`;
+   * policies `append`, `atomic`, `full`. `*` matches one key or index; the rule with the most
+   * literal segments wins, a tie goes to the first listed.
+   */
+  const char *list_merge_rules_json;
+} ReplicantConfig;
+
+typedef struct ReplicantState {
+  /**
+   * Set to `sizeof(ReplicantState)` before `replicant_get_state`; any other value is
+   * refused, so a later version never writes past an older host's struct.
+   */
+  uint32_t struct_size;
+  enum ReplicantConnection connection;
+  enum ReplicantSync sync;
+  enum ReplicantHaltReason halt_reason;
+} ReplicantState;
+
+/**
+ * `DocumentChanged` / `DocumentDeleted`. For a deletion only `document_id` is set.
+ * `visibility` is `public` (curated or read-only) or `private`.
+ * Strings are valid only during the call; copy what you keep.
  */
 typedef void (*DocumentEventCallback)(enum ReplicantEventType event_type,
                                       const char *document_id,
                                       const char *title,
                                       const char *content,
-                                      const char *user_id,
-                                      const char *author_name,
+                                      const char *owner_id,
+                                      const char *author_id,
                                       const char *visibility,
+                                      bool read_only,
                                       enum ReplicantEventOrigin origin,
                                       void *context);
 
 /**
- * Sync event callback for SyncStarted, SyncCompleted
- *
- * # Parameters
- * * `event_type` - SyncStarted or SyncCompleted
- * * `document_count` - Number of documents synced (0 for SyncStarted)
- * * `context` - User-defined context pointer
+ * `SyncStarted`, `SyncCompleted`, `DatabaseChanged`, `IdentityAdopted`.
+ * Strings are valid only during the call; copy what you keep.
  */
-typedef void (*SyncEventCallback)(enum ReplicantEventType event_type,
-                                  uint64_t document_count,
-                                  void *context);
+typedef void (*SyncEventCallback)(enum ReplicantEventType event_type, void *context);
 
 /**
- * Error event callback for SyncError
- *
- * # Parameters
- * * `event_type` - Always SyncError
- * * `error_code` - Stable `ReplicantErrorCode` value; use
- *   `replicant_error_is_credential_rejection` to decide whether to clear the
- *   stored credential
- * * `error` - Error message (always non-null)
- * * `context` - User-defined context pointer
+ * `error_code` is a `ReplicantErrorCode`; `error` is the protocol code, e.g. "clock_skew";
+ * `document_id` is null unless the error is about one document; `fatal` means halted;
+ * `recovered_id` names local content kept aside with the error, -1 if none.
+ * Raised only by the engine (process) that applied the rule; another process sees just
+ * `DocumentChanged`. `replicant_list_recovered` is the durable record. `recovered_id` may
+ * already be dismissed or restored by another process: `restore_*` then returns `ErrorNotFound`.
+ * Strings are valid only during the call; copy what you keep.
  */
 typedef void (*ErrorEventCallback)(enum ReplicantEventType event_type,
                                    int32_t error_code,
                                    const char *error,
+                                   const char *document_id,
+                                   bool fatal,
+                                   int64_t recovered_id,
                                    void *context);
 
 /**
- * Connection event callback for ConnectionLost, ConnectionAttempted, ConnectionSucceeded
- *
- * # Parameters
- * * `event_type` - The connection event type
- * * `connected` - true if connected (valid for Lost/Succeeded), false otherwise
- * * `attempt_number` - Reconnection attempt number (valid for ConnectionAttempted)
- * * `context` - User-defined context pointer
+ * `attempt_number` counts dials since the last successful connection.
+ * Strings are valid only during the call; copy what you keep.
  */
 typedef void (*ConnectionEventCallback)(enum ReplicantEventType event_type,
                                         bool connected,
@@ -271,585 +363,270 @@ typedef void (*ConnectionEventCallback)(enum ReplicantEventType event_type,
                                         void *context);
 
 /**
- * Conflict event callback for ConflictDetected
- *
- * # Parameters
- * * `event_type` - Always ConflictDetected
- * * `document_id` - UUID of the conflicted document (always non-null)
- * * `winning_content` - Content of the winning version (always non-null)
- * * `losing_content` - Content of the losing version (may be null)
- * * `context` - User-defined context pointer
+ * `reason`: `conflict`, `field_conflict`, `delete_wins` or `delete_superseded` (a delete undone
+ * because a newer version arrived). `recovered_id` is the Kept copies id, -1 if none.
+ * `paths_json` is a JSON array of JSON Pointers for `field_conflict`, else null.
+ * Raised only by the engine (process) that applied the rule; another process sees just
+ * `DocumentChanged`. `replicant_list_recovered` is the durable record. `recovered_id` may
+ * already be dismissed or restored by another process: `restore_*` then returns `ErrorNotFound`.
+ * Strings are valid only during the call; copy what you keep.
  */
 typedef void (*ConflictEventCallback)(enum ReplicantEventType event_type,
                                       const char *document_id,
-                                      const char *winning_content,
-                                      const char *losing_content,
+                                      const char *reason,
+                                      int64_t recovered_id,
+                                      const char *paths_json,
                                       void *context);
-
-/**
- * Identity event callback for IdentityChanged
- *
- * # Parameters
- * * `event_type` - Always IdentityChanged
- * * `old_user_id` - The provisional/previous user id (always non-null)
- * * `new_user_id` - The adopted canonical user id (always non-null)
- * * `email` - The email the server resolved the id from (may be empty)
- * * `context` - User-defined context pointer
- */
-typedef void (*IdentityEventCallback)(enum ReplicantEventType event_type,
-                                      const char *old_user_id,
-                                      const char *new_user_id,
-                                      const char *email,
-                                      void *context);
-
-/**
- * Document structure for C API
- */
-typedef struct Document {
-  char *id;
-  char *title;
-  char *content;
-  int64_t sync_revision;
-} Document;
 
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
 
 /**
- * Band check exposed over FFI: `true` iff `code` is a credential rejection.
- *
- * Bindings should treat a `true` result as "clear the stored credential and
- * re-enroll". Implemented once here so consumers do not re-implement the band
- * logic against the raw numeric values.
- *
- * # Safety
- * This function is pure and takes the code by value; it is always safe to call.
+ * Whether `code` (a `ReplicantErrorCode`) means the credentials were refused or are missing.
  */
 bool replicant_error_is_credential_rejection(int32_t code);
 
-/**
- * Create a new sync engine instance
- *
- * # Arguments
- * * `database_url` - SQLite database URL (e.g., "sqlite:client.db?mode=rwc")
- * * `server_url` - WebSocket server URL (e.g., "ws://localhost:8080/ws")
- * * `email` - User email address
- * * `api_key` - Application API key (rpa_ prefix)
- * * `api_secret` - Application API secret (rps_ prefix)
- *
- * # Returns
- * * Pointer to SyncEngine on success, null on failure
- *
- * # Events
- * Connection and initial sync run in the background. ConnectionSucceeded is
- * emitted once per successful connect (at start-up or on a later reconnect),
- * after the engine uses that connection. SyncStarted and SyncCompleted then
- * bracket the full sync that follows; SyncCompleted means the server answered.
- * An offline start emits neither until the server is reached. An engine with
- * no API key, or whose database has never adopted an identity (no `user_id`
- * on this or an earlier run), never connects, so it emits neither.
- *
- * # Safety
- * Caller must ensure all pointers are valid, non-null C strings
- */
-struct Replicant *replicant_create(const char *database_url,
-                                   const char *server_url,
-                                   const char *email,
-                                   const char *api_key,
-                                   const char *api_secret,
-                                   const char *user_id);
+int32_t replicant_abi_version(void);
 
 /**
- * Destroy a sync engine instance and free memory
- *
- * NON-BLOCKING, fire-and-forget: it returns immediately and the teardown —
- * closing both sqlite pools and joining this instance's threads — finishes on
- * a Replicant-owned thread afterwards. The handle is invalid the moment this
- * returns; no further call may use it.
- *
- * This is safe to call on a UI or audio-host thread (plugin scans, project
- * close) precisely because it does not wait. The consequence is that threads
- * Replicant started can still be running Replicant code for a short time after
- * it returns — normally milliseconds, longer if sqlite is contended.
- *
- * THEREFORE: any caller that can be UNLOADED FROM MEMORY — every plugin —
- * MUST make sure its own binary is never unmapped, or one of those threads
- * will be executing code at an address that no longer exists (the DEV-1118
- * crash: an execute access violation on an unmapped image). Pin the module
- * once, at load:
- *
- *   * Windows: `GetModuleHandleExW` with `GET_MODULE_HANDLE_EX_FLAG_PIN`
- *     (plus `GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS`) on an address in your
- *     own module.
- *   * macOS / Linux: `dlopen` your own image with `RTLD_NOLOAD | RTLD_NODELETE`.
- *
- * Pinning is the primary defence, not a workaround. A host process that only
- * ever exits (a standalone app) does not need it; anything a host can unload
- * does.
- *
- * UPGRADING FROM 0.6.2 OR EARLIER WITHOUT PINNING IS A REGRESSION. The old
- * destroy dropped the handle, which joined the tokio runtime's threads before
- * returning and left only sqlx's workers running; this one returns with the
- * background init, both pools, the runtime's threads and the sqlx workers all
- * still live. The total time any thread of ours is alive goes down — the pools
- * are now actually closed, so nothing lingers for the life of the process — but
- * the exposure *at the moment destroy returns* goes up.
- *
- * A second instance may be created immediately; it shares nothing with the one
- * being torn down. Note only that the outgoing instance may still be writing to
- * the same database file for a moment, so an immediate re-create against it can
- * see sqlite contention (and `replicant_create` returns NULL if that outlasts
- * sqlite's 5s busy timeout). `replicant_destroy_and_wait` avoids the overlap.
- *
- * Callers that *can* afford to wait — standalone apps shutting down, tests —
- * should use `replicant_destroy_and_wait` instead, which reports whether the
- * teardown actually finished.
+ * Attaches to the engine for `config`'s data dir, starting it if this process has none yet.
+ * Opens (and after an upgrade migrates) the database on this thread; never waits on the
+ * network. On success `*out_handle` is set; otherwise it is null. Call `replicant_get_state`
+ * next: a handle attached to an engine that is already halted is not sent the halt again.
  *
  * # Safety
- * Caller must ensure engine pointer was created by replicant_create and hasn't been freed.
- * As with any free function, no other call on this handle may be in progress on
- * any thread — which includes destroying it from inside a Replicant callback
- * while the call that dispatched that callback is still on the stack.
+ * `config` and `out_handle` must be valid; the config's strings valid C strings (`email` may be null).
  */
-void replicant_destroy(struct Replicant *engine);
+enum ReplicantSyncResult replicant_create(const struct ReplicantConfig *config,
+                                          struct Replicant **out_handle);
 
 /**
- * Destroy a sync engine instance and wait for its teardown to finish.
- *
- * Same as `replicant_destroy` (the handle is invalid either way, whatever this
- * returns) but BLOCKS for up to `timeout_ms` waiting for Replicant to close
- * its sqlite pools and join its threads.
- *
- * Returns `true` when the teardown completed: no REPLICANT-OWNED thread — its
- * tokio runtime, its sqlite workers — is running any more. That is the claim,
- * and it is narrower than "this module has no threads in it": libraries linked
- * into Replicant (the WebSocket and TLS stacks in particular) may keep threads
- * of their own that Replicant neither owns nor can join, so a module that has
- * ever connected should still be pinned rather than unloaded.
- *
- * Returns `false` if the wait ran out, or if the caller cannot wait (destroy
- * from inside a Replicant callback on a Replicant runtime thread) — the teardown
- * then carries on in the background.
- *
- * `timeout_ms` of 0 does not wait at all; it reports whether the teardown had
- * already finished. Pass a large value (`UINT32_MAX`) to wait in effect
- * indefinitely.
- *
- * Intended for standalone applications and tests. A plugin should call
- * `replicant_destroy` and pin its module instead of blocking a host thread.
+ * Detaches and frees the handle. Returns at once: when this was the engine's last handle, the
+ * engine stops on a Replicant thread afterwards (never waiting on the network), so a plugin
+ * must keep its module pinned. Called from inside one of this handle's callbacks, the free
+ * happens when `replicant_process_events` returns.
  *
  * # Safety
- * Caller must ensure engine pointer was created by replicant_create and hasn't been freed
+ * `handle` must come from `replicant_create` and not be used again.
  */
-bool replicant_destroy_and_wait(struct Replicant *engine, uint32_t timeout_ms);
+void replicant_destroy(struct Replicant *handle);
 
 /**
- * Create a new document
- *
- * # Arguments
- * * `engine` - Sync engine instance
- * * `content_json` - Document content as JSON string (should include any title as part of the JSON)
- * * `out_document_id` - Output buffer for document ID (must be at least 37 chars)
- *
- * # Returns
- * * CSyncResult indicating success or failure
+ * `replicant_destroy`, then waits up to `timeout_ms` for the engine to stop and its threads to
+ * end. True when they have, or when other handles keep the engine running. From inside a
+ * callback it cannot wait: it returns false and the handle is freed when the pump returns.
  *
  * # Safety
- * Caller must ensure engine is valid, content_json is a valid C string, and out_document_id has space for 37 bytes
+ * As `replicant_destroy`.
  */
-enum ReplicantSyncResult replicant_create_document(struct Replicant *engine,
+bool replicant_destroy_and_wait(struct Replicant *handle, uint32_t timeout_ms);
+
+/**
+ * Creates a document owned by the signed-in (or provisional) user; writes its id into
+ * `out_document_id` (37 bytes).
+ *
+ * # Safety
+ * Valid handle, C string, and a 37-byte buffer.
+ */
+enum ReplicantSyncResult replicant_create_document(struct Replicant *handle,
                                                    const char *content_json,
                                                    char *out_document_id);
 
 /**
- * Create a new document with a specified ID
- *
- * # Arguments
- * * `engine` - Sync engine instance
- * * `document_id` - UUID string to use as the document ID
- * * `content_json` - Document content as JSON string
- *
- * # Returns
- * * `SyncResult::Success` - Document created successfully
- * * `SyncResult::ErrorInvalidInput` - Invalid UUID format or null pointers
- * * `SyncResult::ErrorSerialization` - Invalid JSON content
- * * `SyncResult::ErrorDatabase` - Database operation failed
- * * `SyncResult::ErrorConnection` - Sync to server failed (document saved locally)
- *
- * # Note
- * If a document with the specified ID already exists, it will be overwritten (upsert behavior).
- * Use this for ID preservation during data migration or import scenarios.
+ * Creates a document with a chosen id. Refused (`ErrorAlreadyExists`) when the id exists here
+ * or was deleted.
  *
  * # Safety
- * Caller must ensure engine is valid, document_id and content_json are valid C strings
+ * Valid handle and C strings.
  */
-enum ReplicantSyncResult replicant_create_document_with_id(struct Replicant *engine,
+enum ReplicantSyncResult replicant_create_document_with_id(struct Replicant *handle,
                                                            const char *document_id,
                                                            const char *content_json);
 
 /**
- * Update an existing document
- *
- * # Arguments
- * * `engine` - Sync engine instance
- * * `document_id` - Document ID to update
- * * `content_json` - New document content as JSON string
- *
- * # Returns
- * * CSyncResult indicating success or failure
- *
  * # Safety
- * Caller must ensure engine is valid and both document_id and content_json are valid C strings
+ * Valid handle and C strings.
  */
-enum ReplicantSyncResult replicant_update_document(struct Replicant *engine,
+enum ReplicantSyncResult replicant_update_document(struct Replicant *handle,
                                                    const char *document_id,
                                                    const char *content_json);
 
 /**
- * Delete a document
- *
- * # Arguments
- * * `engine` - Sync engine instance
- * * `document_id` - Document ID to delete
- *
- * # Returns
- * * CSyncResult indicating success or failure
- *
  * # Safety
- * Caller must ensure engine is valid and document_id is a valid C string
+ * Valid handle and C string.
  */
-enum ReplicantSyncResult replicant_delete_document(struct Replicant *engine,
+enum ReplicantSyncResult replicant_delete_document(struct Replicant *handle,
                                                    const char *document_id);
 
 /**
- * Free a C string allocated by this library
+ * The document as JSON: `id`, `user_id` (owner), `author_id`, `title`, `content`, `read_only`,
+ * `visibility` (`public`/`private`), `source_doc_id`, `derived_from`, `created_at`,
+ * `updated_at`. `ErrorNotFound` when missing or deleted.
  *
  * # Safety
- * Caller must ensure the string was allocated by this library and hasn't been freed
+ * Valid handle, C string and out pointer; free the result with `replicant_string_free`.
  */
-void replicant_string_free(char *s);
+enum ReplicantSyncResult replicant_get_document(struct Replicant *handle,
+                                                const char *document_id,
+                                                char **out_json);
 
 /**
- * Get the engine's own frozen user UUID
- *
- * # Arguments
- * * `engine` - Sync engine instance
- * * `out_user_id` - Output pointer for user UUID string (caller must free with replicant_string_free)
- *
- * # Returns
- * * SyncResult::Success if the user ID was retrieved
- * * SyncResult::ErrorInvalidInput if engine or out_user_id is null
- * * SyncResult::ErrorDatabase if the user ID could not be read
+ * Every visible document as a JSON array (see `replicant_get_document`).
  *
  * # Safety
- * Caller must ensure engine is valid and out_user_id is a valid pointer
+ * Valid handle and out pointer; free the result with `replicant_string_free`.
  */
-enum ReplicantSyncResult replicant_get_user_id(struct Replicant *engine,
-                                               char **out_user_id);
+enum ReplicantSyncResult replicant_get_all_documents(struct Replicant *handle, char **out_json);
 
 /**
- * Get library version string
- */
-char *replicant_get_version(void);
-
-/**
- * Register a callback for document events (Created, Updated, Deleted)
- *
- * # Arguments
- * * `engine` - Sync engine instance
- * * `callback` - C callback function to invoke for document events
- * * `context` - User-defined context pointer passed to callback
- * * `event_filter` - Optional filter: 0=Created, 1=Updated, 2=Deleted, -1=all document events
- *
- * # Returns
- * * SyncResult indicating success or failure
+ * Document ids as a JSON array; `include_deleted` adds documents whose delete is not yet sent.
  *
  * # Safety
- * Caller must ensure engine is valid, callback is a valid function pointer, and context pointer outlives the callback registration
+ * Valid handle and out pointer; free the result with `replicant_string_free`.
  */
-enum ReplicantSyncResult replicant_register_document_callback(struct Replicant *engine,
+enum ReplicantSyncResult replicant_get_all_document_ids(struct Replicant *handle,
+                                                        bool include_deleted,
+                                                        char **out_json);
+
+/**
+ * # Safety
+ * Valid handle and out pointer.
+ */
+enum ReplicantSyncResult replicant_count_documents(struct Replicant *handle, uint64_t *out_count);
+
+/**
+ * Documents with changes the server has not acknowledged, except parked ones (`replicant_list_parked`).
+ *
+ * # Safety
+ * Valid handle and out pointer.
+ */
+enum ReplicantSyncResult replicant_count_pending_sync(struct Replicant *handle,
+                                                      uint64_t *out_count);
+
+/**
+ * # Safety
+ * `handle` must be valid or null.
+ */
+bool replicant_is_connected(struct Replicant *handle);
+
+/**
+ * Connection, sync phase and halt reason, for a status indicator. Set
+ * `out_state->struct_size = sizeof(ReplicantState)` first.
+ *
+ * # Safety
+ * Valid handle and out pointer.
+ */
+enum ReplicantSyncResult replicant_get_state(struct Replicant *handle,
+                                             struct ReplicantState *out_state);
+
+/**
+ * Leaves `Halted` or retries now. Safe to call repeatedly: the engine dials at most once a second.
+ *
+ * # Safety
+ * Valid handle.
+ */
+enum ReplicantSyncResult replicant_reconnect(struct Replicant *handle);
+
+/**
+ * The data dir's user id (provisional until the first join).
+ *
+ * # Safety
+ * Valid handle and out pointer; free the result with `replicant_string_free`.
+ */
+enum ReplicantSyncResult replicant_get_user_id(struct Replicant *handle, char **out_user_id);
+
+/**
+ * # Safety
+ * Valid handle and C string (a JSON array of JSON paths, e.g. `["$.body"]`).
+ */
+enum ReplicantSyncResult replicant_configure_search(struct Replicant *handle,
+                                                    const char *paths_json);
+
+/**
+ * FTS5 query (`music`, `tun*`, `"a phrase"`, `a AND b`, `title:word`); `limit` 0 means 100.
+ *
+ * # Safety
+ * Valid handle, C string and out pointer; free the result with `replicant_string_free`.
+ */
+enum ReplicantSyncResult replicant_search_documents(struct Replicant *handle,
+                                                    const char *query,
+                                                    uint32_t limit,
+                                                    char **out_json);
+
+/**
+ * # Safety
+ * Valid handle.
+ */
+enum ReplicantSyncResult replicant_rebuild_search_index(struct Replicant *handle);
+
+/**
+ * `event_filter`: -1 every document event, 1 `DocumentChanged` only, 2 `DocumentDeleted` only.
+ * The first registration on a handle fixes the thread that must call `replicant_process_events`.
+ *
+ * # Safety
+ * Valid handle; `context` must outlive the handle.
+ */
+enum ReplicantSyncResult replicant_register_document_callback(struct Replicant *handle,
                                                               DocumentEventCallback callback,
                                                               void *context,
                                                               int32_t event_filter);
 
 /**
- * Register a callback for sync events (Started, Completed)
- *
- * # Arguments
- * * `engine` - Sync engine instance
- * * `callback` - C callback function to invoke for sync events
- * * `context` - User-defined context pointer passed to callback
- *
- * # Returns
- * * SyncResult indicating success or failure
+ * `SyncStarted`, `SyncCompleted`, `DatabaseChanged` and `IdentityAdopted`.
  *
  * # Safety
- * Caller must ensure engine is valid, callback is a valid function pointer, and context pointer outlives the callback registration
+ * Valid handle; `context` must outlive the handle.
  */
-enum ReplicantSyncResult replicant_register_sync_callback(struct Replicant *engine,
+enum ReplicantSyncResult replicant_register_sync_callback(struct Replicant *handle,
                                                           SyncEventCallback callback,
                                                           void *context);
 
 /**
- * Register a callback for error events (SyncError)
- *
- * # Arguments
- * * `engine` - Sync engine instance
- * * `callback` - C callback function to invoke for error events
- * * `context` - User-defined context pointer passed to callback
- *
- * # Returns
- * * SyncResult indicating success or failure
- *
  * # Safety
- * Caller must ensure engine is valid, callback is a valid function pointer, and context pointer outlives the callback registration
+ * Valid handle; `context` must outlive the handle.
  */
-enum ReplicantSyncResult replicant_register_error_callback(struct Replicant *engine,
+enum ReplicantSyncResult replicant_register_error_callback(struct Replicant *handle,
                                                            ErrorEventCallback callback,
                                                            void *context);
 
 /**
- * Register a callback for connection events (Lost, Attempted, Succeeded)
- *
- * # Arguments
- * * `engine` - Sync engine instance
- * * `callback` - C callback function to invoke for connection events
- * * `context` - User-defined context pointer passed to callback
- *
- * # Returns
- * * SyncResult indicating success or failure
- *
  * # Safety
- * Caller must ensure engine is valid, callback is a valid function pointer, and context pointer outlives the callback registration
+ * Valid handle; `context` must outlive the handle.
  */
-enum ReplicantSyncResult replicant_register_connection_callback(struct Replicant *engine,
+enum ReplicantSyncResult replicant_register_connection_callback(struct Replicant *handle,
                                                                 ConnectionEventCallback callback,
                                                                 void *context);
 
 /**
- * Register a callback for conflict events (ConflictDetected)
- *
- * # Arguments
- * * `engine` - Sync engine instance
- * * `callback` - C callback function to invoke for conflict events
- * * `context` - User-defined context pointer passed to callback
- *
- * # Returns
- * * SyncResult indicating success or failure
- *
  * # Safety
- * Caller must ensure engine is valid, callback is a valid function pointer, and context pointer outlives the callback registration
+ * Valid handle; `context` must outlive the handle.
  */
-enum ReplicantSyncResult replicant_register_conflict_callback(struct Replicant *engine,
+enum ReplicantSyncResult replicant_register_conflict_callback(struct Replicant *handle,
                                                               ConflictEventCallback callback,
                                                               void *context);
 
 /**
- * Register a callback for IdentityChanged events
- *
- * # Arguments
- * * `engine` - Sync engine instance
- * * `callback` - Function to call when the server-authoritative id is adopted
- * * `context` - User-defined context pointer passed to callback
- *
- * # Returns
- * * SyncResult indicating success or failure
+ * Runs the callbacks for every queued event. Must be called on the thread that registered
+ * the callbacks: refused with `ErrorWrongThread` elsewhere and `ErrorNoCallbacks` before any
+ * registration; nothing is lost either way. The thread cannot be changed later. A
+ * `replicant_destroy` of this handle from inside a callback frees it when this call returns;
+ * the rest of the batch is not delivered. No rebind: if the registering thread ends, register
+ * again on a new handle.
  *
  * # Safety
- * Caller must ensure engine is valid, callback is a valid function pointer, and context pointer outlives the callback registration
+ * Valid handle; `out_processed_count` may be null.
  */
-enum ReplicantSyncResult replicant_register_identity_callback(struct Replicant *engine,
-                                                              IdentityEventCallback callback,
-                                                              void *context);
-
-/**
- * Process all queued events on the current thread
- *
- * # Arguments
- * * `engine` - Sync engine instance
- * * `out_processed_count` - Output pointer for number of events processed (optional)
- *
- * # Returns
- * * CSyncResult indicating success or failure
- *
- * # Important
- * This function MUST be called on the same thread where callbacks were registered.
- * Events are queued from any thread but only processed on the callback thread.
- *
- * # Safety
- * Caller must ensure engine is valid and out_processed_count points to valid memory (if not null)
- */
-enum ReplicantSyncResult replicant_process_events(struct Replicant *engine,
+enum ReplicantSyncResult replicant_process_events(struct Replicant *handle,
                                                   uint32_t *out_processed_count);
 
 /**
- * Get a document by ID
- *
- * # Arguments
- * * `engine` - Sync engine instance
- * * `document_id` - Document ID as UUID string
- * * `out_content` - Output pointer for document JSON content (caller must free with replicant_string_free)
- *
- * # Returns
- * * SyncResult::Success if document found and content returned
- * * SyncResult::ErrorInvalidInput if document not found or invalid ID
- *
  * # Safety
- * Caller must ensure engine is valid, document_id is a valid C string, and out_content is a valid pointer
+ * `s` must come from this library and not be freed twice.
  */
-enum ReplicantSyncResult replicant_get_document(struct Replicant *engine,
-                                                const char *document_id,
-                                                char **out_content);
+void replicant_string_free(char *s);
 
-/**
- * Get all documents as a JSON array
- *
- * # Arguments
- * * `engine` - Sync engine instance
- * * `out_documents` - Output pointer for JSON array of documents (caller must free with replicant_string_free)
- *
- * # Returns
- * * SyncResult::Success with JSON array (empty array [] if no documents)
- *
- * # Safety
- * Caller must ensure engine is valid and out_documents is a valid pointer
- */
-enum ReplicantSyncResult replicant_get_all_documents(struct Replicant *engine,
-                                                     char **out_documents);
-
-/**
- * Get all document ids as a JSON array
- *
- * # Arguments
- * * `engine` - Sync engine instance
- * * `include_deleted` - If true, include tombstoned (deleted) documents
- * * `out_ids` - Output pointer for JSON array of id strings (caller must free with replicant_string_free)
- *
- * # Returns
- * * SyncResult::Success with JSON array (empty array [] if no documents)
- *
- * # Safety
- * Caller must ensure engine is valid and out_ids is a valid pointer
- */
-enum ReplicantSyncResult replicant_get_all_document_ids(struct Replicant *engine,
-                                                        bool include_deleted,
-                                                        char **out_ids);
-
-/**
- * Get the count of local documents
- *
- * # Arguments
- * * `engine` - Sync engine instance
- * * `out_count` - Output pointer for document count
- *
- * # Returns
- * * SyncResult::Success with count written to out_count
- *
- * # Safety
- * Caller must ensure engine is valid and out_count is a valid pointer
- */
-enum ReplicantSyncResult replicant_count_documents(struct Replicant *engine, uint64_t *out_count);
-
-/**
- * Check if the sync engine is connected to the server
- *
- * # Arguments
- * * `engine` - Sync engine instance
- *
- * # Returns
- * * true if connected, false if disconnected or engine is null
- *
- * # Safety
- * Caller must ensure engine was created by replicant_create
- */
-bool replicant_is_connected(struct Replicant *engine);
-
-/**
- * Get the count of documents pending sync to server
- *
- * # Arguments
- * * `engine` - Sync engine instance
- * * `out_count` - Output pointer for pending document count
- *
- * # Returns
- * * SyncResult::Success with count written to out_count
- *
- * # Safety
- * Caller must ensure engine is valid and out_count is a valid pointer
- */
-enum ReplicantSyncResult replicant_count_pending_sync(struct Replicant *engine,
-                                                      uint64_t *out_count);
-
-/**
- * Configure which JSON paths to index for full-text search
- *
- * # Arguments
- * * `engine` - Replicant client instance
- * * `paths_json` - JSON array of JSON paths to index (e.g., '["$.body", "$.notes"]')
- *
- * # Returns
- * * SyncResult::Success if configuration succeeded
- * * SyncResult::ErrorInvalidInput if paths_json is invalid
- * * SyncResult::ErrorDatabase if index rebuild fails
- *
- * # Note
- * This replaces any existing configuration and rebuilds the search index.
- *
- * # Safety
- * Caller must ensure engine is valid and paths_json is a valid C string
- */
-enum ReplicantSyncResult replicant_configure_search(struct Replicant *engine,
-                                                    const char *paths_json);
-
-/**
- * Search documents using FTS5 full-text search
- *
- * # Arguments
- * * `engine` - Replicant client instance
- * * `query` - FTS5 query string (e.g., "music", "tun*", "\"exact phrase\"")
- * * `limit` - Maximum number of results (0 for default of 100)
- * * `out_documents` - Output pointer for JSON array of matching documents
- *
- * # Returns
- * * SyncResult::Success with JSON array in out_documents
- * * SyncResult::ErrorInvalidInput if query is invalid
- * * SyncResult::ErrorDatabase if search fails
- *
- * # FTS5 Query Syntax
- * * Simple terms: "music" matches documents containing "music"
- * * Prefix: "tun*" matches "tuning", "tune", etc.
- * * Phrase: "\"equal temperament\"" matches exact phrase
- * * Boolean: "music AND theory", "piano OR keyboard"
- * * Column filter: "title:beethoven" searches only title field
- *
- * # Safety
- * Caller must ensure engine is valid, query is a valid C string,
- * and out_documents is a valid pointer. Caller must free result with replicant_string_free.
- */
-enum ReplicantSyncResult replicant_search_documents(struct Replicant *engine,
-                                                    const char *query,
-                                                    uint32_t limit,
-                                                    char **out_documents);
-
-/**
- * Rebuild the full-text search index
- *
- * # Arguments
- * * `engine` - Replicant client instance
- *
- * # Returns
- * * SyncResult::Success if rebuild succeeded
- * * SyncResult::ErrorDatabase if rebuild fails
- *
- * # Note
- * This is called automatically by replicant_configure_search, but can be
- * called manually if needed (e.g., after bulk document imports).
- *
- * # Safety
- * Caller must ensure engine is valid
- */
-enum ReplicantSyncResult replicant_rebuild_search_index(struct Replicant *engine);
+char *replicant_get_version(void);
 
 /**
  * Requests an enrollment token be emailed to `email`. Standalone HTTP call
@@ -908,68 +685,29 @@ enum ReplicantSyncResult replicant_load_credentials(const char *data_dir,
                                                     uintptr_t user_id_cap);
 
 /**
- * Stores credentials to `data_dir` (encrypted at rest). `user_id` is the
- * canonical id delivered by enrollment claim (36-char UUID string); a nil or
- * unparseable id is rejected — credentials are never stored without a real
- * identity.
+ * Stores credentials in `data_dir` (encrypted at rest) and tells this process's engines on
+ * that data dir. `email` (may be null; `""` counts as none) signs joins; `user_id` must be a
+ * real UUID.
  *
  * # Safety
- * All pointers must be valid, non-null C strings.
+ * Valid C strings; `email` may be null.
  */
 enum ReplicantSyncResult replicant_store_credentials(const char *data_dir,
+                                                     const char *email,
                                                      const char *api_key,
                                                      const char *secret,
                                                      const char *user_id);
 
 /**
- * Clears any stored credentials in `data_dir`.
+ * Removes the stored credentials (sign-out) and tells this process's engines on `data_dir`:
+ * they halt as not enrolled and never join with the removed credentials. An engine in another
+ * process ends its live connection within about a second and never joins with the removed
+ * credentials.
  *
  * # Safety
- * `data_dir` must be a valid, non-null C string.
+ * Valid C string.
  */
 enum ReplicantSyncResult replicant_clear_credentials(const char *data_dir);
-
-/**
- * Trigger a test event (for development/testing purposes)
- *
- * # Arguments
- * * `engine` - Replicant client instance
- * * `event_type` - Event type to emit (0-7)
- *
- * # Returns
- * * SyncResult indicating success or failure
- *
- * # Event Types
- * * 0 - DocumentCreated
- * * 1 - DocumentUpdated
- * * 2 - DocumentDeleted
- * * 3 - SyncStarted
- * * 4 - SyncCompleted
- * * 5 - SyncError
- * * 6 - ConflictDetected
- * * 7 - ConnectionLost
- * * 8 - ConnectionAttempted
- * * 9 - ConnectionSucceeded
- *
- * # Safety
- * Caller must ensure engine is a valid pointer
- */
-enum ReplicantSyncResult replicant_emit_test_event(struct Replicant *engine, int32_t event_type);
-
-/**
- * Trigger multiple test events in sequence (for stress testing callbacks)
- *
- * # Arguments
- * * `engine` - Replicant client instance
- * * `count` - Number of events to emit (1-100)
- *
- * # Returns
- * * SyncResult indicating success or failure
- *
- * # Safety
- * Caller must ensure engine is a valid pointer
- */
-enum ReplicantSyncResult replicant_emit_test_event_burst(struct Replicant *engine, int32_t count);
 
 #ifdef __cplusplus
 } // extern "C"

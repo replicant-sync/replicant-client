@@ -1,1775 +1,598 @@
-//! Event callback system for the sync client
-//!
-//! This module provides a thread-safe event system that allows applications to receive
-//! real-time notifications about document changes, sync operations, and connection status.
-//!
-//! # Key Features
-//!
-//! - **Thread-Safe Design**: Events can be generated from any thread but callbacks are
-//!   only invoked on the thread that registered them
-//! - **Type-Specific Callbacks**: Separate callback types for documents, sync, errors,
-//!   connections, and conflicts
-//! - **Event Filtering**: Subscribe to specific event types or all events within a category
-//! - **Context Passing**: Pass application context data to callbacks
-//! - **Offline/Online Events**: Receive events for both local and synchronized operations
-//!
-//! # Callback Types
-//!
-//! - `DocumentEventCallback`: DocumentCreated, DocumentUpdated, DocumentDeleted
-//! - `SyncEventCallback`: SyncStarted, SyncCompleted
-//! - `ErrorEventCallback`: SyncError
-//! - `ConnectionEventCallback`: ConnectionLost, ConnectionAttempted, ConnectionSucceeded
-//! - `ConflictEventCallback`: ConflictDetected
-//!
-//! # Thread Safety
-//!
-//! The event system uses a single-thread callback model:
-//! 1. Events can be generated from any thread
-//! 2. Events are queued for processing
-//! 3. Callbacks are only invoked when `process_events()` is called
-//! 4. All callbacks execute on the thread that registered them
-//!
-//! This design eliminates the need for complex synchronization in user code.
+//! Host callbacks. The first registration fixes the thread that must run them; events wait in
+//! the handle's queue until `replicant_process_events` is called on that thread.
 
-use crate::error_code::ReplicantErrorCode;
-use replicant_core::{errors::ClientError, SyncResult};
 use std::ffi::{c_char, c_void, CString};
-use std::sync::{mpsc, Mutex};
+use std::ptr;
+use std::sync::Mutex;
 use std::thread::{self, ThreadId};
-use uuid::Uuid;
 
-/// Event types that can be emitted by the sync client
+use crate::error_code::error_code_for;
+use crate::host::{lock, HostEvent, Origin};
+
+/// cbindgen:prefix-with-name
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventType {
-    /// A new document was created.
-    ///
-    /// Fires for THIS client's own `create_document` call as well as for a
-    /// document that arrived from the server. Check the event's origin before
-    /// treating it as a change made elsewhere.
-    DocumentCreated = 0,
-    /// An existing document was updated.
-    ///
-    /// Fires for THIS client's own `update_document` call as well as for a
-    /// patch applied from the server. Check the event's origin before treating
-    /// it as a change made elsewhere.
-    DocumentUpdated = 1,
-    /// A document was deleted.
-    ///
-    /// Fires for THIS client's own `delete_document` call as well as for a
-    /// deletion applied from the server. Check the event's origin before
-    /// treating it as a change made elsewhere.
+    /// A document was created or changed; `EventOrigin` says by whom.
+    DocumentChanged = 1,
     DocumentDeleted = 2,
-    /// Synchronization process started
     SyncStarted = 3,
-    /// Synchronization completed successfully
+    /// Every subscribed scope caught up, once per connection. Not a promise that uploads are done.
     SyncCompleted = 4,
-    /// An error occurred during synchronization
     SyncError = 5,
-    /// A conflict was detected between document versions
+    /// Local content was set aside in Kept copies.
     ConflictDetected = 6,
-    /// Connection to server was lost
     ConnectionLost = 7,
-    /// A connection attempt was made to the server
     ConnectionAttempted = 8,
-    /// Successfully connected to the server
     ConnectionSucceeded = 9,
-    /// The server-authoritative user id was adopted, replacing the local one
-    IdentityChanged = 10,
+    /// Changes were trimmed before this engine read them, or this handle fell more than 4096
+    /// events behind: reload every list.
+    DatabaseChanged = 11,
+    /// The data dir adopted the signed-in account's user id and restamped its documents:
+    /// re-read `replicant_get_user_id` and reload lists. On the sync callback.
+    IdentityAdopted = 12,
 }
 
-/// Where a document event came from.
-///
-/// Document events are emitted for this client's own writes as well as for
-/// changes applied from the server, and the rest of the payload cannot tell the
-/// two apart: `user_id` is the document owner, not the writer, and delivery is
-/// asynchronous. Consumers that only care about changes made elsewhere should
-/// ignore `Local` events.
+/// cbindgen:prefix-with-name
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventOrigin {
-    /// This client wrote the document itself.
+    /// A handle of this engine wrote it (this process, this copy of the library): another
+    /// handle's write on the same engine is `Local` too.
     Local = 0,
-    /// The change was applied from the server: a broadcast from another client
-    /// or instance, or a sync pass.
+    /// Sync wrote it: a download, a settle, a conflict revert or a sweep, in any process.
     Remote = 1,
+    /// Another process, or another copy of the library in this process, on the same data dir.
+    OtherProcess = 2,
 }
 
-// =============================================================================
-// Rust-Native Event Types
-// =============================================================================
-
-/// Rust-native event enum with typed variants
-///
-/// This provides an idiomatic Rust interface for event handling, with each variant
-/// containing only the relevant data for that event type.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use replicant_client::events::{EventDispatcher, SyncEvent};
-///
-/// let dispatcher = EventDispatcher::new();
-///
-/// dispatcher.register_rust_callback(|event| {
-///     match event {
-///         SyncEvent::DocumentCreated { id, title, .. } => {
-///             println!("Created: {} - {}", id, title);
-///         }
-///         SyncEvent::SyncCompleted { document_count } => {
-///             println!("Synced {} documents", document_count);
-///         }
-///         _ => {}
-///     }
-/// }).unwrap();
-/// ```
-#[derive(Debug, Clone)]
-pub enum SyncEvent {
-    /// A new document was created, locally or from sync (see `origin`)
-    DocumentCreated {
-        id: String,
-        title: String,
-        content: serde_json::Value,
-        user_id: Option<String>,
-        author_name: Option<String>,
-        visibility: Option<String>,
-        origin: EventOrigin,
-    },
-    /// An existing document was updated, locally or from sync (see `origin`)
-    DocumentUpdated {
-        id: String,
-        title: String,
-        content: serde_json::Value,
-        user_id: Option<String>,
-        author_name: Option<String>,
-        visibility: Option<String>,
-        origin: EventOrigin,
-    },
-    /// A document was deleted, locally or from sync (see `origin`)
-    DocumentDeleted { id: String, origin: EventOrigin },
-    /// Synchronization started
-    SyncStarted,
-    /// Synchronization completed
-    SyncCompleted { document_count: u64 },
-    /// A sync error occurred
-    SyncError {
-        code: ReplicantErrorCode,
-        message: String,
-    },
-    /// A conflict was detected
-    ConflictDetected {
-        document_id: String,
-        winning_content: Option<String>,
-        losing_content: Option<String>,
-    },
-    /// Connection to server was lost
-    ConnectionLost { server_url: String },
-    /// A connection attempt was made
-    ConnectionAttempted { server_url: String },
-    /// Successfully connected to server
-    ConnectionSucceeded { server_url: String },
-    /// The server-authoritative user id was adopted, replacing the local one
-    IdentityChanged {
-        old_user_id: String,
-        new_user_id: String,
-        email: String,
-    },
-}
-
-impl SyncEvent {
-    /// Get the event type for this event
-    pub fn event_type(&self) -> EventType {
-        match self {
-            SyncEvent::DocumentCreated { .. } => EventType::DocumentCreated,
-            SyncEvent::DocumentUpdated { .. } => EventType::DocumentUpdated,
-            SyncEvent::DocumentDeleted { .. } => EventType::DocumentDeleted,
-            SyncEvent::SyncStarted => EventType::SyncStarted,
-            SyncEvent::SyncCompleted { .. } => EventType::SyncCompleted,
-            SyncEvent::SyncError { .. } => EventType::SyncError,
-            SyncEvent::ConflictDetected { .. } => EventType::ConflictDetected,
-            SyncEvent::ConnectionLost { .. } => EventType::ConnectionLost,
-            SyncEvent::ConnectionAttempted { .. } => EventType::ConnectionAttempted,
-            SyncEvent::ConnectionSucceeded { .. } => EventType::ConnectionSucceeded,
-            SyncEvent::IdentityChanged { .. } => EventType::IdentityChanged,
-        }
-    }
-
-    /// Convert from internal QueuedEvent to SyncEvent
-    fn from_queued(event: &QueuedEvent) -> Self {
-        match event.event_type {
-            EventType::DocumentCreated => SyncEvent::DocumentCreated {
-                id: event.document_id.clone().unwrap_or_default(),
-                title: event
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| "Untitled".to_string()),
-                content: event
-                    .content
-                    .as_ref()
-                    .and_then(|c| serde_json::from_str(c).ok())
-                    .unwrap_or(serde_json::Value::Null),
-                user_id: event.user_id.clone(),
-                author_name: event.author_name.clone(),
-                visibility: event.visibility.clone(),
-                origin: event.origin,
-            },
-            EventType::DocumentUpdated => SyncEvent::DocumentUpdated {
-                id: event.document_id.clone().unwrap_or_default(),
-                title: event
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| "Untitled".to_string()),
-                content: event
-                    .content
-                    .as_ref()
-                    .and_then(|c| serde_json::from_str(c).ok())
-                    .unwrap_or(serde_json::Value::Null),
-                user_id: event.user_id.clone(),
-                author_name: event.author_name.clone(),
-                visibility: event.visibility.clone(),
-                origin: event.origin,
-            },
-            EventType::DocumentDeleted => SyncEvent::DocumentDeleted {
-                id: event.document_id.clone().unwrap_or_default(),
-                origin: event.origin,
-            },
-            EventType::SyncStarted => SyncEvent::SyncStarted,
-            EventType::SyncCompleted => SyncEvent::SyncCompleted {
-                document_count: event.numeric_data,
-            },
-            EventType::SyncError => SyncEvent::SyncError {
-                code: event.error_code,
-                message: event
-                    .error
-                    .clone()
-                    .unwrap_or_else(|| "Unknown error".to_string()),
-            },
-            EventType::ConflictDetected => SyncEvent::ConflictDetected {
-                document_id: event.document_id.clone().unwrap_or_default(),
-                winning_content: event.content.clone(),
-                losing_content: event.error.clone(),
-            },
-            EventType::ConnectionLost => SyncEvent::ConnectionLost {
-                server_url: event.title.clone().unwrap_or_default(),
-            },
-            EventType::ConnectionAttempted => SyncEvent::ConnectionAttempted {
-                server_url: event.title.clone().unwrap_or_default(),
-            },
-            EventType::ConnectionSucceeded => SyncEvent::ConnectionSucceeded {
-                server_url: event.title.clone().unwrap_or_default(),
-            },
-            EventType::IdentityChanged => SyncEvent::IdentityChanged {
-                old_user_id: event.document_id.clone().unwrap_or_default(),
-                new_user_id: event.user_id.clone().unwrap_or_default(),
-                email: event.title.clone().unwrap_or_default(),
-            },
+impl From<Origin> for EventOrigin {
+    fn from(origin: Origin) -> Self {
+        match origin {
+            Origin::Local => EventOrigin::Local,
+            Origin::Server => EventOrigin::Remote,
+            Origin::OtherProcess => EventOrigin::OtherProcess,
         }
     }
 }
 
-// =============================================================================
-// Type-Specific Callback Types (C FFI)
-// =============================================================================
+/// `DocumentChanged` / `DocumentDeleted`. For a deletion only `document_id` is set.
+/// `visibility` is `public` (curated or read-only) or `private`.
+/// Strings are valid only during the call; copy what you keep.
+pub type DocumentEventCallback = Option<
+    extern "C" fn(
+        event_type: EventType,
+        document_id: *const c_char,
+        title: *const c_char,
+        content: *const c_char,
+        owner_id: *const c_char,
+        author_id: *const c_char,
+        visibility: *const c_char,
+        read_only: bool,
+        origin: EventOrigin,
+        context: *mut c_void,
+    ),
+>;
 
-/// Document event callback for DocumentCreated, DocumentUpdated, DocumentDeleted
-///
-/// Fires for this client's OWN writes as well as for changes applied from the
-/// server. Check `origin` before treating an event as a change made elsewhere.
-///
-/// # Parameters
-/// * `event_type` - The specific document event type
-/// * `document_id` - UUID of the document (always non-null)
-/// * `title` - Document title (null for Deleted events)
-/// * `content` - Full document JSON (null for Deleted events)
-/// * `user_id` - Owner UUID (null if unknown)
-/// * `author_name` - Author display name (null if unknown)
-/// * `visibility` - "private"/"public" (null if unknown)
-/// * `origin` - `Local` if this client wrote the document, `Remote` if the
-///   change was applied from the server
-/// * `context` - User-defined context pointer
-pub type DocumentEventCallback = extern "C" fn(
+/// `DocumentEventCallback` once registered (never null).
+type DocumentFn = extern "C" fn(
     event_type: EventType,
     document_id: *const c_char,
     title: *const c_char,
     content: *const c_char,
-    user_id: *const c_char,
-    author_name: *const c_char,
+    owner_id: *const c_char,
+    author_id: *const c_char,
     visibility: *const c_char,
+    read_only: bool,
     origin: EventOrigin,
     context: *mut c_void,
 );
 
-/// Sync event callback for SyncStarted, SyncCompleted
-///
-/// # Parameters
-/// * `event_type` - SyncStarted or SyncCompleted
-/// * `document_count` - Number of documents synced (0 for SyncStarted)
-/// * `context` - User-defined context pointer
-pub type SyncEventCallback =
-    extern "C" fn(event_type: EventType, document_count: u64, context: *mut c_void);
+/// `SyncStarted`, `SyncCompleted`, `DatabaseChanged`, `IdentityAdopted`.
+/// Strings are valid only during the call; copy what you keep.
+pub type SyncEventCallback = Option<extern "C" fn(event_type: EventType, context: *mut c_void)>;
 
-/// Error event callback for SyncError
-///
-/// # Parameters
-/// * `event_type` - Always SyncError
-/// * `error_code` - Stable `ReplicantErrorCode` value; use
-///   `replicant_error_is_credential_rejection` to decide whether to clear the
-///   stored credential
-/// * `error` - Error message (always non-null)
-/// * `context` - User-defined context pointer
-pub type ErrorEventCallback = extern "C" fn(
+/// `SyncEventCallback` once registered (never null).
+type SyncFn = extern "C" fn(event_type: EventType, context: *mut c_void);
+
+/// `error_code` is a `ReplicantErrorCode`; `error` is the protocol code, e.g. "clock_skew";
+/// `document_id` is null unless the error is about one document; `fatal` means halted;
+/// `recovered_id` names local content kept aside with the error, -1 if none.
+/// Raised only by the engine (process) that applied the rule; another process sees just
+/// `DocumentChanged`. `replicant_list_recovered` is the durable record. `recovered_id` may
+/// already be dismissed or restored by another process: `restore_*` then returns `ErrorNotFound`.
+/// Strings are valid only during the call; copy what you keep.
+pub type ErrorEventCallback = Option<
+    extern "C" fn(
+        event_type: EventType,
+        error_code: i32,
+        error: *const c_char,
+        document_id: *const c_char,
+        fatal: bool,
+        recovered_id: i64,
+        context: *mut c_void,
+    ),
+>;
+
+/// `ErrorEventCallback` once registered (never null).
+type ErrorFn = extern "C" fn(
     event_type: EventType,
     error_code: i32,
     error: *const c_char,
+    document_id: *const c_char,
+    fatal: bool,
+    recovered_id: i64,
     context: *mut c_void,
 );
 
-/// Connection event callback for ConnectionLost, ConnectionAttempted, ConnectionSucceeded
-///
-/// # Parameters
-/// * `event_type` - The connection event type
-/// * `connected` - true if connected (valid for Lost/Succeeded), false otherwise
-/// * `attempt_number` - Reconnection attempt number (valid for ConnectionAttempted)
-/// * `context` - User-defined context pointer
-pub type ConnectionEventCallback = extern "C" fn(
+/// `attempt_number` counts dials since the last successful connection.
+/// Strings are valid only during the call; copy what you keep.
+pub type ConnectionEventCallback = Option<
+    extern "C" fn(
+        event_type: EventType,
+        connected: bool,
+        attempt_number: u32,
+        context: *mut c_void,
+    ),
+>;
+
+/// `ConnectionEventCallback` once registered (never null).
+type ConnectionFn = extern "C" fn(
     event_type: EventType,
     connected: bool,
     attempt_number: u32,
     context: *mut c_void,
 );
 
-/// Conflict event callback for ConflictDetected
-///
-/// # Parameters
-/// * `event_type` - Always ConflictDetected
-/// * `document_id` - UUID of the conflicted document (always non-null)
-/// * `winning_content` - Content of the winning version (always non-null)
-/// * `losing_content` - Content of the losing version (may be null)
-/// * `context` - User-defined context pointer
-pub type ConflictEventCallback = extern "C" fn(
+/// `reason`: `conflict`, `field_conflict`, `delete_wins` or `delete_superseded` (a delete undone
+/// because a newer version arrived). `recovered_id` is the Kept copies id, -1 if none.
+/// `paths_json` is a JSON array of JSON Pointers for `field_conflict`, else null.
+/// Raised only by the engine (process) that applied the rule; another process sees just
+/// `DocumentChanged`. `replicant_list_recovered` is the durable record. `recovered_id` may
+/// already be dismissed or restored by another process: `restore_*` then returns `ErrorNotFound`.
+/// Strings are valid only during the call; copy what you keep.
+pub type ConflictEventCallback = Option<
+    extern "C" fn(
+        event_type: EventType,
+        document_id: *const c_char,
+        reason: *const c_char,
+        recovered_id: i64,
+        paths_json: *const c_char,
+        context: *mut c_void,
+    ),
+>;
+
+/// `ConflictEventCallback` once registered (never null).
+type ConflictFn = extern "C" fn(
     event_type: EventType,
     document_id: *const c_char,
-    winning_content: *const c_char,
-    losing_content: *const c_char,
+    reason: *const c_char,
+    recovered_id: i64,
+    paths_json: *const c_char,
     context: *mut c_void,
 );
 
-/// Identity event callback for IdentityChanged
-///
-/// # Parameters
-/// * `event_type` - Always IdentityChanged
-/// * `old_user_id` - The provisional/previous user id (always non-null)
-/// * `new_user_id` - The adopted canonical user id (always non-null)
-/// * `email` - The email the server resolved the id from (may be empty)
-/// * `context` - User-defined context pointer
-pub type IdentityEventCallback = extern "C" fn(
-    event_type: EventType,
-    old_user_id: *const c_char,
-    new_user_id: *const c_char,
-    email: *const c_char,
-    context: *mut c_void,
-);
-
-// =============================================================================
-// Callback Entry Types (Internal)
-// =============================================================================
-
-struct DocumentCallbackEntry {
-    callback: DocumentEventCallback,
-    context: *mut c_void,
-    event_filter: Option<EventType>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchError {
+    NoCallbacks,
+    WrongThread,
 }
 
-struct SyncCallbackEntry {
-    callback: SyncEventCallback,
+#[derive(Clone, Copy)]
+struct Registered<F> {
+    callback: F,
     context: *mut c_void,
 }
 
-struct ErrorCallbackEntry {
-    callback: ErrorEventCallback,
-    context: *mut c_void,
+#[derive(Clone, Default)]
+struct Callbacks {
+    thread: Option<ThreadId>,
+    document: Vec<(Registered<DocumentFn>, Option<EventType>)>,
+    sync: Vec<Registered<SyncFn>>,
+    error: Vec<Registered<ErrorFn>>,
+    connection: Vec<Registered<ConnectionFn>>,
+    conflict: Vec<Registered<ConflictFn>>,
 }
 
-struct ConnectionCallbackEntry {
-    callback: ConnectionEventCallback,
-    context: *mut c_void,
-}
+// The contexts are only ever passed back to callbacks on the registering thread.
+unsafe impl Send for Callbacks {}
 
-struct ConflictCallbackEntry {
-    callback: ConflictEventCallback,
-    context: *mut c_void,
-}
+#[derive(Default)]
+pub struct Dispatcher(Mutex<Callbacks>);
 
-struct IdentityCallbackEntry {
-    callback: IdentityEventCallback,
-    context: *mut c_void,
-}
-
-// Safety: Callback entries are only accessed from the registered thread
-unsafe impl Send for DocumentCallbackEntry {}
-unsafe impl Sync for DocumentCallbackEntry {}
-unsafe impl Send for SyncCallbackEntry {}
-unsafe impl Sync for SyncCallbackEntry {}
-unsafe impl Send for ErrorCallbackEntry {}
-unsafe impl Sync for ErrorCallbackEntry {}
-unsafe impl Send for ConnectionCallbackEntry {}
-unsafe impl Sync for ConnectionCallbackEntry {}
-unsafe impl Send for ConflictCallbackEntry {}
-unsafe impl Sync for ConflictCallbackEntry {}
-unsafe impl Send for IdentityCallbackEntry {}
-unsafe impl Sync for IdentityCallbackEntry {}
-
-// =============================================================================
-// Rust Callback Entry (Internal)
-// =============================================================================
-
-struct RustCallbackEntry {
-    callback: Box<dyn Fn(SyncEvent) + Send>,
-    event_filter: Option<EventType>,
-}
-
-#[derive(Debug, Clone)]
-pub struct QueuedEvent {
-    event_type: EventType,
-    document_id: Option<String>,
-    title: Option<String>,
-    content: Option<String>,
-    error: Option<String>,
-    error_code: ReplicantErrorCode,
-    numeric_data: u64,
-    boolean_data: bool,
-    user_id: Option<String>,
-    author_name: Option<String>,
-    visibility: Option<String>,
-    origin: EventOrigin,
-}
-
-/// Thread-safe event dispatcher for managing callbacks and event processing
-///
-/// The EventDispatcher uses a single-thread callback model where events can be
-/// generated from any thread but callbacks are only invoked on the thread that
-/// registered them. This eliminates the need for complex synchronization in user code.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use replicant_client::events::{EventDispatcher, EventOrigin, EventType};
-/// use std::ffi::c_void;
-///
-/// // Define callback function
-/// extern "C" fn my_document_callback(
-///     event_type: EventType,
-///     document_id: *const std::ffi::c_char,
-///     title: *const std::ffi::c_char,
-///     content: *const std::ffi::c_char,
-///     user_id: *const std::ffi::c_char,
-///     author_name: *const std::ffi::c_char,
-///     visibility: *const std::ffi::c_char,
-///     origin: EventOrigin,
-///     _context: *mut c_void
-/// ) {
-///     println!("Document event: {:?}", event_type);
-/// }
-///
-/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
-/// let dispatcher = EventDispatcher::new();
-///
-/// // Register callback (sets callback thread to current thread)
-/// dispatcher.register_document_callback(my_document_callback, std::ptr::null_mut(), None)?;
-///
-/// // In main loop
-/// loop {
-///     let processed = dispatcher.process_events()?;
-///     // ... do other work
-/// #   break; // Exit loop for doctest
-/// }
-/// # Ok(())
-/// # }
-/// ```
-pub struct EventDispatcher {
-    // Type-specific C FFI callback storage
-    document_callbacks: Mutex<Vec<DocumentCallbackEntry>>,
-    sync_callbacks: Mutex<Vec<SyncCallbackEntry>>,
-    error_callbacks: Mutex<Vec<ErrorCallbackEntry>>,
-    connection_callbacks: Mutex<Vec<ConnectionCallbackEntry>>,
-    conflict_callbacks: Mutex<Vec<ConflictCallbackEntry>>,
-    identity_callbacks: Mutex<Vec<IdentityCallbackEntry>>,
-    // Rust-native callback storage
-    rust_callbacks: Mutex<Vec<RustCallbackEntry>>,
-    // Event queue
-    event_queue: Mutex<mpsc::Receiver<QueuedEvent>>,
-    event_sender: mpsc::Sender<QueuedEvent>,
-    callback_thread_id: Mutex<Option<ThreadId>>,
-}
-
-impl EventDispatcher {
-    pub fn new() -> Self {
-        let (sender, receiver) = mpsc::channel();
-        Self {
-            document_callbacks: Mutex::new(Vec::new()),
-            sync_callbacks: Mutex::new(Vec::new()),
-            error_callbacks: Mutex::new(Vec::new()),
-            connection_callbacks: Mutex::new(Vec::new()),
-            conflict_callbacks: Mutex::new(Vec::new()),
-            identity_callbacks: Mutex::new(Vec::new()),
-            rust_callbacks: Mutex::new(Vec::new()),
-            event_queue: Mutex::new(receiver),
-            event_sender: sender,
-            callback_thread_id: Mutex::new(None),
-        }
-    }
-
-    /// Helper to set callback thread ID on first registration
-    fn ensure_callback_thread(&self) -> SyncResult<()> {
-        let mut thread_id = self
-            .callback_thread_id
-            .lock()
-            .map_err(|_| ClientError::LockError("thread ID".into()))?;
-        if thread_id.is_none() {
-            *thread_id = Some(thread::current().id());
-            tracing::info!(
-                "Event callbacks will be processed on thread: {:?}",
-                thread::current().id()
-            );
-        }
-        Ok(())
-    }
-
-    /// Register a callback for document events (Created, Updated, Deleted)
-    ///
-    /// # Parameters
-    /// * `callback` - Function to call for document events
-    /// * `context` - User-defined context pointer passed to callback
-    /// * `event_filter` - Optional filter: DocumentCreated, DocumentUpdated, DocumentDeleted, or None for all
-    pub fn register_document_callback(
+impl Dispatcher {
+    /// `filter`: one of `DocumentChanged` / `DocumentDeleted`, or every document event.
+    pub fn register_document(
         &self,
-        callback: DocumentEventCallback,
+        callback: DocumentFn,
         context: *mut c_void,
-        event_filter: Option<EventType>,
-    ) -> SyncResult<()> {
-        self.ensure_callback_thread()?;
-
-        let mut callbacks = self
-            .document_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("document_callbacks".into()))?;
-
-        callbacks.push(DocumentCallbackEntry {
-            callback,
-            context,
-            event_filter,
-        });
-
-        Ok(())
-    }
-
-    /// Register a callback for sync events (Started, Completed)
-    ///
-    /// # Parameters
-    /// * `callback` - Function to call for sync events
-    /// * `context` - User-defined context pointer passed to callback
-    pub fn register_sync_callback(
-        &self,
-        callback: SyncEventCallback,
-        context: *mut c_void,
-    ) -> SyncResult<()> {
-        self.ensure_callback_thread()?;
-
-        let mut callbacks = self
-            .sync_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("sync_callbacks".into()))?;
-
-        callbacks.push(SyncCallbackEntry { callback, context });
-
-        Ok(())
-    }
-
-    /// Register a callback for error events (SyncError)
-    ///
-    /// # Parameters
-    /// * `callback` - Function to call for error events
-    /// * `context` - User-defined context pointer passed to callback
-    pub fn register_error_callback(
-        &self,
-        callback: ErrorEventCallback,
-        context: *mut c_void,
-    ) -> SyncResult<()> {
-        self.ensure_callback_thread()?;
-
-        let mut callbacks = self
-            .error_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("error_callbacks".into()))?;
-
-        callbacks.push(ErrorCallbackEntry { callback, context });
-
-        Ok(())
-    }
-
-    /// Register a callback for connection events (Lost, Attempted, Succeeded)
-    ///
-    /// # Parameters
-    /// * `callback` - Function to call for connection events
-    /// * `context` - User-defined context pointer passed to callback
-    pub fn register_connection_callback(
-        &self,
-        callback: ConnectionEventCallback,
-        context: *mut c_void,
-    ) -> SyncResult<()> {
-        self.ensure_callback_thread()?;
-
-        let mut callbacks = self
-            .connection_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("connection_callbacks".into()))?;
-
-        callbacks.push(ConnectionCallbackEntry { callback, context });
-
-        Ok(())
-    }
-
-    /// Register a callback for conflict events (ConflictDetected)
-    ///
-    /// # Parameters
-    /// * `callback` - Function to call for conflict events
-    /// * `context` - User-defined context pointer passed to callback
-    pub fn register_conflict_callback(
-        &self,
-        callback: ConflictEventCallback,
-        context: *mut c_void,
-    ) -> SyncResult<()> {
-        self.ensure_callback_thread()?;
-
-        let mut callbacks = self
-            .conflict_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("conflict_callbacks".into()))?;
-
-        callbacks.push(ConflictCallbackEntry { callback, context });
-
-        Ok(())
-    }
-
-    pub fn register_identity_callback(
-        &self,
-        callback: IdentityEventCallback,
-        context: *mut c_void,
-    ) -> SyncResult<()> {
-        self.ensure_callback_thread()?;
-
-        let mut callbacks = self
-            .identity_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("identity_callbacks".into()))?;
-
-        callbacks.push(IdentityCallbackEntry { callback, context });
-
-        Ok(())
-    }
-
-    /// Register a Rust-native callback for all events
-    ///
-    /// This provides an idiomatic Rust interface using the `SyncEvent` enum.
-    /// The callback receives typed event variants with only relevant data.
-    ///
-    /// # Parameters
-    /// * `callback` - Closure to call for events
-    ///
-    /// # Example
-    ///
-    /// ```rust,no_run
-    /// use replicant_client::events::{EventDispatcher, SyncEvent};
-    ///
-    /// let dispatcher = EventDispatcher::new();
-    ///
-    /// dispatcher.register_rust_callback(|event| {
-    ///     match event {
-    ///         SyncEvent::DocumentCreated { id, title, .. } => {
-    ///             println!("Document created: {} - {}", id, title);
-    ///         }
-    ///         SyncEvent::SyncCompleted { document_count } => {
-    ///             println!("Synced {} documents", document_count);
-    ///         }
-    ///         SyncEvent::ConnectionSucceeded { server_url } => {
-    ///             println!("Connected to {}", server_url);
-    ///         }
-    ///         _ => {}
-    ///     }
-    /// }).unwrap();
-    /// ```
-    pub fn register_rust_callback<F>(&self, callback: F) -> SyncResult<()>
-    where
-        F: Fn(SyncEvent) + Send + 'static,
-    {
-        self.ensure_callback_thread()?;
-
-        let mut callbacks = self
-            .rust_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("rust_callbacks".into()))?;
-
-        callbacks.push(RustCallbackEntry {
-            callback: Box::new(callback),
-            event_filter: None,
-        });
-
-        Ok(())
-    }
-
-    /// Register a Rust-native callback with event type filtering
-    ///
-    /// # Parameters
-    /// * `callback` - Closure to call for events
-    /// * `event_filter` - Only receive events of this type
-    pub fn register_rust_callback_filtered<F>(
-        &self,
-        callback: F,
-        event_filter: EventType,
-    ) -> SyncResult<()>
-    where
-        F: Fn(SyncEvent) + Send + 'static,
-    {
-        self.ensure_callback_thread()?;
-
-        let mut callbacks = self
-            .rust_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("rust_callbacks".into()))?;
-
-        callbacks.push(RustCallbackEntry {
-            callback: Box::new(callback),
-            event_filter: Some(event_filter),
-        });
-
-        Ok(())
-    }
-
-    /// Emit a document-created event for a write this client made itself.
-    pub fn emit_document_created(&self, document_id: &Uuid, content: &serde_json::Value) {
-        self.emit_document_created_with_attribution(
-            document_id,
-            content,
-            None,
-            None,
-            None,
-            EventOrigin::Local,
-        );
-    }
-
-    /// Emit a document-created event, carrying attribution (owner user_id, author_name,
-    /// visibility) alongside the document content.
-    ///
-    /// `origin` says whether this client wrote the document or the change was
-    /// applied from the server; consumers use it to ignore their own echoes.
-    pub fn emit_document_created_with_attribution(
-        &self,
-        document_id: &Uuid,
-        content: &serde_json::Value,
-        user_id: Option<&Uuid>,
-        author_name: Option<&str>,
-        visibility: Option<&str>,
-        origin: EventOrigin,
+        filter: Option<EventType>,
     ) {
-        // Extract title from content if present
-        let title = content
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Untitled");
-        self.queue_event(
-            EventType::DocumentCreated,
-            Some(document_id),
-            Some(title),
-            Some(content),
-            None,
-            0,
-            false,
-            user_id.map(|id| id.to_string()),
-            author_name.map(|s| s.to_string()),
-            visibility.map(|s| s.to_string()),
-            origin,
-        );
+        self.bind()
+            .document
+            .push((Registered { callback, context }, filter));
     }
 
-    /// Emit a document-updated event for a write this client made itself.
-    pub fn emit_document_updated(&self, document_id: &Uuid, content: &serde_json::Value) {
-        self.emit_document_updated_with_attribution(
-            document_id,
-            content,
-            None,
-            None,
-            None,
-            EventOrigin::Local,
-        );
+    pub fn register_sync(&self, callback: SyncFn, context: *mut c_void) {
+        self.bind().sync.push(Registered { callback, context });
     }
 
-    /// Emit a document-updated event, carrying attribution (owner user_id, author_name,
-    /// visibility) alongside the document content.
-    ///
-    /// `origin` says whether this client wrote the document or the change was
-    /// applied from the server; consumers use it to ignore their own echoes.
-    pub fn emit_document_updated_with_attribution(
+    pub fn register_error(&self, callback: ErrorFn, context: *mut c_void) {
+        self.bind().error.push(Registered { callback, context });
+    }
+
+    pub fn register_connection(&self, callback: ConnectionFn, context: *mut c_void) {
+        self.bind()
+            .connection
+            .push(Registered { callback, context });
+    }
+
+    pub fn register_conflict(&self, callback: ConflictFn, context: *mut c_void) {
+        self.bind().conflict.push(Registered { callback, context });
+    }
+
+    fn bind(&self) -> std::sync::MutexGuard<'_, Callbacks> {
+        let mut callbacks = lock(&self.0);
+        callbacks
+            .thread
+            .get_or_insert_with(|| thread::current().id());
+        callbacks
+    }
+
+    /// Runs the callbacks for the events `take` hands over, stopping early once `stop()` is
+    /// true; returns the number delivered. Refused, and nothing taken, before any registration
+    /// or off the registering thread.
+    pub fn process(
         &self,
-        document_id: &Uuid,
-        content: &serde_json::Value,
-        user_id: Option<&Uuid>,
-        author_name: Option<&str>,
-        visibility: Option<&str>,
-        origin: EventOrigin,
-    ) {
-        // Extract title from content if present
-        let title = content
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Untitled");
-        self.queue_event(
-            EventType::DocumentUpdated,
-            Some(document_id),
-            Some(title),
-            Some(content),
-            None,
-            0,
-            false,
-            user_id.map(|id| id.to_string()),
-            author_name.map(|s| s.to_string()),
-            visibility.map(|s| s.to_string()),
-            origin,
-        );
-    }
-
-    /// Emit a document-deleted event. `origin` says whether this client deleted
-    /// the document or the deletion was applied from the server.
-    pub fn emit_document_deleted(&self, document_id: &Uuid, origin: EventOrigin) {
-        self.queue_event(
-            EventType::DocumentDeleted,
-            Some(document_id),
-            None,
-            None,
-            None,
-            0,
-            false,
-            None,
-            None,
-            None,
-            origin,
-        );
-    }
-
-    pub fn emit_sync_started(&self) {
-        self.queue_event(
-            EventType::SyncStarted,
-            None,
-            None,
-            None,
-            None,
-            0,
-            false,
-            None,
-            None,
-            None,
-            EventOrigin::Local,
-        );
-    }
-
-    pub fn emit_sync_completed(&self, synced_count: u64) {
-        self.queue_event(
-            EventType::SyncCompleted,
-            None,
-            None,
-            None,
-            None,
-            synced_count,
-            false,
-            None,
-            None,
-            None,
-            EventOrigin::Local,
-        );
-    }
-
-    pub fn emit_sync_error(&self, code: ReplicantErrorCode, error_message: &str) {
-        // SyncError is the only event that carries a structured code, so it
-        // bypasses the shared `queue_event` (whose other callers have no code)
-        // and builds the queued event directly.
-        let queued_event = QueuedEvent {
-            event_type: EventType::SyncError,
-            document_id: None,
-            title: None,
-            content: None,
-            error: Some(error_message.to_string()),
-            error_code: code,
-            numeric_data: 0,
-            boolean_data: false,
-            user_id: None,
-            author_name: None,
-            visibility: None,
-            origin: EventOrigin::Local,
-        };
-
-        if self.event_sender.send(queued_event).is_err() {
-            tracing::error!("Failed to queue event - receiver may have been dropped");
-        }
-    }
-
-    pub fn emit_conflict_detected(&self, document_id: &Uuid) {
-        self.queue_event(
-            EventType::ConflictDetected,
-            Some(document_id),
-            None,
-            None,
-            None,
-            0,
-            false,
-            None,
-            None,
-            None,
-            EventOrigin::Local,
-        );
-    }
-
-    pub fn emit_connection_lost(&self, server_url: &str) {
-        self.queue_event(
-            EventType::ConnectionLost,
-            None,
-            Some(server_url),
-            None,
-            None,
-            0,
-            false,
-            None,
-            None,
-            None,
-            EventOrigin::Local,
-        );
-    }
-
-    pub fn emit_connection_attempted(&self, server_url: &str) {
-        self.queue_event(
-            EventType::ConnectionAttempted,
-            None,
-            Some(server_url),
-            None,
-            None,
-            0,
-            false,
-            None,
-            None,
-            None,
-            EventOrigin::Local,
-        );
-    }
-
-    pub fn emit_connection_succeeded(&self, server_url: &str) {
-        self.queue_event(
-            EventType::ConnectionSucceeded,
-            None,
-            Some(server_url),
-            None,
-            None,
-            0,
-            false,
-            None,
-            None,
-            None,
-            EventOrigin::Local,
-        );
-    }
-
-    pub fn emit_identity_changed(&self, old_user_id: &Uuid, new_user_id: &Uuid, email: &str) {
-        // document_id carries the old id, title the email, user_id the new id.
-        self.queue_event(
-            EventType::IdentityChanged,
-            Some(old_user_id),
-            Some(email),
-            None,
-            None,
-            0,
-            false,
-            Some(new_user_id.to_string()),
-            None,
-            None,
-            EventOrigin::Local,
-        );
-    }
-
-    /// Queue an event for later processing on the callback thread
-    #[allow(clippy::too_many_arguments)] // FFI callback constraints
-    fn queue_event(
-        &self,
-        event_type: EventType,
-        document_id: Option<&Uuid>,
-        title: Option<&str>,
-        content: Option<&serde_json::Value>,
-        error: Option<&str>,
-        numeric_data: u64,
-        boolean_data: bool,
-        user_id: Option<String>,
-        author_name: Option<String>,
-        visibility: Option<String>,
-        origin: EventOrigin,
-    ) {
-        let queued_event = QueuedEvent {
-            event_type,
-            document_id: document_id.map(|id| id.to_string()),
-            title: title.map(|t| t.to_string()),
-            content: content.map(|c| serde_json::to_string(c).unwrap_or_else(|_| "{}".to_string())),
-            error: error.map(|e| e.to_string()),
-            error_code: ReplicantErrorCode::Unknown,
-            numeric_data,
-            boolean_data,
-            user_id,
-            author_name,
-            visibility,
-            origin,
-        };
-
-        if self.event_sender.send(queued_event).is_err() {
-            tracing::error!("Failed to queue event - receiver may have been dropped");
-        }
-    }
-
-    /// Check if any callbacks are registered
-    fn has_callbacks(&self) -> SyncResult<bool> {
-        let doc = self
-            .document_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("document_callbacks".into()))?;
-        let sync = self
-            .sync_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("sync_callbacks".into()))?;
-        let error = self
-            .error_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("error_callbacks".into()))?;
-        let conn = self
-            .connection_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("connection_callbacks".into()))?;
-        let conflict = self
-            .conflict_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("conflict_callbacks".into()))?;
-        let identity = self
-            .identity_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("identity_callbacks".into()))?;
-        let rust = self
-            .rust_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("rust_callbacks".into()))?;
-
-        Ok(!doc.is_empty()
-            || !sync.is_empty()
-            || !error.is_empty()
-            || !conn.is_empty()
-            || !conflict.is_empty()
-            || !identity.is_empty()
-            || !rust.is_empty())
-    }
-
-    /// Process all queued events. This MUST be called on the same thread where callbacks were registered.
-    pub fn process_events(&self) -> SyncResult<usize> {
-        // Verify we're on the correct thread
-        {
-            let thread_id = self
-                .callback_thread_id
-                .lock()
-                .map_err(|_| ClientError::LockError("thread ID".into()))?;
-            if let Some(expected_thread_id) = *thread_id {
-                if thread::current().id() != expected_thread_id {
-                    return Err(ClientError::ThreadSafetyViolation.into());
-                }
-            } else {
-                return Err(ClientError::NoCallbacksRegistered.into());
+        take: impl FnOnce() -> Vec<HostEvent>,
+        stop: impl Fn() -> bool,
+    ) -> Result<usize, DispatchError> {
+        let callbacks = lock(&self.0).clone();
+        match callbacks.thread {
+            None => return Err(DispatchError::NoCallbacks),
+            Some(registered) if registered != thread::current().id() => {
+                return Err(DispatchError::WrongThread)
             }
+            Some(_) => {}
         }
-
-        if !self.has_callbacks()? {
-            return Ok(0);
-        }
-
-        // Lock all callback vectors
-        let document_callbacks = self
-            .document_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("document_callbacks".into()))?;
-        let sync_callbacks = self
-            .sync_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("sync_callbacks".into()))?;
-        let error_callbacks = self
-            .error_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("error_callbacks".into()))?;
-        let connection_callbacks = self
-            .connection_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("connection_callbacks".into()))?;
-        let conflict_callbacks = self
-            .conflict_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("conflict_callbacks".into()))?;
-        let identity_callbacks = self
-            .identity_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("identity_callbacks".into()))?;
-        let rust_callbacks = self
-            .rust_callbacks
-            .lock()
-            .map_err(|_| ClientError::LockError("rust_callbacks".into()))?;
-
-        let receiver = self
-            .event_queue
-            .lock()
-            .map_err(|_| ClientError::LockError("event queue".into()))?;
-
-        let mut processed_count = 0;
-        let mut temp_strings: Vec<CString> = Vec::new();
-
-        // Process all available events
-        while let Ok(queued_event) = receiver.try_recv() {
-            // Dispatch to Rust callbacks first (no FFI overhead)
-            if !rust_callbacks.is_empty() {
-                let sync_event = SyncEvent::from_queued(&queued_event);
-                for entry in rust_callbacks.iter() {
-                    if let Some(filter) = entry.event_filter {
-                        if filter != queued_event.event_type {
-                            continue;
-                        }
-                    }
-                    (entry.callback)(sync_event.clone());
-                }
+        let mut delivered = 0;
+        for event in take() {
+            if stop() {
+                break;
             }
+            callbacks.dispatch(&event);
+            delivered += 1;
+        }
+        Ok(delivered)
+    }
+}
 
-            // Then dispatch to C FFI callbacks
-            temp_strings.clear();
-
-            // Convert strings to C-compatible format
-            let document_id_cstr = queued_event.document_id.as_ref().map(|id| {
-                let cstr = CString::new(id.as_str()).unwrap_or_else(|_| CString::new("").unwrap());
-                let ptr = cstr.as_ptr();
-                temp_strings.push(cstr);
-                ptr
-            });
-
-            let title_cstr = queued_event.title.as_ref().map(|t| {
-                let cstr = CString::new(t.as_str()).unwrap_or_else(|_| CString::new("").unwrap());
-                let ptr = cstr.as_ptr();
-                temp_strings.push(cstr);
-                ptr
-            });
-
-            let content_cstr = queued_event.content.as_ref().map(|c| {
-                let cstr = CString::new(c.as_str()).unwrap_or_else(|_| CString::new("{}").unwrap());
-                let ptr = cstr.as_ptr();
-                temp_strings.push(cstr);
-                ptr
-            });
-
-            let error_cstr = queued_event.error.as_ref().map(|e| {
-                let cstr = CString::new(e.as_str()).unwrap_or_else(|_| CString::new("").unwrap());
-                let ptr = cstr.as_ptr();
-                temp_strings.push(cstr);
-                ptr
-            });
-
-            let user_id_cstr = queued_event.user_id.as_ref().map(|u| {
-                let cstr = CString::new(u.as_str()).unwrap_or_else(|_| CString::new("").unwrap());
-                let ptr = cstr.as_ptr();
-                temp_strings.push(cstr);
-                ptr
-            });
-
-            let author_name_cstr = queued_event.author_name.as_ref().map(|a| {
-                let cstr = CString::new(a.as_str()).unwrap_or_else(|_| CString::new("").unwrap());
-                let ptr = cstr.as_ptr();
-                temp_strings.push(cstr);
-                ptr
-            });
-
-            let visibility_cstr = queued_event.visibility.as_ref().map(|v| {
-                let cstr = CString::new(v.as_str()).unwrap_or_else(|_| CString::new("").unwrap());
-                let ptr = cstr.as_ptr();
-                temp_strings.push(cstr);
-                ptr
-            });
-
-            // Dispatch to appropriate callback type based on event type
-            match queued_event.event_type {
-                EventType::DocumentCreated
-                | EventType::DocumentUpdated
-                | EventType::DocumentDeleted => {
-                    let doc_id_ptr = document_id_cstr.unwrap_or(std::ptr::null());
-                    let title_ptr = title_cstr.unwrap_or(std::ptr::null());
-                    let content_ptr = content_cstr.unwrap_or(std::ptr::null());
-                    let user_id_ptr = user_id_cstr.unwrap_or(std::ptr::null());
-                    let author_name_ptr = author_name_cstr.unwrap_or(std::ptr::null());
-                    let visibility_ptr = visibility_cstr.unwrap_or(std::ptr::null());
-
-                    for entry in document_callbacks.iter() {
-                        if let Some(filter) = entry.event_filter {
-                            if filter != queued_event.event_type {
-                                continue;
-                            }
-                        }
+impl Callbacks {
+    fn dispatch(&self, event: &HostEvent) {
+        match event {
+            HostEvent::DocumentChanged { document, origin } => {
+                let id = text(&document.id.to_string());
+                let title = document.title.as_deref().map(text);
+                let content = text(&document.content.to_string());
+                let owner = document.user_id.map(|owner| text(&owner.to_string()));
+                let author = document.author_id.map(|author| text(&author.to_string()));
+                let visibility = text(document.visibility);
+                for (entry, filter) in &self.document {
+                    if filter.is_none_or(|wanted| wanted == EventType::DocumentChanged) {
                         (entry.callback)(
-                            queued_event.event_type,
-                            doc_id_ptr,
-                            title_ptr,
-                            content_ptr,
-                            user_id_ptr,
-                            author_name_ptr,
-                            visibility_ptr,
-                            queued_event.origin,
-                            entry.context,
-                        );
-                    }
-                }
-
-                EventType::SyncStarted | EventType::SyncCompleted => {
-                    for entry in sync_callbacks.iter() {
-                        (entry.callback)(
-                            queued_event.event_type,
-                            queued_event.numeric_data,
-                            entry.context,
-                        );
-                    }
-                }
-
-                EventType::SyncError => {
-                    let error_ptr = error_cstr.unwrap_or(std::ptr::null());
-                    let error_code = queued_event.error_code as i32;
-                    for entry in error_callbacks.iter() {
-                        (entry.callback)(
-                            queued_event.event_type,
-                            error_code,
-                            error_ptr,
-                            entry.context,
-                        );
-                    }
-                }
-
-                EventType::ConnectionLost
-                | EventType::ConnectionAttempted
-                | EventType::ConnectionSucceeded => {
-                    for entry in connection_callbacks.iter() {
-                        (entry.callback)(
-                            queued_event.event_type,
-                            queued_event.boolean_data,
-                            queued_event.numeric_data as u32,
-                            entry.context,
-                        );
-                    }
-                }
-
-                EventType::ConflictDetected => {
-                    let doc_id_ptr = document_id_cstr.unwrap_or(std::ptr::null());
-                    let winning_ptr = content_cstr.unwrap_or(std::ptr::null());
-                    let losing_ptr = error_cstr.unwrap_or(std::ptr::null()); // Use error field for losing content
-
-                    for entry in conflict_callbacks.iter() {
-                        (entry.callback)(
-                            queued_event.event_type,
-                            doc_id_ptr,
-                            winning_ptr,
-                            losing_ptr,
-                            entry.context,
-                        );
-                    }
-                }
-
-                EventType::IdentityChanged => {
-                    let old_ptr = document_id_cstr.unwrap_or(std::ptr::null());
-                    let new_ptr = user_id_cstr.unwrap_or(std::ptr::null());
-                    let email_ptr = title_cstr.unwrap_or(std::ptr::null());
-
-                    for entry in identity_callbacks.iter() {
-                        (entry.callback)(
-                            queued_event.event_type,
-                            old_ptr,
-                            new_ptr,
-                            email_ptr,
+                            EventType::DocumentChanged,
+                            id.as_ptr(),
+                            or_null(&title),
+                            content.as_ptr(),
+                            or_null(&owner),
+                            or_null(&author),
+                            visibility.as_ptr(),
+                            document.read_only,
+                            (*origin).into(),
                             entry.context,
                         );
                     }
                 }
             }
-
-            processed_count += 1;
+            HostEvent::DocumentDeleted { doc_id, origin } => {
+                let id = text(&doc_id.to_string());
+                for (entry, filter) in &self.document {
+                    if filter.is_none_or(|wanted| wanted == EventType::DocumentDeleted) {
+                        (entry.callback)(
+                            EventType::DocumentDeleted,
+                            id.as_ptr(),
+                            ptr::null(),
+                            ptr::null(),
+                            ptr::null(),
+                            ptr::null(),
+                            ptr::null(),
+                            false,
+                            (*origin).into(),
+                            entry.context,
+                        );
+                    }
+                }
+            }
+            HostEvent::SyncStarted => self.sync_event(EventType::SyncStarted),
+            HostEvent::SyncCompleted => self.sync_event(EventType::SyncCompleted),
+            HostEvent::DatabaseChanged => self.sync_event(EventType::DatabaseChanged),
+            HostEvent::IdentityAdopted { .. } => self.sync_event(EventType::IdentityAdopted),
+            HostEvent::SyncError {
+                code,
+                doc_id,
+                fatal,
+                recovered_id,
+                ..
+            } => {
+                let error = text(code);
+                let document_id = doc_id.map(|id| text(&id.to_string()));
+                for entry in &self.error {
+                    (entry.callback)(
+                        EventType::SyncError,
+                        error_code_for(code) as i32,
+                        error.as_ptr(),
+                        or_null(&document_id),
+                        *fatal,
+                        recovered_id.unwrap_or(-1),
+                        entry.context,
+                    );
+                }
+            }
+            HostEvent::Conflict {
+                doc_id,
+                reason,
+                recovered_id,
+                paths,
+            } => {
+                let id = text(&doc_id.to_string());
+                let reason = text(reason);
+                let paths_json = (!paths.is_empty())
+                    .then(|| text(&serde_json::to_string(paths).unwrap_or_default()));
+                for entry in &self.conflict {
+                    (entry.callback)(
+                        EventType::ConflictDetected,
+                        id.as_ptr(),
+                        reason.as_ptr(),
+                        recovered_id.unwrap_or(-1),
+                        or_null(&paths_json),
+                        entry.context,
+                    );
+                }
+            }
+            HostEvent::ConnectionAttempted { attempt } => {
+                self.connection_event(EventType::ConnectionAttempted, false, *attempt)
+            }
+            HostEvent::ConnectionSucceeded => {
+                self.connection_event(EventType::ConnectionSucceeded, true, 0)
+            }
+            HostEvent::ConnectionLost => self.connection_event(EventType::ConnectionLost, false, 0),
         }
-
-        Ok(processed_count)
     }
 
-    /// Get the number of events waiting to be processed
-    pub fn pending_event_count(&self) -> usize {
-        // We can't easily check the channel length without consuming from it,
-        // so we'll estimate by trying to process events and counting them
-        self.process_events().unwrap_or_default()
+    fn sync_event(&self, event_type: EventType) {
+        for entry in &self.sync {
+            (entry.callback)(event_type, entry.context);
+        }
+    }
+
+    fn connection_event(&self, event_type: EventType, connected: bool, attempt: u32) {
+        for entry in &self.connection {
+            (entry.callback)(event_type, connected, attempt, entry.context);
+        }
     }
 }
 
-impl Default for EventDispatcher {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Interior NULs cannot cross into C; such a value arrives empty.
+fn text(value: &str) -> CString {
+    CString::new(value).unwrap_or_default()
+}
+
+fn or_null(value: &Option<CString>) -> *const c_char {
+    value.as_ref().map_or(ptr::null(), |text| text.as_ptr())
 }
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::CStr;
+
+    use serde_json::json;
+    use uuid::Uuid;
+
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use crate::store::StoredDocument;
 
-    #[test]
-    fn test_event_dispatcher_creation() {
-        let dispatcher = EventDispatcher::new();
-        assert!(dispatcher.document_callbacks.lock().unwrap().is_empty());
-        assert!(dispatcher.sync_callbacks.lock().unwrap().is_empty());
+    type Log = Mutex<Vec<String>>;
 
-        // Should have no pending events initially
-        let result = dispatcher.process_events();
-        assert!(result.is_err()); // No callbacks registered yet
+    fn log(context: *mut c_void) -> &'static Log {
+        unsafe { &*(context as *const Log) }
+    }
+
+    fn read(value: *const c_char) -> String {
+        if value.is_null() {
+            "null".into()
+        } else {
+            unsafe { CStr::from_ptr(value) }
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+
+    extern "C" fn on_document(
+        event_type: EventType,
+        document_id: *const c_char,
+        title: *const c_char,
+        _content: *const c_char,
+        owner_id: *const c_char,
+        _author_id: *const c_char,
+        visibility: *const c_char,
+        read_only: bool,
+        origin: EventOrigin,
+        context: *mut c_void,
+    ) {
+        log(context).lock().unwrap().push(format!(
+            "{event_type:?} {} {} {} {} {read_only} {origin:?}",
+            read(document_id),
+            read(title),
+            read(owner_id),
+            read(visibility)
+        ));
+    }
+
+    extern "C" fn on_sync(event_type: EventType, context: *mut c_void) {
+        log(context).lock().unwrap().push(format!("{event_type:?}"));
+    }
+
+    extern "C" fn on_error(
+        event_type: EventType,
+        error_code: i32,
+        error: *const c_char,
+        document_id: *const c_char,
+        fatal: bool,
+        recovered_id: i64,
+        context: *mut c_void,
+    ) {
+        log(context).lock().unwrap().push(format!(
+            "{event_type:?} {error_code} {} {} {fatal} {recovered_id}",
+            read(error),
+            read(document_id)
+        ));
+    }
+
+    extern "C" fn on_connection(
+        event_type: EventType,
+        connected: bool,
+        attempt_number: u32,
+        context: *mut c_void,
+    ) {
+        log(context)
+            .lock()
+            .unwrap()
+            .push(format!("{event_type:?} {connected} {attempt_number}"));
+    }
+
+    extern "C" fn on_conflict(
+        event_type: EventType,
+        document_id: *const c_char,
+        reason: *const c_char,
+        recovered_id: i64,
+        paths_json: *const c_char,
+        context: *mut c_void,
+    ) {
+        log(context).lock().unwrap().push(format!(
+            "{event_type:?} {} {} {recovered_id} {}",
+            read(document_id),
+            read(reason),
+            read(paths_json)
+        ));
     }
 
     #[test]
-    fn test_document_callback_registration_and_processing() {
-        let dispatcher = EventDispatcher::new();
-        let callback_count = Arc::new(AtomicUsize::new(0));
-        let count_clone = callback_count.clone();
-
-        extern "C" fn test_callback(
-            _event_type: EventType,
-            _doc_id: *const c_char,
-            _title: *const c_char,
-            _content: *const c_char,
-            _user_id: *const c_char,
-            _author_name: *const c_char,
-            _visibility: *const c_char,
-            _origin: EventOrigin,
-            context: *mut c_void,
-        ) {
-            let count = unsafe { &*(context as *const AtomicUsize) };
-            count.fetch_add(1, Ordering::SeqCst);
-        }
-
-        let result = dispatcher.register_document_callback(
-            test_callback,
-            &*count_clone as *const AtomicUsize as *mut c_void,
-            None,
+    fn every_host_event_reaches_its_callback() {
+        let seen: Log = Mutex::new(Vec::new());
+        let context = &seen as *const Log as *mut c_void;
+        let dispatcher = Dispatcher::default();
+        dispatcher.register_document(on_document, context, None);
+        dispatcher.register_sync(on_sync, context);
+        dispatcher.register_error(on_error, context);
+        dispatcher.register_connection(on_connection, context);
+        dispatcher.register_conflict(on_conflict, context);
+        let doc_id = Uuid::from_u128(1);
+        let owner = Uuid::from_u128(0xA);
+        let document = StoredDocument {
+            id: doc_id,
+            user_id: Some(owner),
+            author_id: None,
+            title: Some("T".into()),
+            content: json!({"title": "T"}),
+            read_only: false,
+            visibility: "private",
+            source_doc_id: None,
+            derived_from: None,
+            created_at: "c".into(),
+            updated_at: "u".into(),
+        };
+        let events = vec![
+            HostEvent::ConnectionAttempted { attempt: 1 },
+            HostEvent::ConnectionSucceeded,
+            HostEvent::SyncStarted,
+            HostEvent::DocumentChanged {
+                document,
+                origin: Origin::OtherProcess,
+            },
+            HostEvent::DocumentDeleted {
+                doc_id,
+                origin: Origin::Server,
+            },
+            HostEvent::Conflict {
+                doc_id,
+                reason: "field_conflict".into(),
+                recovered_id: Some(3),
+                paths: vec!["/s".into()],
+            },
+            HostEvent::SyncError {
+                code: "clock_skew".into(),
+                doc_id: None,
+                scope: None,
+                fatal: false,
+                recovered_id: None,
+            },
+            HostEvent::SyncError {
+                code: "forbidden".into(),
+                doc_id: Some(doc_id),
+                scope: None,
+                fatal: false,
+                recovered_id: Some(4),
+            },
+            HostEvent::SyncCompleted,
+            HostEvent::DatabaseChanged,
+            HostEvent::IdentityAdopted { user_id: owner },
+            HostEvent::ConnectionLost,
+        ];
+        assert_eq!(dispatcher.process(|| events, || false), Ok(12));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                "ConnectionAttempted false 1".to_string(),
+                "ConnectionSucceeded true 0".to_string(),
+                "SyncStarted".to_string(),
+                format!("DocumentChanged {doc_id} T {owner} private false OtherProcess"),
+                format!("DocumentDeleted {doc_id} null null null false Remote"),
+                format!("ConflictDetected {doc_id} field_conflict 3 [\"/s\"]"),
+                "SyncError 2101 clock_skew null false -1".to_string(),
+                format!("SyncError 5003 forbidden {doc_id} false 4"),
+                "SyncCompleted".to_string(),
+                "DatabaseChanged".to_string(),
+                "IdentityAdopted".to_string(),
+                "ConnectionLost false 0".to_string(),
+            ]
         );
-
-        assert!(result.is_ok());
-        assert_eq!(dispatcher.document_callbacks.lock().unwrap().len(), 1);
-
-        // Emit an event
-        let doc_id = Uuid::new_v4();
-        dispatcher
-            .emit_document_created(&doc_id, &serde_json::json!({"title": "Test", "test": true}));
-
-        // Process events (should invoke callback)
-        let processed = dispatcher.process_events().unwrap();
-        assert_eq!(processed, 1);
-        assert_eq!(callback_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
-    fn test_document_event_filtering() {
-        let dispatcher = EventDispatcher::new();
-        let created_count = Arc::new(AtomicUsize::new(0));
-        let updated_count = Arc::new(AtomicUsize::new(0));
-
-        let created_clone = created_count.clone();
-        let updated_clone = updated_count.clone();
-
-        extern "C" fn count_callback(
-            _event_type: EventType,
-            _doc_id: *const c_char,
-            _title: *const c_char,
-            _content: *const c_char,
-            _user_id: *const c_char,
-            _author_name: *const c_char,
-            _visibility: *const c_char,
-            _origin: EventOrigin,
-            context: *mut c_void,
-        ) {
-            let count = unsafe { &*(context as *const AtomicUsize) };
-            count.fetch_add(1, Ordering::SeqCst);
-        }
-
-        // Register callback only for created events
-        dispatcher
-            .register_document_callback(
-                count_callback,
-                &*created_clone as *const AtomicUsize as *mut c_void,
-                Some(EventType::DocumentCreated),
-            )
-            .unwrap();
-
-        // Register callback only for updated events
-        dispatcher
-            .register_document_callback(
-                count_callback,
-                &*updated_clone as *const AtomicUsize as *mut c_void,
-                Some(EventType::DocumentUpdated),
-            )
-            .unwrap();
-
-        let doc_id = Uuid::new_v4();
-
-        // Emit created event
-        dispatcher.emit_document_created(&doc_id, &serde_json::json!({"title": "Test"}));
-        dispatcher.process_events().unwrap();
-        assert_eq!(created_count.load(Ordering::SeqCst), 1);
-        assert_eq!(updated_count.load(Ordering::SeqCst), 0);
-
-        // Emit updated event
-        dispatcher.emit_document_updated(&doc_id, &serde_json::json!({"title": "Test"}));
-        dispatcher.process_events().unwrap();
-        assert_eq!(created_count.load(Ordering::SeqCst), 1);
-        assert_eq!(updated_count.load(Ordering::SeqCst), 1);
-
-        // Emit deleted event (neither should trigger - they're filtered)
-        dispatcher.emit_document_deleted(&doc_id, EventOrigin::Local);
-        dispatcher.process_events().unwrap();
-        assert_eq!(created_count.load(Ordering::SeqCst), 1);
-        assert_eq!(updated_count.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn test_thread_safety_check() {
-        let dispatcher = Arc::new(EventDispatcher::new());
-        let callback_count = Arc::new(AtomicUsize::new(0));
-        let count_clone = callback_count.clone();
-
-        extern "C" fn test_callback(_event_type: EventType, _doc_count: u64, context: *mut c_void) {
-            let count = unsafe { &*(context as *const AtomicUsize) };
-            count.fetch_add(1, Ordering::SeqCst);
-        }
-
-        // Register callback on main thread
-        dispatcher
-            .register_sync_callback(
-                test_callback,
-                &*count_clone as *const AtomicUsize as *mut c_void,
-            )
-            .unwrap();
-
-        let dispatcher_clone = dispatcher.clone();
-
-        // Try to process events from another thread (should fail)
-        let handle = std::thread::spawn(move || dispatcher_clone.process_events());
-
-        let result = handle.join().unwrap();
-        assert!(result.is_err()); // Should fail because we're on wrong thread
-
-        // Process events on main thread (should work)
-        dispatcher.emit_sync_started();
-        let processed = dispatcher.process_events().unwrap();
-        assert_eq!(processed, 1);
-        assert_eq!(callback_count.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn test_multiple_callback_types() {
-        let dispatcher = EventDispatcher::new();
-        let doc_count = Arc::new(AtomicUsize::new(0));
-        let sync_count = Arc::new(AtomicUsize::new(0));
-
-        let doc_clone = doc_count.clone();
-        let sync_clone = sync_count.clone();
-
-        extern "C" fn doc_callback(
-            _event_type: EventType,
-            _doc_id: *const c_char,
-            _title: *const c_char,
-            _content: *const c_char,
-            _user_id: *const c_char,
-            _author_name: *const c_char,
-            _visibility: *const c_char,
-            _origin: EventOrigin,
-            context: *mut c_void,
-        ) {
-            let count = unsafe { &*(context as *const AtomicUsize) };
-            count.fetch_add(1, Ordering::SeqCst);
-        }
-
-        extern "C" fn sync_callback(_event_type: EventType, _doc_count: u64, context: *mut c_void) {
-            let count = unsafe { &*(context as *const AtomicUsize) };
-            count.fetch_add(1, Ordering::SeqCst);
-        }
-
-        // Register callbacks for different event types
-        dispatcher
-            .register_document_callback(
-                doc_callback,
-                &*doc_clone as *const AtomicUsize as *mut c_void,
-                None,
-            )
-            .unwrap();
-
-        dispatcher
-            .register_sync_callback(
-                sync_callback,
-                &*sync_clone as *const AtomicUsize as *mut c_void,
-            )
-            .unwrap();
-
-        // Emit multiple events of different types
-        let doc_id = Uuid::new_v4();
-        dispatcher.emit_document_created(&doc_id, &serde_json::json!({"title": "Test1"}));
-        dispatcher.emit_document_updated(&doc_id, &serde_json::json!({"title": "Test2"}));
-        dispatcher.emit_document_deleted(&doc_id, EventOrigin::Local);
-        dispatcher.emit_sync_started();
-        dispatcher.emit_sync_completed(5);
-
-        // Process all events at once
-        let processed = dispatcher.process_events().unwrap();
-        assert_eq!(processed, 5);
-        assert_eq!(doc_count.load(Ordering::SeqCst), 3); // 3 document events
-        assert_eq!(sync_count.load(Ordering::SeqCst), 2); // 2 sync events
-
-        // Process again (should be no more events)
-        let processed = dispatcher.process_events().unwrap();
-        assert_eq!(processed, 0);
-    }
-
-    #[test]
-    fn identity_changed_delivers_to_rust_callback() {
-        let dispatcher = EventDispatcher::new();
-        let captured: Arc<Mutex<Option<SyncEvent>>> = Arc::new(Mutex::new(None));
-        let c = captured.clone();
-        dispatcher
-            .register_rust_callback(move |e| *c.lock().unwrap() = Some(e))
-            .unwrap();
-
-        let old = Uuid::new_v4();
-        let new = Uuid::new_v4();
-        dispatcher.emit_identity_changed(&old, &new, "user@example.com");
-        assert_eq!(dispatcher.process_events().unwrap(), 1);
-
-        let result = captured.lock().unwrap().clone();
-        match result {
-            Some(SyncEvent::IdentityChanged {
-                old_user_id,
-                new_user_id,
-                email,
-            }) => {
-                assert_eq!(old_user_id, old.to_string());
-                assert_eq!(new_user_id, new.to_string());
-                assert_eq!(email, "user@example.com");
-            }
-            other => panic!("expected IdentityChanged, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn identity_changed_delivers_to_ffi_callback() {
-        let dispatcher = EventDispatcher::new();
-        let count = Arc::new(AtomicUsize::new(0));
-        let count_clone = count.clone();
-
-        extern "C" fn identity_callback(
-            event_type: EventType,
-            old_user_id: *const c_char,
-            new_user_id: *const c_char,
-            email: *const c_char,
-            context: *mut c_void,
-        ) {
-            assert_eq!(event_type, EventType::IdentityChanged);
-            assert!(!old_user_id.is_null());
-            assert!(!new_user_id.is_null());
-            assert!(!email.is_null());
-            let c = unsafe { &*(context as *const AtomicUsize) };
-            c.fetch_add(1, Ordering::SeqCst);
-        }
-
-        dispatcher
-            .register_identity_callback(
-                identity_callback,
-                &*count_clone as *const AtomicUsize as *mut c_void,
-            )
-            .unwrap();
-
-        let old = Uuid::new_v4();
-        let new = Uuid::new_v4();
-        dispatcher.emit_identity_changed(&old, &new, "user@example.com");
-        assert_eq!(dispatcher.process_events().unwrap(), 1);
-        assert_eq!(count.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn test_error_callback() {
-        let dispatcher = EventDispatcher::new();
-        let error_count = Arc::new(AtomicUsize::new(0));
-        let error_clone = error_count.clone();
-
-        extern "C" fn error_callback(
-            _event_type: EventType,
-            _error_code: i32,
-            _error: *const c_char,
-            context: *mut c_void,
-        ) {
-            let count = unsafe { &*(context as *const AtomicUsize) };
-            count.fetch_add(1, Ordering::SeqCst);
-        }
-
-        dispatcher
-            .register_error_callback(
-                error_callback,
-                &*error_clone as *const AtomicUsize as *mut c_void,
-            )
-            .unwrap();
-
-        dispatcher.emit_sync_error(ReplicantErrorCode::Unknown, "Test error");
-
-        let processed = dispatcher.process_events().unwrap();
-        assert_eq!(processed, 1);
-        assert_eq!(error_count.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn test_connection_callback() {
-        let dispatcher = EventDispatcher::new();
-        let conn_count = Arc::new(AtomicUsize::new(0));
-        let conn_clone = conn_count.clone();
-
-        extern "C" fn conn_callback(
-            _event_type: EventType,
-            _connected: bool,
-            _attempt: u32,
-            context: *mut c_void,
-        ) {
-            let count = unsafe { &*(context as *const AtomicUsize) };
-            count.fetch_add(1, Ordering::SeqCst);
-        }
-
-        dispatcher
-            .register_connection_callback(
-                conn_callback,
-                &*conn_clone as *const AtomicUsize as *mut c_void,
-            )
-            .unwrap();
-
-        dispatcher.emit_connection_lost("ws://localhost:8080");
-        dispatcher.emit_connection_attempted("ws://localhost:8080");
-        dispatcher.emit_connection_succeeded("ws://localhost:8080");
-
-        let processed = dispatcher.process_events().unwrap();
-        assert_eq!(processed, 3);
-        assert_eq!(conn_count.load(Ordering::SeqCst), 3);
-    }
-
-    #[test]
-    fn test_conflict_callback() {
-        let dispatcher = EventDispatcher::new();
-        let conflict_count = Arc::new(AtomicUsize::new(0));
-        let conflict_clone = conflict_count.clone();
-
-        extern "C" fn conflict_callback(
-            _event_type: EventType,
-            _doc_id: *const c_char,
-            _winning: *const c_char,
-            _losing: *const c_char,
-            context: *mut c_void,
-        ) {
-            let count = unsafe { &*(context as *const AtomicUsize) };
-            count.fetch_add(1, Ordering::SeqCst);
-        }
-
-        dispatcher
-            .register_conflict_callback(
-                conflict_callback,
-                &*conflict_clone as *const AtomicUsize as *mut c_void,
-            )
-            .unwrap();
-
-        let doc_id = Uuid::new_v4();
-        dispatcher.emit_conflict_detected(&doc_id);
-
-        let processed = dispatcher.process_events().unwrap();
-        assert_eq!(processed, 1);
-        assert_eq!(conflict_count.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn test_rust_callback() {
-        let dispatcher = EventDispatcher::new();
-        let events_received = Arc::new(Mutex::new(Vec::<String>::new()));
-        let events_clone = events_received.clone();
-
-        // Register Rust callback
-        dispatcher
-            .register_rust_callback(move |event| {
-                let desc = match &event {
-                    SyncEvent::DocumentCreated { title, .. } => format!("created:{}", title),
-                    SyncEvent::SyncCompleted { document_count } => {
-                        format!("synced:{}", document_count)
-                    }
-                    SyncEvent::ConnectionSucceeded { server_url } => {
-                        format!("connected:{}", server_url)
-                    }
-                    _ => format!("other:{:?}", event.event_type()),
-                };
-                events_clone.lock().unwrap().push(desc);
-            })
-            .unwrap();
-
-        // Emit events
-        let doc_id = Uuid::new_v4();
-        dispatcher.emit_document_created(&doc_id, &serde_json::json!({"title": "Test Doc"}));
-        dispatcher.emit_sync_completed(42);
-        dispatcher.emit_connection_succeeded("ws://localhost:8080");
-
-        // Process events
-        let processed = dispatcher.process_events().unwrap();
-        assert_eq!(processed, 3);
-
-        // Verify events were received
-        let events = events_received.lock().unwrap();
-        assert_eq!(events.len(), 3);
-        assert_eq!(events[0], "created:Test Doc");
-        assert_eq!(events[1], "synced:42");
-        assert_eq!(events[2], "connected:ws://localhost:8080");
-    }
-
-    #[test]
-    fn test_rust_and_c_callbacks_together() {
-        let dispatcher = EventDispatcher::new();
-
-        // Rust callback
-        let rust_count = Arc::new(AtomicUsize::new(0));
-        let rust_clone = rust_count.clone();
-        dispatcher
-            .register_rust_callback(move |_event| {
-                rust_clone.fetch_add(1, Ordering::SeqCst);
-            })
-            .unwrap();
-
-        // C FFI callback
-        let c_count = Arc::new(AtomicUsize::new(0));
-        let c_clone = c_count.clone();
-
-        extern "C" fn c_callback(_event_type: EventType, _doc_count: u64, context: *mut c_void) {
-            let count = unsafe { &*(context as *const AtomicUsize) };
-            count.fetch_add(1, Ordering::SeqCst);
-        }
-
-        dispatcher
-            .register_sync_callback(c_callback, &*c_clone as *const AtomicUsize as *mut c_void)
-            .unwrap();
-
-        // Emit sync events
-        dispatcher.emit_sync_started();
-        dispatcher.emit_sync_completed(10);
-
-        // Process events
-        let processed = dispatcher.process_events().unwrap();
-        assert_eq!(processed, 2);
-
-        // Both callbacks should have been invoked
-        assert_eq!(rust_count.load(Ordering::SeqCst), 2);
-        assert_eq!(c_count.load(Ordering::SeqCst), 2);
+    fn processing_before_registration_or_off_thread_is_refused_and_takes_nothing() {
+        let dispatcher = Dispatcher::default();
+        assert_eq!(
+            dispatcher.process(
+                || unreachable!("nothing is taken before a registration"),
+                || false
+            ),
+            Err(DispatchError::NoCallbacks)
+        );
+        let seen: Log = Mutex::new(Vec::new());
+        dispatcher.register_sync(on_sync, &seen as *const Log as *mut c_void);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                assert_eq!(
+                    dispatcher
+                        .process(|| unreachable!("nothing is taken off the thread"), || false),
+                    Err(DispatchError::WrongThread)
+                );
+            });
+        });
+        assert_eq!(
+            dispatcher.process(|| vec![HostEvent::SyncStarted], || false),
+            Ok(1)
+        );
+        assert_eq!(*seen.lock().unwrap(), vec!["SyncStarted".to_string()]);
     }
 }

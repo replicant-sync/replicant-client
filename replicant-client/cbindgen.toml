@@ -13,8 +13,13 @@ documentation = true
 [export]
 include = [
     "Replicant",
+    "ReplicantConfig",
+    "ReplicantListMerge",
+    "ReplicantState",
+    "ReplicantConnection",
+    "ReplicantSync",
+    "ReplicantHaltReason",
     "SyncResult",
-    "Document",
     "EventType",
     "EventOrigin",
     "ReplicantErrorCode",
@@ -30,9 +35,6 @@ include = [
 "EventType" = "ReplicantEventType"
 "EventOrigin" = "ReplicantEventOrigin"
 "SyncResult" = "ReplicantSyncResult"
-
-[enum]
-rename_variants = "PascalCase"
 
 [fn]
 rename_args = "snake_case"

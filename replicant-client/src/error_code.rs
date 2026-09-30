@@ -1,107 +1,73 @@
-//! Stable, structured error codes carried alongside `SyncError` events.
-//!
-//! Consumers must be able to react to a sync error by the *action* it calls for
-//! (clear the credential? retry? refuse to sync?) without substring-matching a
-//! free-form message. Every `SyncError` event carries a [`ReplicantErrorCode`]
-//! whose numeric value is stable and exported to C.
+//! Stable codes for `SyncError` events; the event's text is the protocol code itself.
 
-/// Structured error code carried by every `SyncError` event.
-///
-/// The numeric values are STABLE and exported to C via cbindgen. They are
-/// banded by the action a consumer should take:
-///
-/// - `0` — unknown / uncategorized.
-/// - `1xxx` — **credential rejected**: the stored credential is bad. The
-///   consumer should clear it and re-enroll. See [`is_credential_rejection`].
-/// - `2xxx` — **transient**: retry later; NEVER clear credentials. This band
-///   includes the timestamp reasons (`2101`, `2102`), which are client/server
-///   clock skew — not a bad credential — and so must never trigger a clear.
-/// - `3xxx` — **protocol**: the exchange was malformed or violated the contract.
-/// - `4xxx` — **identity drift**: the local identity diverged from the account;
-///   refuse to sync, but do NOT clear credentials.
-/// - `5xxx` — **unresolved divergence**: a local edit could not be reconciled
-///   with the server's copy. Retrying cannot help; surface it to the user.
+/// cbindgen:prefix-with-name
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicantErrorCode {
-    /// Unknown or uncategorized error.
     Unknown = 0,
-
-    // 1xxx — credential rejected (clear the stored credential and re-enroll)
-    /// The API key is not recognized by the server.
-    InvalidApiKey = 1001,
-    /// The HMAC signature did not verify.
-    InvalidSignature = 1002,
-    /// The credential authenticated but is not bound to an enrolled user.
-    CredentialNotEnrolled = 1003,
-
-    // 2xxx — transient (retry; never clear credentials)
-    /// The socket/transport failed to connect.
-    ConnectionFailed = 2001,
-    /// A join or call timed out.
-    Timeout = 2002,
-    /// The signed timestamp was outside the server's acceptance window
-    /// (client/server clock skew, not a bad credential).
-    TimestampExpired = 2101,
-    /// The timestamp field was malformed or unparseable (treated as clock skew).
-    InvalidTimestamp = 2102,
-
-    // 3xxx — protocol
-    /// A required join parameter was missing.
-    MissingParams = 3001,
-    /// The join topic's user id did not match the credential's user.
-    TopicUserMismatch = 3002,
-    /// Generic malformed or unexpected server reply.
+    /// The server refused the credentials; the engine is halted until they change.
+    AuthInvalid = 1001,
+    /// No stored credentials; the engine is halted until someone signs in.
+    NotEnrolled = 1003,
+    /// The server needs a newer client; halted.
+    UpdateRequired = 2003,
+    /// This computer's clock is off; not fatal, the engine keeps retrying.
+    ClockSkew = 2101,
     ProtocolError = 3003,
-
-    // 4xxx — identity drift (refuse to sync; do NOT clear credentials)
-    /// The server-reported user id diverged from the local identity.
+    /// A subscribed scope was refused and dropped.
+    SubscriptionForbidden = 3004,
+    /// The data dir belongs to another account; halted.
     IdentityDrift = 4001,
-
-    // 5xxx — unresolved divergence (surface to the user; do NOT retry)
-    /// A local edit could not be rebased onto the server's current content.
-    /// The server's copy is now local truth and the edit was discarded.
-    UpdateConflict = 5001,
+    AccountDisabled = 4002,
+    /// The server refused this document's changes; its next local edit retries them. If the
+    /// refused change was a delete, the server's version is back instead, and edits made before
+    /// the delete are in Kept copies (`recovered_id`). Also for `Forbidden` and `TooLarge`.
+    Validation = 5002,
+    Forbidden = 5003,
+    TooLarge = 5004,
+    /// The document became a read-only publication; unsent edits are in Kept copies.
+    BecamePublication = 5005,
+    /// Its id belongs to another account; the content is in Kept copies.
+    CreateRejected = 5006,
+    /// The server kept storing something other than what was uploaded; the document stops
+    /// uploading until its next local edit. Local content is kept.
+    Diverged = 5007,
+    /// Reserved: a delete the server refused (the document is back). Not emitted before 0.8;
+    /// until then a refused delete arrives as `Validation`, `Forbidden` or `TooLarge`.
+    DeleteRefused = 5008,
+    /// The local database failed while checking a join.
+    LocalDatabase = 6001,
 }
 
-/// True iff `code` is in the credential-rejection band (`1xxx`).
-///
-/// A `true` result means the consumer should clear the stored credential and
-/// re-enroll. This is the single source of truth for the band check so bindings
-/// do not re-derive the range.
+/// The stable code for a protocol or local error code.
+pub fn error_code_for(code: &str) -> ReplicantErrorCode {
+    match code {
+        "auth_invalid" => ReplicantErrorCode::AuthInvalid,
+        "not_enrolled" => ReplicantErrorCode::NotEnrolled,
+        "update_required" => ReplicantErrorCode::UpdateRequired,
+        "clock_skew" => ReplicantErrorCode::ClockSkew,
+        "protocol_error" => ReplicantErrorCode::ProtocolError,
+        "subscription_forbidden" => ReplicantErrorCode::SubscriptionForbidden,
+        "identity_drift" => ReplicantErrorCode::IdentityDrift,
+        "account_disabled" => ReplicantErrorCode::AccountDisabled,
+        "validation" => ReplicantErrorCode::Validation,
+        "forbidden" => ReplicantErrorCode::Forbidden,
+        "too_large" => ReplicantErrorCode::TooLarge,
+        "became_publication" => ReplicantErrorCode::BecamePublication,
+        "create_rejected" => ReplicantErrorCode::CreateRejected,
+        "diverged" => ReplicantErrorCode::Diverged,
+        "delete_refused" => ReplicantErrorCode::DeleteRefused,
+        "store_error" => ReplicantErrorCode::LocalDatabase,
+        _ => ReplicantErrorCode::Unknown,
+    }
+}
+
+/// Whether `code` means the credentials were refused or are missing.
 pub fn is_credential_rejection(code: ReplicantErrorCode) -> bool {
     (1000..2000).contains(&(code as i32))
 }
 
-/// Map a server join-rejection reason string to its [`ReplicantErrorCode`].
-///
-/// The reasons are the atoms the phoenix server sends in `{:error, %{reason:
-/// "<atom>"}}` (see `replicant_server` `Sync.Channel`/`Auth`). A reason that is
-/// present but not recognized is treated as a protocol contract mismatch
-/// ([`ReplicantErrorCode::ProtocolError`]); the *absent*-reason case is handled
-/// by the caller ([`crate::websocket::error_code_for_join_reject`]).
-pub fn error_code_for_reason(reason: &str) -> ReplicantErrorCode {
-    match reason {
-        "invalid_api_key" => ReplicantErrorCode::InvalidApiKey,
-        "invalid_signature" => ReplicantErrorCode::InvalidSignature,
-        "credential_not_enrolled" => ReplicantErrorCode::CredentialNotEnrolled,
-        "timestamp_expired" => ReplicantErrorCode::TimestampExpired,
-        "invalid_timestamp" => ReplicantErrorCode::InvalidTimestamp,
-        "missing_params" => ReplicantErrorCode::MissingParams,
-        "topic_user_mismatch" => ReplicantErrorCode::TopicUserMismatch,
-        "invalid_topic" => ReplicantErrorCode::ProtocolError,
-        _ => ReplicantErrorCode::ProtocolError,
-    }
-}
-
-/// Band check exposed over FFI: `true` iff `code` is a credential rejection.
-///
-/// Bindings should treat a `true` result as "clear the stored credential and
-/// re-enroll". Implemented once here so consumers do not re-implement the band
-/// logic against the raw numeric values.
-///
-/// # Safety
-/// This function is pure and takes the code by value; it is always safe to call.
+/// Whether `code` (a `ReplicantErrorCode`) means the credentials were refused or are missing.
 #[no_mangle]
 pub extern "C" fn replicant_error_is_credential_rejection(code: i32) -> bool {
     (1000..2000).contains(&code)
@@ -112,91 +78,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_server_reason_maps_to_its_code() {
-        assert_eq!(
-            error_code_for_reason("invalid_api_key"),
-            ReplicantErrorCode::InvalidApiKey
-        );
-        assert_eq!(
-            error_code_for_reason("invalid_signature"),
-            ReplicantErrorCode::InvalidSignature
-        );
-        assert_eq!(
-            error_code_for_reason("credential_not_enrolled"),
-            ReplicantErrorCode::CredentialNotEnrolled
-        );
-        assert_eq!(
-            error_code_for_reason("timestamp_expired"),
-            ReplicantErrorCode::TimestampExpired
-        );
-        assert_eq!(
-            error_code_for_reason("invalid_timestamp"),
-            ReplicantErrorCode::InvalidTimestamp
-        );
-        assert_eq!(
-            error_code_for_reason("missing_params"),
-            ReplicantErrorCode::MissingParams
-        );
-        assert_eq!(
-            error_code_for_reason("topic_user_mismatch"),
-            ReplicantErrorCode::TopicUserMismatch
-        );
-        assert_eq!(
-            error_code_for_reason("invalid_topic"),
-            ReplicantErrorCode::ProtocolError
-        );
+    fn error_codes_map_every_v2_code() {
+        for (code, expected) in [
+            ("auth_invalid", 1001),
+            ("not_enrolled", 1003),
+            ("update_required", 2003),
+            ("clock_skew", 2101),
+            ("protocol_error", 3003),
+            ("subscription_forbidden", 3004),
+            ("identity_drift", 4001),
+            ("account_disabled", 4002),
+            ("validation", 5002),
+            ("forbidden", 5003),
+            ("too_large", 5004),
+            ("became_publication", 5005),
+            ("create_rejected", 5006),
+            ("diverged", 5007),
+            ("store_error", 6001),
+        ] {
+            assert_eq!(error_code_for(code) as i32, expected, "{code}");
+        }
     }
 
     #[test]
-    fn unrecognized_reason_is_protocol_error() {
-        assert_eq!(
-            error_code_for_reason("something_new"),
-            ReplicantErrorCode::ProtocolError
-        );
+    fn unknown_codes_are_unknown() {
+        assert_eq!(error_code_for("something_new"), ReplicantErrorCode::Unknown);
     }
 
     #[test]
-    fn credential_rejection_band_is_1xxx_only() {
-        // 1xxx band: true
-        assert!(is_credential_rejection(ReplicantErrorCode::InvalidApiKey));
-        assert!(is_credential_rejection(
-            ReplicantErrorCode::InvalidSignature
-        ));
-        assert!(is_credential_rejection(
-            ReplicantErrorCode::CredentialNotEnrolled
-        ));
-
-        // every other band: false
-        assert!(!is_credential_rejection(ReplicantErrorCode::Unknown));
+    fn only_refused_or_missing_credentials_are_credential_rejections() {
+        assert!(is_credential_rejection(ReplicantErrorCode::AuthInvalid));
+        assert!(is_credential_rejection(ReplicantErrorCode::NotEnrolled));
         assert!(!is_credential_rejection(
-            ReplicantErrorCode::ConnectionFailed
+            ReplicantErrorCode::AccountDisabled
         ));
-        assert!(!is_credential_rejection(ReplicantErrorCode::Timeout));
-        assert!(!is_credential_rejection(
-            ReplicantErrorCode::TimestampExpired
-        ));
-        assert!(!is_credential_rejection(
-            ReplicantErrorCode::InvalidTimestamp
-        ));
-        assert!(!is_credential_rejection(ReplicantErrorCode::MissingParams));
-        assert!(!is_credential_rejection(
-            ReplicantErrorCode::TopicUserMismatch
-        ));
-        assert!(!is_credential_rejection(ReplicantErrorCode::ProtocolError));
-        assert!(!is_credential_rejection(ReplicantErrorCode::IdentityDrift));
-        assert!(!is_credential_rejection(ReplicantErrorCode::UpdateConflict));
-    }
-
-    #[test]
-    fn ffi_band_check_matches_rust_helper() {
-        assert!(replicant_error_is_credential_rejection(
-            ReplicantErrorCode::CredentialNotEnrolled as i32
-        ));
-        assert!(!replicant_error_is_credential_rejection(
-            ReplicantErrorCode::Timeout as i32
-        ));
-        assert!(!replicant_error_is_credential_rejection(
-            ReplicantErrorCode::IdentityDrift as i32
-        ));
+        assert!(!is_credential_rejection(ReplicantErrorCode::ClockSkew));
+        assert!(replicant_error_is_credential_rejection(1001));
+        assert!(!replicant_error_is_credential_rejection(4001));
     }
 }
