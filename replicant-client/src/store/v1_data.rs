@@ -321,7 +321,7 @@ async fn remove_document(conn: &mut SqliteConnection, id: &str) -> StoreResult<(
         .bind(id)
         .execute(&mut *conn)
         .await?;
-    sqlx::query("DELETE FROM documents_fts WHERE document_id = ?")
+    sqlx::query(super::reads::DELETE_FTS_ENTRY)
         .bind(id)
         .execute(&mut *conn)
         .await?;

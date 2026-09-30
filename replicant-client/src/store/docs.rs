@@ -4,13 +4,13 @@ use serde_json::Value;
 use sqlx::{Row, SqliteConnection};
 use uuid::Uuid;
 
+use super::reads::{DELETE_FTS_ENTRY, HAS_SEARCH_CONFIG, UPDATE_FTS_ENTRY};
 use super::{now_rfc3339, now_unix, DocNotice, KeptCopy, StoreError, StoreResult};
 use crate::engine::doc::{
     DocOp, DocSnapshot, Membership, OutboxRow, RecoverReason, RowKind, Shadow,
 };
 use crate::engine::hash::content_hash;
 use crate::engine::types::DocEnvelope;
-use crate::queries::Queries;
 
 const TITLE_MAX_CHARS: usize = 128;
 
@@ -379,17 +379,17 @@ pub(crate) async fn append_change_log(
 
 /// Keeps the v1 full-text index in step when search paths are configured.
 pub(crate) async fn refresh_search(conn: &mut SqliteConnection, doc_id: Uuid) -> StoreResult<()> {
-    let configured: i64 = sqlx::query_scalar(Queries::HAS_SEARCH_CONFIG)
+    let configured: i64 = sqlx::query_scalar(HAS_SEARCH_CONFIG)
         .fetch_one(&mut *conn)
         .await?;
     if configured == 0 {
         return Ok(());
     }
-    sqlx::query(Queries::DELETE_FTS_ENTRY)
+    sqlx::query(DELETE_FTS_ENTRY)
         .bind(doc_id.to_string())
         .execute(&mut *conn)
         .await?;
-    sqlx::query(Queries::UPDATE_FTS_ENTRY)
+    sqlx::query(UPDATE_FTS_ENTRY)
         .bind(doc_id.to_string())
         .execute(&mut *conn)
         .await?;

@@ -12,11 +12,13 @@ use docs::{LogOrigin, Writer};
 use crate::engine::doc::DocEvent;
 use crate::engine::list_merge::ListMergeConfig;
 use crate::engine::types::{SCOPE_CURATED, SCOPE_OWN};
-use crate::queries::Queries;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const POOL_SIZE: u32 = 4;
 const TOMBSTONE_RETENTION_SECS: i64 = 90 * 24 * 3600;
+const RESTAMP_DOCUMENTS_USER_ID: &str = "UPDATE documents SET user_id = ?1 WHERE user_id = ?2";
+const ADOPT_USER_CONFIG_IDENTITY: &str =
+    "UPDATE user_config SET user_id = ?1, identity_adopted = 1 WHERE user_id = ?2";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -200,7 +202,7 @@ impl Store {
         let adopted = row.try_get::<i64, _>("identity_adopted")? != 0;
         let check = if local == server_user_id {
             if !adopted {
-                sqlx::query(Queries::ADOPT_USER_CONFIG_IDENTITY)
+                sqlx::query(ADOPT_USER_CONFIG_IDENTITY)
                     .bind(server_user_id.to_string())
                     .bind(local.to_string())
                     .execute(&mut *tx)
@@ -208,12 +210,12 @@ impl Store {
             }
             IdentityCheck::Matches
         } else if !adopted {
-            sqlx::query(Queries::RESTAMP_DOCUMENTS_USER_ID)
+            sqlx::query(RESTAMP_DOCUMENTS_USER_ID)
                 .bind(server_user_id.to_string())
                 .bind(local.to_string())
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query(Queries::ADOPT_USER_CONFIG_IDENTITY)
+            sqlx::query(ADOPT_USER_CONFIG_IDENTITY)
                 .bind(server_user_id.to_string())
                 .bind(local.to_string())
                 .execute(&mut *tx)
@@ -271,11 +273,13 @@ pub(crate) async fn read_user_id(conn: &mut SqliteConnection) -> StoreResult<Uui
 pub mod change_log;
 mod docs;
 mod feed;
+mod reads;
 mod recovered;
 mod uploads;
 mod v1_data;
 mod writes;
 
+pub use reads::{ParkedDocument, StoredDocument};
 pub use recovered::RecoveredCopy;
 
 #[cfg(test)]
