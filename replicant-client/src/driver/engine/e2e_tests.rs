@@ -1247,3 +1247,46 @@ async fn a_trimmed_cursor_holds_uploads_until_the_resync_and_keeps_no_copy() {
     assert_eq!(recovered_rows(&store, doc_id).await, 0, "no kept copy");
     engine.stop().await;
 }
+
+#[tokio::test]
+async fn a_delete_the_server_refuses_parks_once_and_is_not_resent() {
+    let server = ScriptedServer::start(ME).await;
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, mut events) = live_engine(&server, &path).await;
+    let store = engine.store();
+    let doc_id = store
+        .create_document(ME, None, json!({"n": 1}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    eventually("synced", || async { outbox_rows(&store).await == 0 }).await;
+    server.reject_deletes("forbidden");
+    store.delete_document(ME, doc_id).await.unwrap();
+    engine.notify_outbox();
+    let refusal = EngineEvent::Doc(DocNotice {
+        doc_id,
+        event: DocEvent::SyncError {
+            code: "forbidden".into(),
+        },
+    });
+    wait_for(&mut events, "the park", |event| *event == refusal).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut refusals = 0;
+    while let Ok(event) = events.try_recv() {
+        refusals += usize::from(event == refusal);
+    }
+    let deletes = server
+        .uploads_for(doc_id)
+        .iter()
+        .filter(|upload| upload["kind"] == "delete")
+        .count();
+    let parked_deletes = count(
+        &store,
+        "SELECT COUNT(*) FROM outbox WHERE kind = 'delete' AND parked_error IS NOT NULL",
+    )
+    .await;
+    engine.stop().await;
+    assert_eq!(deletes, 1, "the refused delete is sent once");
+    assert_eq!(refusals, 0, "no second SyncError after the first");
+    assert_eq!(parked_deletes, 1);
+}

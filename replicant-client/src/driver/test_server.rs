@@ -115,6 +115,7 @@ struct Model {
     lose_next_upload: bool,
     drop_after_next_upload: bool,
     reject_next_upload: Option<String>,
+    reject_deletes: Option<String>,
     stamp_updates: u32,
     drop_next_push: bool,
     frames: Vec<Frame>,
@@ -213,6 +214,10 @@ impl ScriptedServer {
             .to_string();
             let _ = model.outbound[held.connection].send(frame);
         }
+    }
+
+    pub fn reject_deletes(&self, code: &str) {
+        self.model().reject_deletes = Some(code.to_string());
     }
 
     pub fn reject_next_upload(&self, code: &str) {
@@ -333,6 +338,7 @@ impl Model {
             lose_next_upload: false,
             drop_after_next_upload: false,
             reject_next_upload: None,
+            reject_deletes: None,
             stamp_updates: 0,
             drop_next_push: false,
             frames: Vec::new(),
@@ -504,6 +510,11 @@ impl Model {
         }
         if let Some(code) = self.reject_next_upload.take() {
             return error(&code);
+        }
+        if payload["kind"] == "delete" {
+            if let Some(code) = self.reject_deletes.clone() {
+                return error(&code);
+            }
         }
         let kind = payload["kind"].as_str().unwrap_or_default().to_string();
         let body = payload["payload"].clone();

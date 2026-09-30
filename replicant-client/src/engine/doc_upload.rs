@@ -33,8 +33,13 @@ pub enum BuildResult {
 
 pub fn build_upload(snap: &DocSnapshot, me: Uuid) -> BuildResult {
     let ends_in_delete = snap.rows.last().is_some_and(|r| r.kind == RowKind::Delete);
-    // A pending delete goes out even behind parked rows: nothing else can unpark a deleted document.
-    if snap.rows.is_empty() || (!ends_in_delete && snap.rows.iter().any(|r| r.parked)) {
+    // A pending delete goes out even behind parked rows: nothing else can unpark a deleted
+    // document. A delete the server refused is parked itself and waits like any other row.
+    let sendable_delete = snap
+        .rows
+        .last()
+        .is_some_and(|r| r.kind == RowKind::Delete && !r.parked);
+    if snap.rows.is_empty() || (!sendable_delete && snap.rows.iter().any(|r| r.parked)) {
         return BuildResult::Nothing;
     }
     let covered: Vec<Uuid> = snap.rows.iter().map(|r| r.mutation_id).collect();
@@ -489,6 +494,18 @@ mod upload_tests {
             s.shadow.as_ref().map(|sh| sh.hash.clone())
         );
         assert_eq!(inflight.covered, vec![m(1), m(2)]);
+    }
+
+    #[test]
+    fn a_parked_delete_is_not_built_again() {
+        let mut s = synced(json!({"n": 1}), 1);
+        s.soft_deleted = true;
+        let mut parked_update = row(1, RowKind::Update);
+        parked_update.parked = true;
+        let mut parked_delete = row(2, RowKind::Delete);
+        parked_delete.parked = true;
+        s.rows = vec![parked_update, parked_delete];
+        assert!(matches!(build_upload(&s, ME), BuildResult::Nothing));
     }
 
     #[test]
