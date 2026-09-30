@@ -88,6 +88,15 @@ fn is_document_event(event: &HostEvent) -> bool {
     )
 }
 
+fn is_connection_event(event: &HostEvent) -> bool {
+    matches!(
+        event,
+        HostEvent::ConnectionAttempted { .. }
+            | HostEvent::ConnectionSucceeded
+            | HostEvent::ConnectionLost
+    )
+}
+
 impl EventQueue {
     pub(super) fn push(&self, event: HostEvent) {
         let mut queued = lock(&self.0);
@@ -96,13 +105,15 @@ impl EventQueue {
             return;
         }
         if matches!(event, HostEvent::ConnectionAttempted { .. }) {
-            // Only the latest dial matters; a long offline spell must not push other events out.
-            if let Some(attempted) =
-                queued.events.iter_mut().rev().find(|queued_event| {
-                    matches!(queued_event, HostEvent::ConnectionAttempted { .. })
-                })
+            // Back-to-back dials collapse into the latest, so a long offline spell cannot push
+            // other events out; a dial after a success or loss stays after it.
+            if let Some(last @ HostEvent::ConnectionAttempted { .. }) = queued
+                .events
+                .iter_mut()
+                .rev()
+                .find(|queued_event| is_connection_event(queued_event))
             {
-                *attempted = event;
+                *last = event;
                 return;
             }
         }
@@ -448,6 +459,24 @@ mod tests {
                 HostEvent::ConnectionAttempted {
                     attempt: QUEUE_CAP as u32
                 }
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dial_after_a_lost_connection_stays_after_it() {
+        let queue = EventQueue::default();
+        queue.push(HostEvent::ConnectionAttempted { attempt: 1 });
+        queue.push(HostEvent::ConnectionSucceeded);
+        queue.push(HostEvent::ConnectionLost);
+        queue.push(HostEvent::ConnectionAttempted { attempt: 1 });
+        assert_eq!(
+            queue.take(),
+            vec![
+                HostEvent::ConnectionAttempted { attempt: 1 },
+                HostEvent::ConnectionSucceeded,
+                HostEvent::ConnectionLost,
+                HostEvent::ConnectionAttempted { attempt: 1 },
             ]
         );
     }
