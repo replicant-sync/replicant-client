@@ -967,3 +967,58 @@ async fn a_sign_out_in_another_process_while_halted_auth_invalid_reports_not_enr
         ConnectionView::Halted(HaltReason::NotEnrolled)
     );
 }
+
+async fn halted_account_disabled(server: &ScriptedServer, keys: &SwitchableCredentials) -> Harness {
+    server.reject_join("account_disabled");
+    let mut h = harness(&server.url, keys.loader(), ME, true).await;
+    h.start().await;
+    h.turn_until("halted", |o| {
+        connection(o) == ConnectionView::Halted(HaltReason::AccountDisabled)
+    })
+    .await;
+    h
+}
+
+#[tokio::test]
+async fn another_account_signed_in_elsewhere_after_account_disabled_is_dialled_within_three_seconds(
+) {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = halted_account_disabled(&server, &keys).await;
+    keys.set("k2");
+    server.accept_joins();
+    jump(Duration::from_millis(3100)).await;
+    h.turn_until("live with the other account", is_live).await;
+    assert_eq!(server.join_keys(), vec!["k1".to_string(), "k2".to_string()]);
+}
+
+#[tokio::test]
+async fn a_disabled_account_is_never_redialled_by_the_recheck() {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = halted_account_disabled(&server, &keys).await;
+    for _ in 0..10 {
+        jump(Duration::from_millis(3100)).await;
+        h.turns(3).await;
+    }
+    assert_eq!(server.stats.upgrades(), 1);
+    assert_eq!(
+        connection(&h.owner),
+        ConnectionView::Halted(HaltReason::AccountDisabled)
+    );
+    assert!(h.owner.timers.is_scheduled(&TimerId::HaltRetry));
+}
+
+#[tokio::test]
+async fn a_sign_out_while_halted_account_disabled_reports_not_enrolled() {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = halted_account_disabled(&server, &keys).await;
+    keys.sign_out();
+    jump(Duration::from_millis(3100)).await;
+    h.turns(3).await;
+    assert_eq!(
+        connection(&h.owner),
+        ConnectionView::Halted(HaltReason::NotEnrolled)
+    );
+}

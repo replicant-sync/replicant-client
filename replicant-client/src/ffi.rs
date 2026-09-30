@@ -225,6 +225,8 @@ pub enum ReplicantHaltReason {
     AuthInvalid = 2,
     /// The server needs a newer client.
     UpdateRequired = 3,
+    /// The server disabled the account. A different account signed in on this data dir, in any
+    /// process, is picked up within about 3 s; the same account stays halted.
     AccountDisabled = 4,
     /// This data dir belongs to another account.
     IdentityDrift = 5,

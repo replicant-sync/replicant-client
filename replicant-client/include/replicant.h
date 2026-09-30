@@ -213,6 +213,10 @@ enum ReplicantHaltReason
    * The server needs a newer client.
    */
   ReplicantHaltReason_UpdateRequired = 3,
+  /**
+   * The server disabled the account. A different account signed in on this data dir, in any
+   * process, is picked up within about 3 s; the same account stays halted.
+   */
   ReplicantHaltReason_AccountDisabled = 4,
   /**
    * This data dir belongs to another account.

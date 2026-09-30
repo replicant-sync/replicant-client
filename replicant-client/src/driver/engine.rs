@@ -191,7 +191,7 @@ struct Owner {
     /// Fingerprint of the credentials that signed the most recently sent join; may differ from
     /// `auth_fingerprint` if credentials changed while that join was outstanding.
     join_fingerprint: Option<[u8; 32]>,
-    /// Fingerprint of credentials the server rejected with `auth_invalid`, or that joined as
+    /// Fingerprint of credentials the server refused (`auth_invalid`, `account_disabled`), or that joined as
     /// another user (`identity_drift`).
     rejected: Option<[u8; 32]>,
     /// Seconds added to this machine's clock when signing a join; learnt from `clock_skew`.
@@ -459,8 +459,8 @@ impl Owner {
         }
     }
 
-    /// A halted engine's periodic check: credentials the server rejected with `auth_invalid`, or
-    /// that joined as another user, are not tried again until they change.
+    /// A halted engine's periodic check: credentials the server rejected with `auth_invalid` or
+    /// `account_disabled`, or that joined as another user, are not tried again until they change.
     fn check_credentials(&mut self) -> Input {
         let auth = match (self.credentials)() {
             Ok(Some(auth)) => auth,
@@ -687,9 +687,15 @@ impl Owner {
             }
             Effect::Emit(lifecycle) => self.emit(EngineEvent::Lifecycle(lifecycle)),
             Effect::SetState(state) => {
-                let drifted = matches!(&state.connection,
-                    ConnectionView::Halted(HaltReason::Other(code)) if code == "identity_drift");
-                if drifted || state.connection == ConnectionView::Halted(HaltReason::AuthInvalid) {
+                let refused = match &state.connection {
+                    ConnectionView::Halted(HaltReason::Other(code)) => code == "identity_drift",
+                    ConnectionView::Halted(reason) => matches!(
+                        reason,
+                        HaltReason::AuthInvalid | HaltReason::AccountDisabled
+                    ),
+                    _ => false,
+                };
+                if refused {
                     self.rejected = self.join_fingerprint;
                 }
                 self.state.send_replace(state);

@@ -28,18 +28,13 @@ const MAX_CATCH_UP_FAILURES: u32 = 3;
 const UNREADABLE_PUSHES_BEFORE_ERROR: u32 = 3;
 
 /// Halts that another process's sign-in can end: the stored credentials are read again every
-/// `CREDENTIALS_RECHECK`.
-fn is_credentials_recheck(reason: &HaltReason) -> bool {
-    match reason {
-        HaltReason::NotEnrolled | HaltReason::AuthInvalid => true,
-        HaltReason::Other(code) => code == "identity_drift",
-        HaltReason::UpdateRequired | HaltReason::AccountDisabled => false,
-    }
-}
-
-/// Halts a sign-out replaces with `NotEnrolled`.
+/// `CREDENTIALS_RECHECK`, and a sign-out replaces the halt with `NotEnrolled`.
 fn is_credential_halt(reason: &HaltReason) -> bool {
-    is_credentials_recheck(reason) || *reason == HaltReason::AccountDisabled
+    match reason {
+        HaltReason::NotEnrolled | HaltReason::AuthInvalid | HaltReason::AccountDisabled => true,
+        HaltReason::Other(code) => code == "identity_drift",
+        HaltReason::UpdateRequired => false,
+    }
 }
 
 fn schedule_credentials_recheck(fx: &mut Vec<Effect>) {
@@ -532,7 +527,7 @@ impl Core {
                 }
             }
             Input::CredentialsUnchanged => {
-                if matches!(&self.conn, Conn::Halted(reason) if is_credentials_recheck(reason)) {
+                if matches!(&self.conn, Conn::Halted(reason) if is_credential_halt(reason)) {
                     schedule_credentials_recheck(fx);
                 }
             }
@@ -658,7 +653,7 @@ impl Core {
             doc_id: None,
             fatal: true,
         }));
-        if is_credentials_recheck(&reason) {
+        if is_credential_halt(&reason) {
             schedule_credentials_recheck(fx);
         }
         self.conn = Conn::Halted(reason);
@@ -2463,7 +2458,7 @@ mod connection_tests {
     }
 
     #[test]
-    fn an_account_disabled_halt_is_not_rechecked() {
+    fn an_account_disabled_halt_is_checked_again_every_three_seconds() {
         let mut c = core();
         c.step(Input::Start {
             has_credentials: true,
@@ -2475,14 +2470,23 @@ mod connection_tests {
             req,
             result: Err(refused),
         });
-        assert!(!fx.iter().any(|e| matches!(
-            e,
-            Effect::Schedule {
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::HaltRetry,
+            after: CREDENTIALS_RECHECK
+        }));
+        assert!(c
+            .step(Input::Timer(TimerId::HaltRetry))
+            .contains(&Effect::CheckCredentials));
+        assert!(c
+            .step(Input::CredentialsUnchanged)
+            .contains(&Effect::Schedule {
                 timer: TimerId::HaltRetry,
-                ..
-            }
-        )));
-        assert!(c.step(Input::CredentialsUnchanged).is_empty());
+                after: CREDENTIALS_RECHECK
+            }));
+        assert_eq!(
+            c.state().connection,
+            ConnectionView::Halted(HaltReason::AccountDisabled)
+        );
     }
 }
 
