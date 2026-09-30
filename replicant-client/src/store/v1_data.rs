@@ -22,6 +22,7 @@ struct Counts {
     pending_without_base: usize,
     rejected_creates: usize,
     unmigratable: usize,
+    unowned_edits: usize,
     dropped_queue_rows: usize,
     markers: u64,
 }
@@ -48,6 +49,7 @@ pub(crate) async fn migrate_v1_data(pool: &SqlitePool) -> StoreResult<()> {
         pending = counts.pending,
         rejected_creates = counts.rejected_creates,
         unmigratable = counts.unmigratable,
+        unowned_edits = counts.unowned_edits,
         dropped_queue_rows = counts.dropped_queue_rows,
         markers = counts.markers,
         "migrated v1 sync data"
@@ -56,6 +58,12 @@ pub(crate) async fn migrate_v1_data(pool: &SqlitePool) -> StoreResult<()> {
         warn!(
             rows = counts.dropped_queue_rows,
             "v1 queue rows dropped: their documents are missing or were set aside"
+        );
+    }
+    if counts.unowned_edits > 0 {
+        warn!(
+            documents = counts.unowned_edits,
+            "v1 edits to documents that are not ours: kept aside, as only the owner can send them"
         );
     }
     if counts.pending_without_base > 0 {
@@ -174,6 +182,12 @@ async fn migrate(conn: &mut SqliteConnection) -> StoreResult<Counts> {
         let rows = queue.remove(&doc_id).unwrap_or_default();
         let mine = owner.is_some() && owner == me;
         let pending = mine && status == "pending";
+        // Only the owner can send an edit: another's is kept aside and the document migrates as
+        // synced.
+        if !mine && status == "pending" {
+            keep_aside(&mut *conn, &id, &content, "unmigratable").await?;
+            counts.unowned_edits += 1;
+        }
         let rejected_create =
             mine && status == "conflict" && rows.iter().any(|row| row.kind == "create");
 
@@ -227,15 +241,17 @@ async fn migrate(conn: &mut SqliteConnection) -> StoreResult<Counts> {
             (Some(content.clone()), Vec::new())
         };
 
+        // Documents of no or another account start read-only, as their snapshot would make them.
         sqlx::query(
             "UPDATE documents SET content = ?, hash = ?, server_content = ?, server_hash = ?, \
-             server_seq = ? WHERE id = ?",
+             server_seq = ?, read_only = ? WHERE id = ?",
         )
         .bind(content.to_string())
         .bind(content_hash(&content))
         .bind(shadow.as_ref().map(Value::to_string))
         .bind(shadow.as_ref().map(content_hash))
         .bind(shadow.as_ref().map(|_| 0_i64))
+        .bind(!mine)
         .bind(&id)
         .execute(&mut *conn)
         .await?;
@@ -729,6 +745,16 @@ mod tests {
                 (id(2), "collection:curated".to_string(), 1, 0),
                 (id(3), "collection:curated".to_string(), 1, 0),
             ]
+        );
+        let read_only: Vec<String> =
+            sqlx::query_scalar("SELECT id FROM documents WHERE read_only = 1 ORDER BY id")
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            read_only,
+            vec![id(2), id(3)],
+            "only our documents are writable"
         );
         assert_eq!(
             count(
@@ -1418,17 +1444,70 @@ mod tests {
         store.close().await;
     }
 
+    async fn kept_copies(store: &Store) -> Vec<(Uuid, Value, String)> {
+        store
+            .list_recovered()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|copy| (copy.doc_id, copy.content, copy.reason))
+            .collect()
+    }
+
     #[tokio::test]
-    async fn a_pending_document_of_another_account_is_migrated_as_synced() {
+    async fn a_pending_edit_on_another_accounts_document_is_kept_aside_and_it_migrates_as_synced() {
         let (_dir, path, pool) = v012_db().await;
         v1_user(&pool, ME, true).await;
-        let other = Uuid::from_u128(0x0BE);
-        v1_doc(&pool, &id(1), Some(other), json!({"n": 1}), "pending", None).await;
+        v1_doc(&pool, &id(1), Some(OTHER), json!({"n": 1}), "pending", None).await;
         v1_queue_row(&pool, &id(1), "update", None).await;
         let store = migrated(pool, &path).await;
         let snap = snapshot(&store, doc(1)).await;
         assert!(snap.rows.is_empty());
+        assert!(snap.read_only, "not ours to edit");
         assert_eq!(snap.shadow.map(|s| s.content), Some(json!({"n": 1})));
+        assert_eq!(
+            kept_copies(&store).await,
+            vec![(doc(1), json!({"n": 1}), "unmigratable".to_string())]
+        );
+        store.close().await;
+    }
+
+    /// A pending v1 edit of doc(1) with no owner, as v1's `resync_document` inserts a document it
+    /// did not have.
+    async fn unowned_pending_edit() -> (tempfile::TempDir, Store) {
+        let (dir, path, pool) = v012_db().await;
+        v1_user(&pool, ME, true).await;
+        v1_doc(&pool, &id(1), None, json!({"n": 2}), "pending", None).await;
+        v1_queue_row(&pool, &id(1), "update", Some(json!({"n": 1}))).await;
+        (dir, migrated(pool, &path).await)
+    }
+
+    #[tokio::test]
+    async fn a_pending_edit_on_an_unowned_document_is_kept_before_the_curated_sweep() {
+        let (_dir, store) = unowned_pending_edit().await;
+        assert!(snapshot(&store, doc(1)).await.read_only);
+        store.finish_snapshot(SCOPE_CURATED, &[], 1).await.unwrap();
+        assert!(!snapshot(&store, doc(1)).await.exists);
+        assert_eq!(
+            kept_copies(&store).await,
+            vec![(doc(1), json!({"n": 2}), "unmigratable".to_string())]
+        );
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_pending_edit_on_an_unowned_document_is_kept_when_a_snapshot_replaces_it() {
+        let (_dir, store) = unowned_pending_edit().await;
+        let server = envelope(doc(1), Some(ME), json!({"n": 1}), 5);
+        store
+            .apply_snapshot_page(ME, SCOPE_OWN, std::slice::from_ref(&server))
+            .await
+            .unwrap();
+        assert_eq!(snapshot(&store, doc(1)).await.content, json!({"n": 1}));
+        assert_eq!(
+            kept_copies(&store).await,
+            vec![(doc(1), json!({"n": 2}), "unmigratable".to_string())]
+        );
         store.close().await;
     }
 
