@@ -67,6 +67,9 @@ pub fn build_upload(snap: &DocSnapshot, me: Uuid) -> BuildResult {
     };
 
     match (&snap.shadow, ends_in_delete) {
+        // A sent row may have landed, and another device may have edited it since: the delete
+        // waits for the server's version to go out on.
+        (None, true) if snap.unacked_upload.is_some() => BuildResult::NeedsServerCopy,
         (shadow, true) => send(
             UploadKind::Delete,
             shadow.as_ref().map(|sh| sh.hash.clone()),
@@ -288,6 +291,18 @@ mod upload_tests {
         assert_eq!(u.kind, UploadKind::Delete);
         assert_eq!(u.base_hash, None);
         assert_eq!(f.covered, vec![m(1), m(2)]);
+    }
+
+    #[test]
+    fn a_delete_without_a_shadow_after_a_sent_row_fetches_the_server_copy() {
+        let s = DocSnapshot {
+            shadow: None,
+            soft_deleted: true,
+            rows: vec![row(1, RowKind::Create), row(2, RowKind::Delete)],
+            unacked_upload: Some(m(1)),
+            ..synced(sample(), 0)
+        };
+        assert_eq!(build_upload(&s, ME), BuildResult::NeedsServerCopy);
     }
 
     #[test]

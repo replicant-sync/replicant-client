@@ -768,6 +768,71 @@ async fn offline_create_then_delete_uploads_one_delete_and_tombstones_at_zero() 
 }
 
 #[tokio::test]
+async fn a_delete_after_a_lost_create_reply_never_destroys_another_devices_edit() {
+    let server = ScriptedServer::start(ME).await;
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, _events) = live_engine(&server, &path).await;
+    let store = engine.store();
+    server.lose_next_upload();
+    let doc_id = store
+        .create_document(ME, None, json!({"n": 1}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    eventually("the create is applied", || async {
+        server.doc(doc_id).is_some()
+    })
+    .await;
+    engine.stop().await;
+
+    let theirs = json!({"n": 2, "note": "theirs"});
+    server.put_doc(doc_id, theirs.clone());
+    let store = Store::open(&path).await.unwrap();
+    store.delete_document(ME, doc_id).await.unwrap();
+    store.close().await;
+
+    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let engine = Engine::start(&path, config(&server.url, credentials("k1")), events_tx)
+        .await
+        .unwrap();
+    let store = engine.store();
+    wait_for(&mut events, "DeleteSuperseded", |event| {
+        *event
+            == EngineEvent::Doc(DocNotice {
+                doc_id,
+                event: DocEvent::DeleteSuperseded,
+            })
+    })
+    .await;
+    eventually("settled", || async { outbox_rows(&store).await == 0 }).await;
+    assert_eq!(
+        server
+            .doc(doc_id)
+            .map(|(content, _, deleted)| (content, deleted)),
+        Some((theirs.clone(), false)),
+        "the other device's edit survives on the server"
+    );
+    assert!(server
+        .uploads_for(doc_id)
+        .iter()
+        .all(|upload| upload["kind"] != "delete"));
+    let after = snapshot(&store, doc_id).await;
+    assert!(after.exists && !after.soft_deleted);
+    assert_eq!(after.content, theirs);
+    let kept: Vec<_> = store
+        .list_recovered()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|copy| copy.doc_id == doc_id)
+        .collect();
+    assert_eq!(kept.len(), 1, "with no shadow the local content is kept");
+    assert_eq!(kept[0].content, json!({"n": 1}));
+    assert_eq!(kept[0].reason, "delete_superseded");
+    engine.stop().await;
+}
+
+#[tokio::test]
 async fn app_and_daw_on_one_data_dir_upload_an_edit_once() {
     let server = ScriptedServer::start(ME).await;
     let (_dir, path) = seeded_db(ME, true).await;

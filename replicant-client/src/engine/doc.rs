@@ -283,24 +283,26 @@ fn apply_upsert(
     }
     // A delete made on an older version must not destroy another device's newer edit. An
     // envelope holding the version it was made on (the shadow's, or our own last upload's)
-    // leaves it pending, to go out on the new base.
+    // leaves it pending, to go out on the new base. With no shadow the version it was made on
+    // is unknown, so any content other than the local content supersedes it, and the local
+    // content is kept whenever it differs.
     if delete_pending(snap) {
-        if let Some(old) = &snap.shadow {
-            let incoming = content_hash(&doc.content);
-            if incoming != content_hash(&old.content) && incoming != content_hash(&snap.content) {
-                if content_hash(&snap.content) != content_hash(&old.content) {
-                    ops.push(DocOp::Recover {
-                        content: snap.content.clone(),
-                        reason: RecoverReason::DeleteSuperseded,
-                    });
-                }
-                ops.push(DocOp::DropAllRows);
-                ops.push(DocOp::Undelete);
-                ops.push(DocOp::SetShadow(new_shadow));
-                ops.push(DocOp::SetContent(doc.content.clone()));
-                ops.push(DocOp::Emit(DocEvent::DeleteSuperseded));
-                return ops;
+        let incoming = content_hash(&doc.content);
+        let local = content_hash(&snap.content);
+        let base = snap.shadow.as_ref().map(|old| content_hash(&old.content));
+        if incoming != local && base.as_ref() != Some(&incoming) {
+            if base.as_ref() != Some(&local) {
+                ops.push(DocOp::Recover {
+                    content: snap.content.clone(),
+                    reason: RecoverReason::DeleteSuperseded,
+                });
             }
+            ops.push(DocOp::DropAllRows);
+            ops.push(DocOp::Undelete);
+            ops.push(DocOp::SetShadow(new_shadow));
+            ops.push(DocOp::SetContent(doc.content.clone()));
+            ops.push(DocOp::Emit(DocEvent::DeleteSuperseded));
+            return ops;
         }
         ops.push(DocOp::SetShadow(new_shadow));
         return ops;
@@ -1199,19 +1201,81 @@ mod apply_change_tests {
     }
 
     #[test]
-    fn a_pending_delete_without_a_shadow_is_never_superseded() {
+    fn a_pending_delete_without_a_shadow_is_superseded_by_other_content() {
         let mut s = synced(json!({"a": 1}), 0);
         s.shadow = None;
         s.soft_deleted = true;
         s.rows = vec![row(1, RowKind::Create), row(2, RowKind::Delete)];
         let ops = apply_change(&s, &upsert("own", json!({"a": 9}), 3), ME, &APPEND);
+        assert!(ops.contains(&DocOp::Emit(DocEvent::DeleteSuperseded)));
+        assert!(
+            ops.contains(&DocOp::Recover {
+                content: json!({"a": 1}),
+                reason: RecoverReason::DeleteSuperseded
+            }),
+            "with no shadow, any local content other than the incoming is kept"
+        );
+        let after = s.project(&ops);
+        assert!(after.exists && !after.soft_deleted);
+        assert!(after.rows.is_empty());
+        assert_eq!(after.content, json!({"a": 9}));
+        assert_eq!(after.shadow.unwrap().seq, 3);
+    }
+
+    #[test]
+    fn a_delete_without_a_shadow_is_superseded_by_a_version_this_device_never_saw() {
+        // Create sent, reply lost; another device edited it; this device deleted it offline
+        // and returns via a full resync.
+        let mut s = synced(json!({"a": 1}), 0);
+        s.shadow = None;
+        s.soft_deleted = true;
+        s.rows = vec![row(1, RowKind::Create), row(2, RowKind::Delete)];
+        s.unacked_upload = Some(m(1));
+        let other_device = env(json!({"a": 9}), 5);
+        let ops = apply_snapshot_doc(&s, "own", &other_device, ME, &APPEND);
+        assert!(ops.contains(&DocOp::Emit(DocEvent::DeleteSuperseded)));
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"a": 1}),
+            reason: RecoverReason::DeleteSuperseded
+        }));
+        let after = s.project(&ops);
+        assert!(after.exists && !after.soft_deleted);
+        assert_eq!(after.content, json!({"a": 9}));
+        assert_eq!(
+            build_upload(&after, ME),
+            BuildResult::Nothing,
+            "no delete goes out on the other device's version"
+        );
+    }
+
+    #[test]
+    fn a_delete_without_a_shadow_stays_pending_when_the_server_holds_our_content() {
+        // Our create landed but its reply was lost; the envelope is that create.
+        let mut s = synced(json!({"a": 1}), 0);
+        s.shadow = None;
+        s.soft_deleted = true;
+        s.rows = vec![row(1, RowKind::Create), row(2, RowKind::Delete)];
+        s.unacked_upload = Some(m(1));
+        let ours = env(json!({"a": 1}), 5);
+        let ops = apply_snapshot_doc(&s, "own", &ours, ME, &APPEND);
         assert!(!ops
             .iter()
-            .any(|op| matches!(op, DocOp::Emit(_) | DocOp::Undelete)));
+            .any(|op| matches!(op, DocOp::Emit(_) | DocOp::Undelete | DocOp::Recover { .. })));
         let after = s.project(&ops);
         assert!(after.soft_deleted);
         assert_eq!(after.rows, s.rows);
-        assert_eq!(after.shadow.unwrap().seq, 3);
+        assert_eq!(after.shadow.as_ref().unwrap().seq, 5);
+        match build_upload(&after, ME) {
+            BuildResult::Send { upload, .. } => {
+                assert_eq!(upload.kind, crate::engine::types::UploadKind::Delete);
+                assert_eq!(
+                    upload.base_hash,
+                    Some(ours.hash),
+                    "the delete goes out on our version"
+                );
+            }
+            other => panic!("expected the delete, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2383,6 +2447,8 @@ mod property_tests {
         rebase_conflicts_server_copy: u32,
         server_copy_fetches: u32,
         server_copy_waits: u32,
+        /// Deletes with no shadow that fetched the server copy before going out.
+        delete_copy_fetches: u32,
         mismatch_retries: u32,
         delete_wins: u32,
         local_deletes_settled: u32,
@@ -2407,6 +2473,7 @@ mod property_tests {
             self.rebase_conflicts_server_copy += other.rebase_conflicts_server_copy;
             self.server_copy_fetches += other.server_copy_fetches;
             self.server_copy_waits += other.server_copy_waits;
+            self.delete_copy_fetches += other.delete_copy_fetches;
             self.mismatch_retries += other.mismatch_retries;
             self.delete_wins += other.delete_wins;
             self.local_deletes_settled += other.local_deletes_settled;
@@ -3047,8 +3114,71 @@ mod property_tests {
                     self.apply(&ops);
                 }
                 BuildResult::Nothing => self.mismatches = 0,
-                BuildResult::NeedsServerCopy => panic!("the model document always has a shadow"),
+                BuildResult::NeedsServerCopy => {
+                    assert!(
+                        self.snap.shadow.is_none() && ends_in_delete,
+                        "only a delete with no shadow asks for the server copy in the model"
+                    );
+                    self.hits.delete_copy_fetches += 1;
+                    self.fetch_server_copy(server, rng);
+                }
             }
+        }
+
+        fn fetch_server_copy(&mut self, server: &Server, rng: &mut Jitter) {
+            self.hits.server_copy_fetches += 1;
+            if server.deleted {
+                let ops = apply_server_deleted(&self.snap, server.seq());
+                self.apply(&ops);
+                return;
+            }
+            let doc = server.envelope(server.seq());
+            if doc.seq > self.cursor {
+                // The copy may hold an upload of ours whose reply was lost;
+                // catching up lets its echo settle our rows first, then we rebuild.
+                self.hits.server_copy_waits += 1;
+                self.catch_up(server, rng);
+                return;
+            }
+            let pending_delete_before = delete_pending(&self.snap);
+            let rebase_possible = self.snap.shadow.is_some() && !self.snap.rows.is_empty();
+            let before_server_seq = self.snap.server_seq();
+            let old_shadow_content = self.snap.shadow.as_ref().map(|s| s.content.clone());
+            let local_content_before = self.snap.content.clone();
+            let ops = apply_server_copy(&self.snap, &doc, ME, self.lists);
+            self.count_rebase_conflict(rebase_possible, &ops, true);
+            if rebase_possible && !pending_delete_before && doc.seq > before_server_seq {
+                if let Some(shadow_content) = &old_shadow_content {
+                    assert_shared_collision_kept_aside(
+                        "server copy",
+                        self,
+                        shadow_content,
+                        &local_content_before,
+                        &doc.content,
+                        &ops,
+                    );
+                    let merge = check_pitches(
+                        "server copy",
+                        self,
+                        shadow_content,
+                        &local_content_before,
+                        &doc.content,
+                        &ops,
+                    );
+                    self.count_pitch_merge(merge);
+                }
+            }
+            self.apply(&ops);
+            // apply_server_copy's content guard gates on the envelope's own seq.
+            assert_other_device_edit_preserved(
+                before_server_seq,
+                doc.seq,
+                pending_delete_before,
+                &doc,
+                self,
+                &ops,
+                "server copy",
+            );
         }
 
         fn reply(&mut self, server: &Server, rng: &mut Jitter) {
@@ -3068,60 +3198,8 @@ mod property_tests {
                     self.apply(&ops);
                 }
                 SettleResult::FetchServerCopy => {
-                    self.hits.server_copy_fetches += 1;
                     self.mismatches += 1;
-                    if server.deleted {
-                        let ops = apply_server_deleted(&self.snap, server.seq());
-                        self.apply(&ops);
-                        return;
-                    }
-                    let doc = server.envelope(server.seq());
-                    if doc.seq > self.cursor {
-                        // The copy may hold an upload of ours whose reply was lost;
-                        // catching up lets its echo settle our rows first, then we rebuild.
-                        self.hits.server_copy_waits += 1;
-                        self.catch_up(server, rng);
-                        return;
-                    }
-                    let pending_delete_before = delete_pending(&self.snap);
-                    let rebase_possible = self.snap.shadow.is_some() && !self.snap.rows.is_empty();
-                    let before_server_seq = self.snap.server_seq();
-                    let old_shadow_content = self.snap.shadow.as_ref().map(|s| s.content.clone());
-                    let local_content_before = self.snap.content.clone();
-                    let ops = apply_server_copy(&self.snap, &doc, ME, self.lists);
-                    self.count_rebase_conflict(rebase_possible, &ops, true);
-                    if rebase_possible && !pending_delete_before && doc.seq > before_server_seq {
-                        if let Some(shadow_content) = &old_shadow_content {
-                            assert_shared_collision_kept_aside(
-                                "server copy",
-                                self,
-                                shadow_content,
-                                &local_content_before,
-                                &doc.content,
-                                &ops,
-                            );
-                            let merge = check_pitches(
-                                "server copy",
-                                self,
-                                shadow_content,
-                                &local_content_before,
-                                &doc.content,
-                                &ops,
-                            );
-                            self.count_pitch_merge(merge);
-                        }
-                    }
-                    self.apply(&ops);
-                    // apply_server_copy's content guard gates on the envelope's own seq.
-                    assert_other_device_edit_preserved(
-                        before_server_seq,
-                        doc.seq,
-                        pending_delete_before,
-                        &doc,
-                        self,
-                        &ops,
-                        "server copy",
-                    );
+                    self.fetch_server_copy(server, rng);
                 }
                 SettleResult::Retry { mismatch, .. } => {
                     if mismatch {
@@ -3569,7 +3647,7 @@ mod property_tests {
             drain(seed, &mut server, &mut client, &mut rng);
             for (base, deleted_over) in &server.deletes {
                 assert!(
-                    base.as_ref().is_none_or(|base| base == deleted_over),
+                    base.as_ref() == Some(deleted_over),
                     "seed {seed}: a delete destroyed a version the client had not seen"
                 );
             }
@@ -3618,6 +3696,7 @@ mod property_tests {
         assert!(totals.rebase_conflicts_delivery > 0, "{totals:?}");
         assert!(totals.server_copy_fetches > 0, "{totals:?}");
         assert!(totals.server_copy_waits > 0, "{totals:?}");
+        assert!(totals.delete_copy_fetches > 0, "{totals:?}");
         assert!(totals.mismatch_retries > 0, "{totals:?}");
         assert!(totals.delete_wins > 0, "{totals:?}");
         assert!(totals.local_deletes_settled > 0, "{totals:?}");
