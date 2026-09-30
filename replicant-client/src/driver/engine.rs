@@ -461,25 +461,29 @@ impl Owner {
 
     /// A halted engine's periodic check: credentials the server rejected with `auth_invalid`, or
     /// that joined as another user, are not tried again until they change.
-    fn check_credentials(&mut self) -> bool {
+    fn check_credentials(&mut self) -> Input {
         let auth = match (self.credentials)() {
             Ok(Some(auth)) => auth,
             Ok(None) => {
                 self.auth_fingerprint = None;
-                return false;
+                return Input::CredentialsChanged {
+                    has_credentials: false,
+                };
             }
             Err(error) => {
                 warn!(%error, "stored credentials unreadable");
-                return false;
+                return Input::CredentialsUnchanged;
             }
         };
         let print = fingerprint(&auth);
         if self.rejected == Some(print) {
-            return false;
+            return Input::CredentialsUnchanged;
         }
         self.auth_fingerprint = Some(print);
         self.connection.set_auth(auth);
-        true
+        Input::CredentialsChanged {
+            has_credentials: true,
+        }
     }
 
     async fn feed(&mut self, input: Input) {
@@ -575,11 +579,8 @@ impl Owner {
             Effect::Schedule { timer, after } => self.timers.schedule(timer, after),
             Effect::Cancel(timer) => self.timers.cancel(&timer),
             Effect::CheckCredentials => {
-                let has_credentials = self.check_credentials();
-                self.queue.push_back(Queued {
-                    epoch: None,
-                    input: Input::CredentialsChanged { has_credentials },
-                });
+                let input = self.check_credentials();
+                self.queue.push_back(Queued { epoch: None, input });
             }
             Effect::LoadCursors => match twice(|| store.load_cursors()).await {
                 Ok(cursors) => self.answer(Input::Cursors(cursors)),

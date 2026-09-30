@@ -81,6 +81,7 @@ fn next_input(rng: &mut Jitter, outstanding: &mut Vec<(u64, Request)>, socket_ge
             Input::CredentialsChanged {
                 has_credentials: false,
             },
+            Input::CredentialsUnchanged,
             Input::OutboxChanged,
             Input::UnreadablePush {
                 scope: Some("own".into()),

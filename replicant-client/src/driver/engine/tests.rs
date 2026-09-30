@@ -188,17 +188,19 @@ async fn halted_auth_invalid_does_not_redial_with_the_same_credentials() {
         connection(o) == ConnectionView::Halted(HaltReason::AuthInvalid)
     })
     .await;
-    jump(Duration::from_secs(301)).await;
-    h.turns(3).await;
+    for _ in 0..5 {
+        jump(Duration::from_millis(3100)).await;
+        h.turns(3).await;
+    }
     assert_eq!(
         server.stats.upgrades(),
         1,
-        "the 5 min check must not redial with credentials the server rejected"
+        "the 3 s check must not redial with credentials the server rejected"
     );
     assert!(h.owner.timers.is_scheduled(&TimerId::HaltRetry));
     keys.set("k2");
     server.accept_joins();
-    jump(Duration::from_secs(301)).await;
+    jump(Duration::from_millis(3100)).await;
     h.turn_until("live with new credentials", is_live).await;
     assert_eq!(server.join_keys(), vec!["k1".to_string(), "k2".to_string()]);
 }
@@ -892,4 +894,76 @@ async fn two_engines_starting_on_one_v1_database_both_start_and_migrate_it_once(
     );
     app.stop().await;
     daw.stop().await;
+}
+
+#[tokio::test]
+async fn a_re_sign_in_after_auth_invalid_in_another_process_is_picked_up_within_three_seconds() {
+    let server = ScriptedServer::start(ME).await;
+    server.reject_join("auth_invalid");
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = harness(&server.url, keys.loader(), ME, true).await;
+    h.start().await;
+    h.turn_until("halted", |o| {
+        connection(o) == ConnectionView::Halted(HaltReason::AuthInvalid)
+    })
+    .await;
+    // The user signs out and in again in another process (Studio): this engine is never told.
+    keys.set("k2");
+    server.accept_joins();
+    for _ in 0..(3250 / LOG_TICK.as_millis()) {
+        jump(LOG_TICK).await;
+        h.turns(2).await;
+    }
+    assert_ne!(
+        connection(&h.owner),
+        ConnectionView::Halted(HaltReason::AuthInvalid),
+        "a cross-process re-sign-in after auth_invalid is not picked up within 3 s"
+    );
+}
+
+#[tokio::test]
+async fn a_sign_out_while_halted_auth_invalid_reports_not_enrolled() {
+    let server = ScriptedServer::start(ME).await;
+    server.reject_join("auth_invalid");
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = harness(&server.url, keys.loader(), ME, true).await;
+    h.start().await;
+    h.turn_until("halted", |o| {
+        connection(o) == ConnectionView::Halted(HaltReason::AuthInvalid)
+    })
+    .await;
+    // replicant_clear_credentials in this process.
+    keys.sign_out();
+    assert!(h
+        .controls
+        .commands
+        .try_send(Command::CredentialsChanged)
+        .is_ok());
+    h.turns(3).await;
+    assert_eq!(
+        connection(&h.owner),
+        ConnectionView::Halted(HaltReason::NotEnrolled),
+        "signed out, but the state still says the credentials were refused"
+    );
+}
+
+#[tokio::test]
+async fn a_sign_out_in_another_process_while_halted_auth_invalid_reports_not_enrolled_within_three_seconds(
+) {
+    let server = ScriptedServer::start(ME).await;
+    server.reject_join("auth_invalid");
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = harness(&server.url, keys.loader(), ME, true).await;
+    h.start().await;
+    h.turn_until("halted", |o| {
+        connection(o) == ConnectionView::Halted(HaltReason::AuthInvalid)
+    })
+    .await;
+    keys.sign_out();
+    jump(Duration::from_millis(3100)).await;
+    h.turns(3).await;
+    assert_eq!(
+        connection(&h.owner),
+        ConnectionView::Halted(HaltReason::NotEnrolled)
+    );
 }

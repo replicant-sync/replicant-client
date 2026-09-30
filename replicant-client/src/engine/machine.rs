@@ -22,21 +22,31 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 const STABLE_AFTER: Duration = Duration::from_secs(60);
 const QUIET: Duration = Duration::from_millis(200);
 const QUIET_CAP: Duration = Duration::from_secs(1);
-const HALT_RETRY: Duration = Duration::from_secs(300);
 /// A sign-in in another process is noticed this soon (0.6 polled every 3 s).
-const NOT_ENROLLED_RECHECK: Duration = Duration::from_secs(3);
+const CREDENTIALS_RECHECK: Duration = Duration::from_secs(3);
 const MAX_CATCH_UP_FAILURES: u32 = 3;
 const UNREADABLE_PUSHES_BEFORE_ERROR: u32 = 3;
 
-/// Halts that another process's sign-in can end, so the stored credentials are read again:
-/// every `NOT_ENROLLED_RECHECK` when signed out, every `HALT_RETRY` otherwise.
-fn credentials_recheck(reason: &HaltReason) -> Option<Duration> {
+/// Halts that another process's sign-in can end: the stored credentials are read again every
+/// `CREDENTIALS_RECHECK`.
+fn is_credentials_recheck(reason: &HaltReason) -> bool {
     match reason {
-        HaltReason::NotEnrolled => Some(NOT_ENROLLED_RECHECK),
-        HaltReason::AuthInvalid => Some(HALT_RETRY),
-        HaltReason::Other(code) if code == "identity_drift" => Some(HALT_RETRY),
-        HaltReason::Other(_) | HaltReason::UpdateRequired | HaltReason::AccountDisabled => None,
+        HaltReason::NotEnrolled | HaltReason::AuthInvalid => true,
+        HaltReason::Other(code) => code == "identity_drift",
+        HaltReason::UpdateRequired | HaltReason::AccountDisabled => false,
     }
+}
+
+/// Halts a sign-out replaces with `NotEnrolled`.
+fn is_credential_halt(reason: &HaltReason) -> bool {
+    is_credentials_recheck(reason) || *reason == HaltReason::AccountDisabled
+}
+
+fn schedule_credentials_recheck(fx: &mut Vec<Effect>) {
+    fx.push(Effect::Schedule {
+        timer: TimerId::HaltRetry,
+        after: CREDENTIALS_RECHECK,
+    });
 }
 
 /// Why the connection is halted and will not retry on its own schedule.
@@ -176,6 +186,9 @@ pub enum Input {
     CredentialsChanged {
         has_credentials: bool,
     },
+    /// A halted engine's credential check found nothing new to try: the refused credentials are
+    /// still stored, or the file was unreadable.
+    CredentialsUnchanged,
     OutboxChanged,
     Shutdown,
     /// `gen` echoes the `OpenSocket` it answers; events from older sockets are ignored.
@@ -244,7 +257,7 @@ pub enum Effect {
     CloseSocket {
         gen: u64,
     },
-    /// Answered with `Input::CredentialsChanged`.
+    /// Answered with `Input::CredentialsChanged` or `Input::CredentialsUnchanged`.
     CheckCredentials,
     Send {
         req: u64,
@@ -509,14 +522,18 @@ impl Core {
                 if let Conn::Halted(reason) = &self.conn {
                     if has_credentials {
                         self.connect_now(fx);
-                    } else if let Some(after) = credentials_recheck(reason) {
-                        fx.push(Effect::Schedule {
-                            timer: TimerId::HaltRetry,
-                            after,
-                        });
+                    } else if *reason == HaltReason::NotEnrolled {
+                        schedule_credentials_recheck(fx);
+                    } else if is_credential_halt(reason) {
+                        self.halt(HaltReason::NotEnrolled, fx);
                     }
                 } else if !has_credentials {
                     self.sign_out(fx);
+                }
+            }
+            Input::CredentialsUnchanged => {
+                if matches!(&self.conn, Conn::Halted(reason) if is_credentials_recheck(reason)) {
+                    schedule_credentials_recheck(fx);
                 }
             }
             Input::SocketOpened { gen } | Input::SocketClosed { gen } if gen != self.socket_gen => {
@@ -641,11 +658,8 @@ impl Core {
             doc_id: None,
             fatal: true,
         }));
-        if let Some(after) = credentials_recheck(&reason) {
-            fx.push(Effect::Schedule {
-                timer: TimerId::HaltRetry,
-                after,
-            });
+        if is_credentials_recheck(&reason) {
+            schedule_credentials_recheck(fx);
         }
         self.conn = Conn::Halted(reason);
     }
@@ -2356,7 +2370,7 @@ mod connection_tests {
     }
 
     #[test]
-    fn an_identity_drift_halt_is_checked_again_every_five_minutes() {
+    fn an_identity_drift_halt_is_checked_again_every_three_seconds() {
         let mut c = core();
         c.step(Input::Start {
             has_credentials: true,
@@ -2374,21 +2388,101 @@ mod connection_tests {
         );
         assert!(fx.contains(&Effect::Schedule {
             timer: TimerId::HaltRetry,
-            after: HALT_RETRY
+            after: CREDENTIALS_RECHECK
         }));
         assert!(c
             .step(Input::Timer(TimerId::HaltRetry))
             .contains(&Effect::CheckCredentials));
         assert!(
-            c.step(Input::CredentialsChanged {
-                has_credentials: false
-            })
-            .contains(&Effect::Schedule {
-                timer: TimerId::HaltRetry,
-                after: HALT_RETRY
-            }),
+            c.step(Input::CredentialsUnchanged)
+                .contains(&Effect::Schedule {
+                    timer: TimerId::HaltRetry,
+                    after: CREDENTIALS_RECHECK
+                }),
             "a check that finds the drifted credentials schedules the next one"
         );
+        assert_eq!(
+            c.state().connection,
+            ConnectionView::Halted(HaltReason::Other("identity_drift".into()))
+        );
+    }
+
+    #[test]
+    fn a_sign_out_from_any_credential_halt_reports_not_enrolled_and_rechecks() {
+        for code in ["auth_invalid", "identity_drift", "account_disabled"] {
+            let mut c = core();
+            c.step(Input::Start {
+                has_credentials: true,
+            });
+            let (req, _) = sends(&c.step(opened(&c))).pop().expect("join sent");
+            let mut refused = ServerError::new(code);
+            refused.is_fatal = true;
+            c.step(Input::Reply {
+                req,
+                result: Err(refused),
+            });
+            assert!(matches!(c.state().connection, ConnectionView::Halted(_)));
+            let fx = c.step(Input::CredentialsChanged {
+                has_credentials: false,
+            });
+            assert_eq!(
+                c.state().connection,
+                ConnectionView::Halted(HaltReason::NotEnrolled),
+                "{code}"
+            );
+            assert!(
+                fx.contains(&Effect::Schedule {
+                    timer: TimerId::HaltRetry,
+                    after: CREDENTIALS_RECHECK
+                }),
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sign_out_while_halted_update_required_keeps_that_reason() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (req, _) = sends(&c.step(opened(&c))).pop().expect("join sent");
+        let mut refused = ServerError::new("update_required");
+        refused.is_fatal = true;
+        c.step(Input::Reply {
+            req,
+            result: Err(refused),
+        });
+        c.step(Input::CredentialsChanged {
+            has_credentials: false,
+        });
+        assert_eq!(
+            c.state().connection,
+            ConnectionView::Halted(HaltReason::UpdateRequired)
+        );
+    }
+
+    #[test]
+    fn an_account_disabled_halt_is_not_rechecked() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (req, _) = sends(&c.step(opened(&c))).pop().expect("join sent");
+        let mut refused = ServerError::new("account_disabled");
+        refused.is_fatal = true;
+        let fx = c.step(Input::Reply {
+            req,
+            result: Err(refused),
+        });
+        assert!(!fx.iter().any(|e| matches!(
+            e,
+            Effect::Schedule {
+                timer: TimerId::HaltRetry,
+                ..
+            }
+        )));
+        assert!(c.step(Input::CredentialsUnchanged).is_empty());
     }
 }
 
