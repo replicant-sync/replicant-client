@@ -224,7 +224,7 @@ pub(crate) async fn apply_ops(
             DocOp::Emit(event) => notices.push(DocNotice {
                 doc_id: snap.doc_id,
                 event: event.clone(),
-                kept: kept.clone(),
+                kept: kept.take(),
             }),
             DocOp::SetShadow(_)
             | DocOp::SetContent(_)
@@ -482,6 +482,25 @@ mod tests {
             t.store.list_recovered().await.unwrap()[0].id,
             kept.recovered_id
         );
+    }
+
+    #[tokio::test]
+    async fn a_kept_copy_attaches_to_the_next_notice_only() {
+        let t = temp_store().await;
+        seed_synced(&t.store, DOC, "own", Some(ME), json!({"a": 1}), 1).await;
+        let notices = apply(&t.store, DOC, |_| {
+            vec![
+                DocOp::Recover {
+                    content: json!({"a": 2}),
+                    reason: RecoverReason::DeleteWins,
+                },
+                DocOp::Emit(DocEvent::ConflictDetected),
+                DocOp::Emit(DocEvent::ConflictDetected),
+            ]
+        })
+        .await;
+        assert!(notices[0].kept.is_some());
+        assert_eq!(notices[1].kept, None);
     }
 
     #[tokio::test]

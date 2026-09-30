@@ -76,6 +76,7 @@ impl Store {
         };
         let doc_id = Uuid::parse_str(&doc_id)?;
         let fields: Vec<FieldConflict> = serde_json::from_str(&fields)?;
+        // Checked before put_field: a deleted document would otherwise report Corrupt.
         let snap = load_snapshot(&mut tx, doc_id).await?;
         if !snap.exists || snap.soft_deleted {
             return Err(StoreError::DocumentGone(doc_id));
