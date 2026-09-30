@@ -1055,6 +1055,38 @@ async fn a_new_secret_for_the_same_key_stored_elsewhere_after_account_disabled_i
     assert_eq!(server.stats.upgrades(), 2);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_launches_on_one_v1_database_write_exactly_one_backup() {
+    for _ in 0..5 {
+        let (_dir, path, pool) = v012_db().await;
+        v1_user(&pool, ME, true).await;
+        let doc_id = Uuid::from_u128(0xD1).to_string();
+        v1_doc(&pool, &doc_id, Some(ME), json!({"n": 1}), "pending", None).await;
+        v1_queue_row(&pool, &doc_id, "update", Some(json!({"n": 0}))).await;
+        pool.close().await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let start = || {
+            Engine::start(
+                &path,
+                config("ws://127.0.0.1:9", no_credentials()),
+                tx.clone(),
+            )
+        };
+        let (a, b, c, d) = tokio::join!(start(), start(), start(), start());
+        let engines: Vec<Engine> = [a, b, c, d].into_iter().map(Result::unwrap).collect();
+        let prefix = format!("{}.v1-backup", path.file_name().unwrap().to_string_lossy());
+        let backups: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name == &prefix || name.starts_with(&format!("{prefix}-")))
+            .collect();
+        assert_eq!(backups, vec![prefix]);
+        for engine in engines {
+            engine.stop().await;
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_sign_out_seen_at_the_join_lets_the_disabled_keys_be_dialled_once_stored_again() {
     let server = ScriptedServer::start(ME).await;

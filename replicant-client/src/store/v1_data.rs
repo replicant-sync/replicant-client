@@ -394,8 +394,8 @@ async fn holds_v1_data<'c>(conn: impl sqlx::SqliteExecutor<'c>) -> StoreResult<b
 
 /// Copies a data dir that still holds v1 sync data to `<db path>.v1-backup` before 015 changes
 /// it for good. The copy is written under a temporary name and renamed, so a backup that exists
-/// is complete. An existing backup is never replaced: a later attempt writes a new one beside it
-/// (`backup_path`).
+/// is complete. Once a backup exists, another is written only for a clean v1 file (one restored
+/// from a backup and used by 0.6 again), and beside the old one (`backup_path`), never over it.
 pub(crate) async fn back_up_v1_database(pool: &SqlitePool, db_path: &Path) -> StoreResult<()> {
     if !holds_v1_data(pool).await? {
         return Ok(());
@@ -403,19 +403,34 @@ pub(crate) async fn back_up_v1_database(pool: &SqlitePool, db_path: &Path) -> St
     // Holding the write lock serialises backups across processes, so a temporary file found
     // here was left by a crash.
     let mut lock = pool.begin_with("BEGIN IMMEDIATE").await?;
-    // Another process may have migrated the file while this one waited for the lock.
-    if !holds_v1_data(&mut *lock).await? {
+    // Another process may have migrated the file, or backed it up, while this one waited for
+    // the lock.
+    if !holds_v1_data(&mut *lock).await?
+        || (any_backup_exists(db_path)? && !is_clean_v1(&mut lock).await?)
+    {
         lock.rollback().await?;
         return Ok(());
     }
     let backup = backup_path(db_path, now_unix());
     let partial = sibling(db_path, ".v1-backup.tmp");
-    let written = write_backup(pool, &partial, &backup).await;
-    if written.is_err() {
+    if let Err(error) = write_backup(pool, &partial, &backup).await {
         let _ = std::fs::remove_file(&partial);
+        lock.rollback().await?;
+        return Err(error);
     }
-    lock.rollback().await?;
-    written
+    // Marks the file as backed up. The mark is written after the copy, so a backup restored
+    // over the file is unmarked.
+    let marked = match sqlx::query(&format!("PRAGMA user_version = {V1_BACKED_UP}"))
+        .execute(&mut *lock)
+        .await
+    {
+        Ok(_) => lock.commit().await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = marked {
+        warn!(%error, "could not mark the v1 database as backed up");
+    }
+    Ok(())
 }
 
 async fn write_backup(pool: &SqlitePool, partial: &Path, backup: &Path) -> StoreResult<()> {
@@ -442,6 +457,54 @@ async fn write_backup(pool: &SqlitePool, partial: &Path, backup: &Path) -> Store
         let _ = std::fs::File::open(dir).and_then(|dir| dir.sync_all());
     }
     Ok(())
+}
+
+/// The first migration only 2.0 applies; a file that records it has been migrated since its
+/// backup, even if 015 has not finished.
+const FIRST_V2_MIGRATION: i64 = 13;
+/// `PRAGMA user_version` of a v1 file that has been backed up. v1 never sets it.
+const V1_BACKED_UP: i64 = 0x5631_424b;
+
+/// A v1 file that was neither backed up nor touched by 2.0: one restored from a backup.
+async fn is_clean_v1(conn: &mut SqliteConnection) -> StoreResult<bool> {
+    let user_version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut *conn)
+        .await?;
+    if user_version == V1_BACKED_UP {
+        return Ok(false);
+    }
+    let has_ledger: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if has_ledger == 0 {
+        return Ok(true);
+    }
+    let v2_applied: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version >= ?")
+            .bind(FIRST_V2_MIGRATION)
+            .fetch_one(&mut *conn)
+            .await?;
+    Ok(v2_applied == 0)
+}
+
+/// Whether `<db path>.v1-backup` or a `.v1-backup-<suffix>` beside it exists; a partial
+/// `.v1-backup.tmp` does not count.
+fn any_backup_exists(db_path: &Path) -> StoreResult<bool> {
+    let (Some(dir), Some(name)) = (db_path.parent(), db_path.file_name()) else {
+        return Ok(false);
+    };
+    let first = format!("{}.v1-backup", name.to_string_lossy());
+    let stamped = format!("{first}-");
+    for entry in std::fs::read_dir(dir).map_err(backup_failed)? {
+        let entry_name = entry.map_err(backup_failed)?.file_name();
+        let entry_name = entry_name.to_string_lossy();
+        if entry_name == first || entry_name.starts_with(&stamped) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn backup_failed(error: impl std::fmt::Display) -> StoreError {
@@ -1247,8 +1310,22 @@ mod tests {
         );
     }
 
+    fn backups_of(path: &Path) -> Vec<PathBuf> {
+        let prefix = format!("{}.v1-backup", path.file_name().unwrap().to_string_lossy());
+        let mut found: Vec<PathBuf> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|p| {
+                let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                name == prefix || name.starts_with(&format!("{prefix}-"))
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
     #[tokio::test]
-    async fn a_backup_from_an_earlier_failed_migration_is_kept_as_it_was() {
+    async fn a_migration_that_keeps_failing_after_the_backup_leaves_exactly_one_backup() {
         let (_dir, path, pool) = v012_db().await;
         v1_user(&pool, ME, true).await;
         v1_doc(
@@ -1267,47 +1344,56 @@ mod tests {
         .await
         .unwrap();
         pool.close().await;
-        assert!(Store::open(&path)
-            .await
-            .err()
-            .unwrap()
-            .is_migration_failed());
+        for _ in 0..3 {
+            assert!(Store::open(&path)
+                .await
+                .err()
+                .unwrap()
+                .is_migration_failed());
+        }
+        let first = std::fs::read(backup_of(&path)).unwrap();
 
         let raw = raw_pool(&path).await;
         sqlx::query("DROP TRIGGER refuse")
             .execute(&raw)
             .await
             .unwrap();
+        raw.close().await;
+        Store::open(&path).await.unwrap().close().await;
+        assert_eq!(backups_of(&path), vec![backup_of(&path)]);
+        assert_eq!(
+            std::fs::read(backup_of(&path)).unwrap(),
+            first,
+            "the retries leave the first backup byte for byte"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restored_v1_database_used_by_0_6_again_gets_a_new_backup_beside_the_old_one() {
+        let (_dir, migrated_path, pool) = v012_db().await;
+        v1_user(&pool, ME, true).await;
+        v1_doc(&pool, &id(1), Some(ME), json!({"n": 1}), "synced", None).await;
+        migrated(pool, &migrated_path).await.close().await;
+        let first = std::fs::read(backup_of(&migrated_path)).unwrap();
+
+        // The user restores the backup and runs 0.6, which edits the document. A fresh dir
+        // holding the same two files: a closed pool's handle may still touch the old one.
+        let restored_dir = tempfile::tempdir().unwrap();
+        let path = restored_dir.path().join(migrated_path.file_name().unwrap());
+        std::fs::write(backup_of(&path), &first).unwrap();
+        std::fs::write(&path, &first).unwrap();
+        let raw = raw_pool(&path).await;
         sqlx::query("UPDATE documents SET content = '{\"n\":2}'")
             .execute(&raw)
             .await
             .unwrap();
         raw.close().await;
-        let first = std::fs::read(backup_of(&path)).unwrap();
         Store::open(&path).await.unwrap().close().await;
-        assert_eq!(
-            std::fs::read(backup_of(&path)).unwrap(),
-            first,
-            "the retry leaves the first backup byte for byte"
-        );
-        assert_eq!(
-            backed_up_content(&path, doc(1)).await,
-            json!({"n": 1}).to_string()
-        );
-        let prefix = format!("{}.v1-backup-", path.file_name().unwrap().to_string_lossy());
-        let stamped: Vec<PathBuf> = std::fs::read_dir(path.parent().unwrap())
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
-            .filter(|p| {
-                p.file_name()
-                    .unwrap()
-                    .to_string_lossy()
-                    .strip_prefix(&prefix)
-                    .is_some_and(|secs| secs.parse::<i64>().is_ok())
-            })
-            .collect();
-        assert_eq!(stamped.len(), 1, "the retry writes a timestamped backup");
-        let second = raw_pool(&stamped[0]).await;
+
+        let backups = backups_of(&path);
+        assert_eq!(backups.len(), 2, "{backups:?}");
+        assert_eq!(std::fs::read(backup_of(&path)).unwrap(), first);
+        let second = raw_pool(&backups[1]).await;
         let content: String = sqlx::query_scalar("SELECT content FROM documents")
             .fetch_one(&second)
             .await
