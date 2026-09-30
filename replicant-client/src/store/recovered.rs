@@ -14,7 +14,7 @@ pub struct RecoveredCopy {
     /// The full local content when it was set aside.
     pub content: Value,
     /// `conflict`, `field_conflict`, `delete_wins`, `became_publication`, `create_rejected`,
-    /// `delete_superseded` or `delete_refused`.
+    /// `delete_superseded`, `delete_refused` or `delete_publication`.
     pub reason: String,
     /// Unix seconds.
     pub recovered_at: i64,

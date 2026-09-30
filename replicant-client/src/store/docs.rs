@@ -413,6 +413,7 @@ fn reason_str(reason: RecoverReason) -> &'static str {
         RecoverReason::CreateRejected => "create_rejected",
         RecoverReason::DeleteSuperseded => "delete_superseded",
         RecoverReason::DeleteRefused => "delete_refused",
+        RecoverReason::DeletePublication => "delete_publication",
     }
 }
 

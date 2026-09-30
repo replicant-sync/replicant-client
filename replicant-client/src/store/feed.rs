@@ -486,4 +486,47 @@ mod tests {
             "a host write in another process waited {waited:?} behind a snapshot page"
         );
     }
+
+    #[tokio::test]
+    async fn a_pending_delete_on_a_document_that_became_a_publication_leaves_it_visible() {
+        let t = temp_store().await;
+        seed_synced(
+            &t.store,
+            doc(1),
+            SCOPE_OWN,
+            Some(ME),
+            json!({"title": "Mine"}),
+            3,
+        )
+        .await;
+        t.store.delete_document(doc(1)).await.unwrap();
+        let mut publication = envelope(doc(1), Some(ME), json!({"title": "Mine"}), 4);
+        publication.read_only = true;
+        t.store
+            .apply_changes(
+                ME,
+                SCOPE_CURATED,
+                &[upsert_change(SCOPE_CURATED, publication)],
+                4,
+            )
+            .await
+            .unwrap();
+        let visible = format!(
+            "SELECT COUNT(*) FROM documents WHERE id = '{}' AND deleted_at IS NULL AND read_only = 1",
+            doc(1)
+        );
+        assert_eq!(count(&t.store, &visible).await, 1);
+        assert_eq!(count(&t.store, "SELECT COUNT(*) FROM outbox").await, 0);
+        assert_eq!(
+            count(&t.store, "SELECT COUNT(*) FROM recovered").await,
+            0,
+            "deleted without an edit: nothing kept"
+        );
+        let last_kind: String =
+            sqlx::query_scalar("SELECT kind FROM change_log ORDER BY local_seq DESC LIMIT 1")
+                .fetch_one(&t.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(last_kind, "upsert", "the host is told it is back");
+    }
 }
