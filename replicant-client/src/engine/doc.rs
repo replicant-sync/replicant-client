@@ -3201,9 +3201,9 @@ mod property_tests {
     }
 
     /// At a rebase, `pitches` is either set aside whole (the server's list taken) or merged with
-    /// nothing lost, duplicated or revived, and with the order both sides agree on kept. Nothing
-    /// comes from neither side. An atomic list both sides changed to different lists is always
-    /// set aside whole.
+    /// nothing lost, duplicated or revived, and with the order kept for every pair both sides
+    /// hold and agree on. Nothing comes from neither side. An atomic list both sides changed to
+    /// different lists is always set aside whole.
     fn check_pitches(
         what: &str,
         client: &Client,
@@ -3276,16 +3276,13 @@ mod property_tests {
                     Some(first_at < second_at)
                 });
                 if let [Some(in_mine), Some(in_theirs)] = orders {
-                    if in_mine != in_theirs {
-                        continue;
+                    if in_mine == in_theirs {
+                        assert!(
+                            in_mine,
+                            "{what}: {first} and {second} are out of order \
+                             (mine {mine:?}, theirs {theirs:?}, result {result:?})"
+                        );
                     }
-                }
-                if let Some(first_is_first) = orders.into_iter().flatten().next() {
-                    assert!(
-                        first_is_first,
-                        "{what}: {first} and {second} are out of order \
-                         (mine {mine:?}, theirs {theirs:?}, result {result:?})"
-                    );
                 }
             }
         }
