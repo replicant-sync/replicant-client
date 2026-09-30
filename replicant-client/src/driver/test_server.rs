@@ -102,6 +102,7 @@ struct Model {
     mode: Mode,
     user_id: Uuid,
     join_error: Option<String>,
+    clock_ahead: Option<i64>,
     seq: i64,
     docs: HashMap<Uuid, ServerDoc>,
     log: Vec<LogEntry>,
@@ -156,6 +157,12 @@ impl ScriptedServer {
 
     pub fn accept_joins(&self) {
         self.model().join_error = None;
+    }
+
+    /// Joins are checked against a server clock `secs` ahead of this machine's, with the real
+    /// server's 300 s window.
+    pub fn clock_ahead_by(&self, secs: i64) {
+        self.model().clock_ahead = Some(secs);
     }
 
     pub fn lose_next_upload(&self) {
@@ -286,6 +293,7 @@ impl Model {
             mode: Mode::Normal,
             user_id,
             join_error: None,
+            clock_ahead: None,
             seq: 0,
             docs: HashMap::new(),
             log: Vec::new(),
@@ -689,16 +697,27 @@ fn handle(model: &Mutex<Model>, index: usize, text: &str) -> Outcome {
     let mut outcome = Outcome::default();
     match event.as_str() {
         "heartbeat" => outcome.replies.push(reply("ok", json!({}))),
-        "phx_join" => match model.join_error.clone() {
-            Some(code) => outcome
-                .replies
-                .push(reply("error", json!({"code": code, "is_fatal": true}))),
-            None => {
-                model.joined.insert(index);
-                let joined = json!({"user_id": model.user_id, "protocol_version": 2});
-                outcome.replies.push(reply("ok", joined));
+        "phx_join" => {
+            let skewed = model.clock_ahead.and_then(|ahead| {
+                let server_time = crate::store::now_unix() + ahead;
+                let signed = payload["timestamp"].as_i64().unwrap_or_default();
+                ((signed - server_time).abs() > 300).then_some(server_time)
+            });
+            match (skewed, model.join_error.clone()) {
+                (Some(server_time), _) => outcome.replies.push(reply(
+                    "error",
+                    json!({"code": "clock_skew", "is_fatal": false, "server_time": server_time}),
+                )),
+                (None, Some(code)) => outcome
+                    .replies
+                    .push(reply("error", json!({"code": code, "is_fatal": true}))),
+                (None, None) => {
+                    model.joined.insert(index);
+                    let joined = json!({"user_id": model.user_id, "protocol_version": 2});
+                    outcome.replies.push(reply("ok", joined));
+                }
             }
-        },
+        }
         "get_changes_since" => {
             let (status, response) = model.changes_since(&payload);
             outcome.replies.push(reply(status, response));

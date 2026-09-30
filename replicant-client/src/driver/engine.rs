@@ -181,6 +181,8 @@ struct Owner {
     join_fingerprint: Option<[u8; 32]>,
     /// Fingerprint of credentials the server rejected with `auth_invalid`.
     rejected: Option<[u8; 32]>,
+    /// Seconds added to this machine's clock when signing a join; learnt from `clock_skew`.
+    clock_offset: i64,
     socket_gen: u64,
     queue: VecDeque<Queued>,
     events: mpsc::UnboundedSender<EngineEvent>,
@@ -232,6 +234,7 @@ impl Owner {
             auth_fingerprint,
             join_fingerprint: None,
             rejected: None,
+            clock_offset: 0,
             socket_gen: 0,
             queue: VecDeque::new(),
             events,
@@ -325,11 +328,32 @@ impl Owner {
         }
     }
 
+    /// A `clock_skew` join reply carries the server's clock; every later join is signed with it.
+    fn learn_clock_offset(&mut self, input: &Input) {
+        if let Input::Reply {
+            result:
+                Err(ServerError {
+                    code,
+                    server_time: Some(server_time),
+                    ..
+                }),
+            ..
+        } = input
+        {
+            if code == "clock_skew" {
+                self.clock_offset = server_time - now_unix();
+            }
+        }
+    }
+
     /// A join reaches the core only after its user id was checked against the data dir:
     /// adopted on the first join, and any other id afterwards halts as `identity_drift`.
     async fn on_received(&mut self, received: Received) -> Input {
         let (req, user_id) = match received {
-            Received::Input(input) => return input,
+            Received::Input(input) => {
+                self.learn_clock_offset(&input);
+                return input;
+            }
             Received::Joined { req, user_id } => (req, user_id),
         };
         let result = match self.store.check_identity(user_id).await {
@@ -444,7 +468,9 @@ impl Owner {
                         return None;
                     }
                 }
-                return self.connection.send(req, &request, now_unix());
+                return self
+                    .connection
+                    .send(req, &request, now_unix() + self.clock_offset);
             }
             Effect::Schedule { timer, after } => self.timers.schedule(timer, after),
             Effect::Cancel(timer) => self.timers.cancel(&timer),

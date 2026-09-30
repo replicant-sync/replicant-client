@@ -385,7 +385,11 @@ impl Session {
 enum Conn {
     Idle,
     Disconnected,
-    Connecting { join_req: Option<u64> },
+    /// `skew_retried`: this dial already re-sent its join after a `clock_skew`.
+    Connecting {
+        join_req: Option<u64>,
+        skew_retried: bool,
+    },
     Connected(Session),
     Halted(HaltReason),
     Stopped,
@@ -500,10 +504,11 @@ impl Core {
             Input::SocketOpened { gen } | Input::SocketClosed { gen } if gen != self.socket_gen => {
             }
             Input::SocketOpened { .. } => {
-                if let Conn::Connecting { join_req: None } = self.conn {
+                if let Conn::Connecting { join_req: None, .. } = self.conn {
                     let req = self.alloc_req();
                     self.conn = Conn::Connecting {
                         join_req: Some(req),
+                        skew_retried: false,
                     };
                     fx.push(Effect::Send {
                         req,
@@ -536,7 +541,10 @@ impl Core {
     }
 
     fn connect_now(&mut self, fx: &mut Vec<Effect>) {
-        self.conn = Conn::Connecting { join_req: None };
+        self.conn = Conn::Connecting {
+            join_req: None,
+            skew_retried: false,
+        };
         self.socket_gen += 1;
         fx.push(Effect::Emit(Lifecycle::ConnectionAttempted));
         fx.push(Effect::OpenSocket {
@@ -657,7 +665,11 @@ impl Core {
     }
 
     fn on_reply(&mut self, req: u64, result: Result<Response, ServerError>, fx: &mut Vec<Effect>) {
-        if let Conn::Connecting { join_req: Some(j) } = self.conn {
+        if let Conn::Connecting {
+            join_req: Some(j),
+            skew_retried,
+        } = self.conn
+        {
             if j == req {
                 match result {
                     Ok(_) => self.on_joined(fx),
@@ -666,6 +678,21 @@ impl Core {
                             fx.push(Effect::Cancel(TimerId::ConnectTimeout));
                             self.close_socket(fx);
                             self.halt(reason, fx);
+                        }
+                        // The driver signs this join with the server's clock.
+                        None if e.code == "clock_skew"
+                            && e.server_time.is_some()
+                            && !skew_retried =>
+                        {
+                            let req = self.alloc_req();
+                            self.conn = Conn::Connecting {
+                                join_req: Some(req),
+                                skew_retried: true,
+                            };
+                            fx.push(Effect::Send {
+                                req,
+                                request: Request::Join,
+                            });
                         }
                         None => {
                             // The host can tell the user to fix the device clock.
@@ -1812,18 +1839,54 @@ mod connection_tests {
         assert!(opens(&fx));
     }
 
+    fn skew() -> ServerError {
+        let mut skew = ServerError::new("clock_skew");
+        skew.server_time = Some(1_767_225_600);
+        skew
+    }
+
     #[test]
-    fn clock_skew_join_error_backs_off_and_reports_without_halting() {
+    fn a_clock_skew_join_error_rejoins_once_on_the_same_socket_without_reporting() {
         let mut c = core();
         c.step(Input::Start {
             has_credentials: true,
         });
         let (req, _) = sends(&c.step(opened(&c))).pop().unwrap();
-        let mut skew = ServerError::new("clock_skew");
-        skew.server_time = Some(1_767_225_600);
         let fx = c.step(Input::Reply {
             req,
-            result: Err(skew),
+            result: Err(skew()),
+        });
+        assert_eq!(c.state().connection, ConnectionView::Connecting);
+        assert!(!closes(&fx), "the socket stays open");
+        assert!(
+            emitted(&fx).is_empty(),
+            "a clock the server corrected is not an error"
+        );
+        let (rejoin, request) = sends(&fx).pop().expect("the join is sent again");
+        assert_eq!(request, Request::Join);
+        assert_ne!(rejoin, req);
+        c.step(Input::Reply {
+            req: rejoin,
+            result: Ok(Response::Joined),
+        });
+        assert_eq!(c.state().connection, ConnectionView::Connected);
+    }
+
+    #[test]
+    fn a_second_clock_skew_on_one_dial_backs_off_and_reports() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        let fx = c.step(Input::Reply {
+            req,
+            result: Err(skew()),
+        });
+        let (rejoin, _) = sends(&fx).pop().unwrap();
+        let fx = c.step(Input::Reply {
+            req: rejoin,
+            result: Err(skew()),
         });
         assert_eq!(c.state().connection, ConnectionView::Disconnected);
         assert!(closes(&fx));
@@ -1843,6 +1906,22 @@ mod connection_tests {
                 fatal: false
             }]
         );
+    }
+
+    #[test]
+    fn clock_skew_without_server_time_backs_off_and_reports() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        let fx = c.step(Input::Reply {
+            req,
+            result: Err(ServerError::new("clock_skew")),
+        });
+        assert_eq!(c.state().connection, ConnectionView::Disconnected);
+        assert!(closes(&fx));
+        assert_eq!(emitted(&fx).len(), 1);
     }
 
     #[test]

@@ -1001,3 +1001,35 @@ async fn a_delete_on_a_stale_version_is_refused_and_can_be_repeated() {
     assert!(!snapshot(&store, doc_id).await.exists);
     engine.stop().await;
 }
+
+#[tokio::test]
+async fn a_skewed_clock_joins_on_the_second_try_without_an_error() {
+    let server = ScriptedServer::start(ME).await;
+    server.clock_ahead_by(3600);
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let engine = Engine::start(&path, config(&server.url, credentials("k1")), events_tx)
+        .await
+        .unwrap();
+    wait_for(&mut events, "SyncCompleted", |event| {
+        assert!(
+            !matches!(event, EngineEvent::Lifecycle(Lifecycle::SyncError { code, .. }) if code == "clock_skew"),
+            "a clock the server corrected is not an error"
+        );
+        *event == EngineEvent::Lifecycle(Lifecycle::SyncCompleted)
+    })
+    .await;
+    let joins: Vec<i64> = server
+        .frames()
+        .into_iter()
+        .filter(|frame| frame.event == "phx_join")
+        .map(|frame| frame.payload["timestamp"].as_i64().unwrap())
+        .collect();
+    assert_eq!(joins.len(), 2, "one skewed join, one re-signed");
+    assert!(
+        (joins[1] - joins[0] - 3600).abs() <= 5,
+        "the second join is signed with the server's clock: {joins:?}"
+    );
+    assert_eq!(server.stats.upgrades(), 1, "on the same socket");
+    engine.stop().await;
+}
