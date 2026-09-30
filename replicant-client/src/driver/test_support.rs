@@ -32,10 +32,14 @@ pub(crate) async fn seeded_db(user_id: Uuid, adopted: bool) -> (TempDir, PathBuf
 }
 
 fn auth(api_key: &str) -> JoinAuth {
+    auth_with_secret(api_key, "rps_test")
+}
+
+fn auth_with_secret(api_key: &str, api_secret: &str) -> JoinAuth {
     JoinAuth {
         email: "a@b.c".into(),
         api_key: api_key.into(),
-        api_secret: "rps_test".into(),
+        api_secret: api_secret.into(),
     }
 }
 
@@ -52,25 +56,29 @@ pub(crate) fn no_credentials() -> CredentialLoader {
 /// Credentials a test can change, remove or make unreadable while the engine runs.
 #[derive(Clone)]
 pub(crate) struct SwitchableCredentials {
-    api_key: Arc<Mutex<Option<String>>>,
+    stored: Arc<Mutex<Option<(String, String)>>>,
     unreadable: Arc<AtomicBool>,
 }
 
 impl SwitchableCredentials {
     pub fn new(api_key: &str) -> Self {
         Self {
-            api_key: Arc::new(Mutex::new(Some(api_key.to_string()))),
+            stored: Arc::new(Mutex::new(Some((api_key.into(), "rps_test".into())))),
             unreadable: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn set(&self, api_key: &str) {
-        *self.api_key.lock().unwrap() = Some(api_key.to_string());
+        self.set_with_secret(api_key, "rps_test");
+    }
+
+    pub fn set_with_secret(&self, api_key: &str, api_secret: &str) {
+        *self.stored.lock().unwrap() = Some((api_key.into(), api_secret.into()));
     }
 
     /// As if the stored credentials were cleared, here or by another process.
     pub fn sign_out(&self) {
-        *self.api_key.lock().unwrap() = None;
+        *self.stored.lock().unwrap() = None;
     }
 
     /// As if the file were half-written or corrupt: every read fails until `false`.
@@ -79,12 +87,16 @@ impl SwitchableCredentials {
     }
 
     pub fn loader(&self) -> CredentialLoader {
-        let (api_key, unreadable) = (self.api_key.clone(), self.unreadable.clone());
+        let (stored, unreadable) = (self.stored.clone(), self.unreadable.clone());
         Arc::new(move || {
             if unreadable.load(Ordering::SeqCst) {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "decrypt failed"));
             }
-            Ok(api_key.lock().unwrap().as_deref().map(auth))
+            Ok(stored
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(key, secret)| auth_with_secret(key, secret)))
         })
     }
 }

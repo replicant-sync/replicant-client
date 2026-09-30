@@ -192,7 +192,7 @@ struct Owner {
     /// `auth_fingerprint` if credentials changed while that join was outstanding.
     join_fingerprint: Option<[u8; 32]>,
     /// Fingerprint of credentials the server refused (`auth_invalid`, `account_disabled`), or that joined as
-    /// another user (`identity_drift`).
+    /// another user (`identity_drift`). Cleared by a sign-out: the same keys stored again are dialled.
     rejected: Option<[u8; 32]>,
     /// Seconds added to this machine's clock when signing a join; learnt from `clock_skew`.
     clock_offset: i64,
@@ -454,6 +454,7 @@ impl Owner {
             }
             None => {
                 self.auth_fingerprint = None;
+                self.rejected = None;
                 Ok(false)
             }
         }
@@ -466,6 +467,7 @@ impl Owner {
             Ok(Some(auth)) => auth,
             Ok(None) => {
                 self.auth_fingerprint = None;
+                self.rejected = None;
                 return Input::CredentialsChanged {
                     has_credentials: false,
                 };
@@ -764,6 +766,8 @@ fn fingerprint(auth: &JoinAuth) -> [u8; 32] {
     hasher.update(auth.email.as_bytes());
     hasher.update([0]);
     hasher.update(auth.api_key.as_bytes());
+    hasher.update([0]);
+    hasher.update(auth.api_secret.as_bytes());
     hasher.finalize().into()
 }
 

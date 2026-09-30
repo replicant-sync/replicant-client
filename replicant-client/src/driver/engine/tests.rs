@@ -1022,3 +1022,58 @@ async fn a_sign_out_while_halted_account_disabled_reports_not_enrolled() {
         ConnectionView::Halted(HaltReason::NotEnrolled)
     );
 }
+
+#[tokio::test]
+async fn a_re_enabled_account_signed_in_again_elsewhere_with_the_same_keys_is_dialled_within_three_seconds(
+) {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = halted_account_disabled(&server, &keys).await;
+    keys.sign_out();
+    jump(Duration::from_millis(3100)).await;
+    h.turns(3).await;
+    assert_eq!(
+        connection(&h.owner),
+        ConnectionView::Halted(HaltReason::NotEnrolled)
+    );
+    server.accept_joins();
+    keys.set("k1");
+    jump(Duration::from_millis(3100)).await;
+    h.turn_until("live with the same keys", is_live).await;
+    assert_eq!(server.join_keys(), vec!["k1".to_string(), "k1".to_string()]);
+}
+
+#[tokio::test]
+async fn a_new_secret_for_the_same_key_stored_elsewhere_after_account_disabled_is_dialled() {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = halted_account_disabled(&server, &keys).await;
+    keys.set_with_secret("k1", "rps_rotated");
+    server.accept_joins();
+    jump(Duration::from_millis(3100)).await;
+    h.turn_until("live with the new secret", is_live).await;
+    assert_eq!(server.stats.upgrades(), 2);
+}
+
+#[tokio::test]
+async fn a_sign_out_seen_at_the_join_lets_the_disabled_keys_be_dialled_once_stored_again() {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = halted_account_disabled(&server, &keys).await;
+    keys.set("k2");
+    jump(Duration::from_millis(3100)).await;
+    h.turn_until("dialling with k2", |o| {
+        connection(o) == ConnectionView::Connecting
+    })
+    .await;
+    keys.sign_out();
+    h.turn_until("signed out at the join", |o| {
+        connection(o) == ConnectionView::Halted(HaltReason::NotEnrolled)
+    })
+    .await;
+    server.accept_joins();
+    keys.set("k1");
+    jump(Duration::from_millis(3100)).await;
+    h.turn_until("live with the re-enabled keys", is_live).await;
+    assert_eq!(server.join_keys(), vec!["k1".to_string(), "k1".to_string()]);
+}
