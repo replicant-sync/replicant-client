@@ -110,6 +110,8 @@ struct Model {
     replies: HashMap<(Uuid, Option<String>), Value>,
     hold_uploads: bool,
     held: Vec<Held>,
+    hold_changes: bool,
+    held_changes: Vec<Held>,
     lose_next_upload: bool,
     drop_after_next_upload: bool,
     reject_next_upload: Option<String>,
@@ -192,6 +194,24 @@ impl ScriptedServer {
                 .to_string();
                 let _ = model.outbound[held.connection].send(frame);
             }
+        }
+    }
+
+    /// Holds every `get_changes_since` until `release_held_changes`.
+    pub fn hold_changes(&self) {
+        self.model().hold_changes = true;
+    }
+
+    /// Stops holding and answers every held `get_changes_since` from the current log.
+    pub fn release_held_changes(&self) {
+        let mut model = self.model();
+        model.hold_changes = false;
+        for held in std::mem::take(&mut model.held_changes) {
+            let (status, response) = model.changes_since(&held.payload);
+            let frame = json!([held.join_ref, held.reference, "sync:v2", "phx_reply",
+                {"status": status, "response": response}])
+            .to_string();
+            let _ = model.outbound[held.connection].send(frame);
         }
     }
 
@@ -308,6 +328,8 @@ impl Model {
             replies: HashMap::new(),
             hold_uploads: false,
             held: Vec::new(),
+            hold_changes: false,
+            held_changes: Vec::new(),
             lose_next_upload: false,
             drop_after_next_upload: false,
             reject_next_upload: None,
@@ -732,6 +754,12 @@ fn handle(model: &Mutex<Model>, index: usize, text: &str) -> Outcome {
                 }
             }
         }
+        "get_changes_since" if model.hold_changes => model.held_changes.push(Held {
+            connection: index,
+            join_ref: join_ref.clone(),
+            reference: reference.clone(),
+            payload,
+        }),
         "get_changes_since" => {
             let (status, response) = model.changes_since(&payload);
             outcome.replies.push(reply(status, response));

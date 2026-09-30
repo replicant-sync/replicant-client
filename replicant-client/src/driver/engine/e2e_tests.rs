@@ -1185,3 +1185,65 @@ async fn a_delete_made_while_an_upload_is_refused_still_reaches_the_server() {
     .await;
     engine.stop().await;
 }
+
+#[tokio::test]
+async fn a_trimmed_cursor_holds_uploads_until_the_resync_and_keeps_no_copy() {
+    let server = ScriptedServer::start(ME).await;
+    let doc_id = Uuid::from_u128(0xD1);
+    server.put_doc(doc_id, json!({"a": 1, "b": 1}));
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, _events) = live_engine(&server, &path).await;
+    engine.stop().await;
+
+    // Months offline: an edit here, another device's edit there, and the log trimmed past this
+    // data dir's nonzero cursor.
+    let store = Store::open(&path).await.unwrap();
+    store
+        .update_document(ME, doc_id, json!({"a": 2, "b": 1}))
+        .await
+        .unwrap();
+    store.close().await;
+    server.put_doc(doc_id, json!({"a": 1, "b": 2}));
+    server.trim_log_through(server.head());
+    server.hold_changes();
+    let asked = |server: &ScriptedServer| {
+        server
+            .frames()
+            .iter()
+            .filter(|frame| frame.event == "get_changes_since")
+            .count()
+    };
+    let asked_before = asked(&server);
+
+    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let engine = Engine::start(&path, config(&server.url, credentials("k1")), events_tx)
+        .await
+        .unwrap();
+    let store = engine.store();
+    eventually("own asks for changes from its old cursor", || async {
+        asked(&server) > asked_before
+    })
+    .await;
+    // Well past the upload pump's quiet period.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        server.uploads_for(doc_id).is_empty(),
+        "nothing is sent before own's cursor is answered"
+    );
+
+    server.release_held_changes();
+    wait_for(&mut events, "SyncCompleted", |event| {
+        *event == EngineEvent::Lifecycle(Lifecycle::SyncCompleted)
+    })
+    .await;
+    eventually("the offline edit is uploaded", || async {
+        outbox_rows(&store).await == 0
+    })
+    .await;
+    assert_eq!(
+        server_content(&server, doc_id),
+        Some(json!({"a": 2, "b": 2}))
+    );
+    assert_eq!(recovered_rows(&store, doc_id).await, 0, "no kept copy");
+    engine.stop().await;
+}

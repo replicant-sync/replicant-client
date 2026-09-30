@@ -370,12 +370,11 @@ struct Session {
     pump_scheduled: bool,
     pump_deferred: bool,
     pending_load_failures: u32,
-    /// `own`'s snapshot resync hasn't finished applying yet: a build now could be marked sent
-    /// and found unacknowledged when the snapshot page applies, wrongly forcing the conflict
-    /// path for a returning user's offline edits. Starts true (cursors aren't loaded yet, so it
-    /// isn't known whether `own` needs a snapshot at all); cleared once cursors show a nonzero
-    /// `own` cursor, or on `own`'s `SnapshotFinish`, or when `own` is dropped. Set true again
-    /// whenever `own` starts (or restarts, e.g. after `cursor_too_old`) a snapshot resync.
+    /// Uploads wait while this is set: a build now could be marked sent and then found
+    /// unacknowledged by an `own` snapshot page, forcing the conflict path for a returning
+    /// user's offline edits. Starts true on join; cleared when `own`'s changes request is
+    /// answered (the server accepted the cursor), on `own`'s `SnapshotFinish`, or when `own` is
+    /// dropped. A nonzero cursor alone never clears it: it may be past the trim.
     own_snapshot_resync_pending: bool,
 }
 
@@ -776,10 +775,6 @@ impl Core {
             let cursor = list.iter().find(|(n, _)| n == name).map_or(0, |(_, c)| *c);
             s.cursors.insert(name.clone(), cursor);
             s.applied.insert(name.clone(), cursor);
-            if name == SCOPE_OWN && cursor != 0 {
-                // No snapshot needed: catch-up resumes from this cursor via change pages.
-                s.own_snapshot_resync_pending = false;
-            }
         }
         s.phase = Some(Phase::CatchingUp);
         fx.push(Effect::Emit(Lifecycle::SyncStarted));
@@ -963,6 +958,9 @@ impl Core {
                     has_more,
                 }) => {
                     let Some(s) = self.session() else { return };
+                    if scope == SCOPE_OWN {
+                        s.own_snapshot_resync_pending = false;
+                    }
                     s.cursors.insert(scope.clone(), next_cursor);
                     s.scopes
                         .insert(scope.clone(), ScopeSync::Applying { req, has_more });
@@ -3078,8 +3076,8 @@ mod upload_orchestration_tests {
         Uuid::from_u128(0x1000 + n)
     }
 
-    /// Joined and past the snapshot-resync window: `own` has a nonzero cursor, so uploads are
-    /// never held for it.
+    /// Joined and past the resync hold: `own`'s changes request from a nonzero cursor has been
+    /// answered, so uploads are never held for it.
     fn connected(c: &mut Core) {
         c.step(Input::Start {
             has_credentials: true,
@@ -3089,10 +3087,22 @@ mod upload_orchestration_tests {
             req,
             result: Ok(Response::Joined),
         });
-        c.step(Input::Cursors(vec![
+        let fx = c.step(Input::Cursors(vec![
             ("own".into(), 1000),
             ("collection:curated".into(), 1),
         ]));
+        let (own_req, _) = sends(&fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetChangesSince { scope, .. } if scope == "own"))
+            .expect("own catches up from its cursor");
+        c.step(Input::Reply {
+            req: own_req,
+            result: Ok(Response::Changes {
+                changes: vec![],
+                next_cursor: 1000,
+                has_more: false,
+            }),
+        });
     }
 
     fn prepared(d: Uuid) -> BuildOutcome {
@@ -3739,6 +3749,104 @@ mod upload_orchestration_tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn a_nonzero_own_cursor_holds_builds_until_its_changes_reply() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (join_req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        c.step(Input::Reply {
+            req: join_req,
+            result: Ok(Response::Joined),
+        });
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        let (own_req, _) = sends(&fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetChangesSince { scope, .. } if scope == "own"))
+            .expect("own catches up from its cursor");
+        assert!(
+            !c.step(Input::PendingDocs(vec![doc(1)]))
+                .contains(&Effect::BuildUpload { doc_id: doc(1) }),
+            "the cursor may be past the trim: wait for the server's answer"
+        );
+        c.step(Input::Reply {
+            req: own_req,
+            result: Ok(Response::Changes {
+                changes: vec![],
+                next_cursor: 5,
+                has_more: false,
+            }),
+        });
+        assert!(c
+            .step(Input::PendingDocs(vec![doc(1)]))
+            .contains(&Effect::BuildUpload { doc_id: doc(1) }));
+    }
+
+    #[test]
+    fn a_trimmed_own_cursor_keeps_builds_held_through_the_snapshot() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (join_req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        c.step(Input::Reply {
+            req: join_req,
+            result: Ok(Response::Joined),
+        });
+        let fx = c.step(Input::Cursors(vec![
+            ("own".into(), 5),
+            ("collection:curated".into(), 5),
+        ]));
+        let (own_req, _) = sends(&fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetChangesSince { scope, .. } if scope == "own"))
+            .expect("own catches up from its cursor");
+        assert!(!c
+            .step(Input::PendingDocs(vec![doc(1)]))
+            .contains(&Effect::BuildUpload { doc_id: doc(1) }));
+        let fx = c.step(Input::Reply {
+            req: own_req,
+            result: Err(ServerError::new("cursor_too_old")),
+        });
+        let (snapshot_req, _) = sends(&fx)
+            .into_iter()
+            .find(|(_, r)| matches!(r, Request::GetSnapshot { scope, .. } if scope == "own"))
+            .expect("own resyncs by snapshot");
+        assert!(!c
+            .step(Input::PendingDocs(vec![doc(1)]))
+            .contains(&Effect::BuildUpload { doc_id: doc(1) }));
+        c.step(Input::Reply {
+            req: snapshot_req,
+            result: Ok(Response::SnapshotPage {
+                docs: vec![],
+                snapshot_seq: 9,
+                next_page_token: None,
+            }),
+        });
+        let fx = c.step(Input::Applied {
+            scope: "own".into(),
+            tag: ApplyTag::SnapshotPage(snapshot_req),
+        });
+        let finish = fx
+            .iter()
+            .find_map(|e| match e {
+                Effect::FinishSnapshot { tag, .. } => Some(tag.clone()),
+                _ => None,
+            })
+            .expect("finish snapshot");
+        c.step(Input::Applied {
+            scope: "own".into(),
+            tag: finish,
+        });
+        assert!(c
+            .step(Input::PendingDocs(vec![doc(1)]))
+            .contains(&Effect::BuildUpload { doc_id: doc(1) }));
     }
 
     #[test]
