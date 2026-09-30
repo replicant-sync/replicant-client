@@ -1,7 +1,9 @@
 //! Local content the sync rules set aside (`DocOp::Recover`), kept until the user dismisses it.
 
 use serde_json::Value;
+use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
+use tracing::warn;
 use uuid::Uuid;
 
 use super::{Store, StoreResult};
@@ -22,29 +24,40 @@ pub struct RecoveredCopy {
     pub fields: Option<Vec<FieldConflict>>,
 }
 
+fn parse_copy(row: &SqliteRow) -> StoreResult<RecoveredCopy> {
+    Ok(RecoveredCopy {
+        id: row.try_get("id")?,
+        doc_id: Uuid::parse_str(&row.try_get::<String, _>("doc_id")?)?,
+        content: serde_json::from_str(&row.try_get::<String, _>("content")?)?,
+        reason: row.try_get("reason")?,
+        recovered_at: row.try_get("recovered_at")?,
+        fields: row
+            .try_get::<Option<String>, _>("fields")?
+            .map(|fields| serde_json::from_str(&fields))
+            .transpose()?,
+    })
+}
+
 impl Store {
-    /// Every kept copy, newest first.
+    /// Every kept copy, newest first. A row that cannot be read is left out (and logged), so one
+    /// bad row never hides the others.
     pub async fn list_recovered(&self) -> StoreResult<Vec<RecoveredCopy>> {
         let rows = sqlx::query(
             "SELECT id, doc_id, content, reason, recovered_at, fields FROM recovered ORDER BY id DESC",
         )
         .fetch_all(&self.pool)
         .await?;
-        rows.iter()
-            .map(|row| -> StoreResult<RecoveredCopy> {
-                Ok(RecoveredCopy {
-                    id: row.try_get("id")?,
-                    doc_id: Uuid::parse_str(&row.try_get::<String, _>("doc_id")?)?,
-                    content: serde_json::from_str(&row.try_get::<String, _>("content")?)?,
-                    reason: row.try_get("reason")?,
-                    recovered_at: row.try_get("recovered_at")?,
-                    fields: row
-                        .try_get::<Option<String>, _>("fields")?
-                        .map(|fields| serde_json::from_str(&fields))
-                        .transpose()?,
-                })
+        Ok(rows
+            .iter()
+            .filter_map(|row| match parse_copy(row) {
+                Ok(copy) => Some(copy),
+                Err(error) => {
+                    let id = row.try_get::<i64, _>("id").ok();
+                    warn!(?id, %error, "skipping an unreadable kept copy");
+                    None
+                }
             })
-            .collect()
+            .collect())
     }
 
     /// Deletes one kept copy; false when no copy has that id.
@@ -91,6 +104,29 @@ mod tests {
             copies[0].fields, None,
             "a whole-document copy names no fields"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_kept_copy_is_left_out_and_the_others_are_listed() {
+        let t = temp_store().await;
+        keep(&t.store, Uuid::from_u128(1), r#"{"v":1}"#, 100).await;
+        keep(&t.store, Uuid::from_u128(2), "not json", 200).await;
+        exec(
+            &t.store,
+            "INSERT INTO recovered (doc_id, content, reason, recovered_at) \
+             VALUES ('not-a-uuid', '{}', 'conflict', 300)",
+        )
+        .await;
+        keep(&t.store, Uuid::from_u128(4), r#"{"v":4}"#, 400).await;
+        let doc_ids: Vec<Uuid> = t
+            .store
+            .list_recovered()
+            .await
+            .unwrap()
+            .iter()
+            .map(|copy| copy.doc_id)
+            .collect();
+        assert_eq!(doc_ids, vec![Uuid::from_u128(4), Uuid::from_u128(1)]);
     }
 
     #[tokio::test]

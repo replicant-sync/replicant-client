@@ -394,7 +394,8 @@ async fn holds_v1_data<'c>(conn: impl sqlx::SqliteExecutor<'c>) -> StoreResult<b
 
 /// Copies a data dir that still holds v1 sync data to `<db path>.v1-backup` before 015 changes
 /// it for good. The copy is written under a temporary name and renamed, so a backup that exists
-/// is complete; one that exists is never replaced, as it holds the v1 data as it was.
+/// is complete. An existing backup is never replaced: a later attempt writes a new one beside it
+/// (`backup_path`).
 pub(crate) async fn back_up_v1_database(pool: &SqlitePool, db_path: &Path) -> StoreResult<()> {
     if !holds_v1_data(pool).await? {
         return Ok(());
@@ -407,13 +408,9 @@ pub(crate) async fn back_up_v1_database(pool: &SqlitePool, db_path: &Path) -> St
         lock.rollback().await?;
         return Ok(());
     }
-    let backup = sibling(db_path, ".v1-backup");
+    let backup = backup_path(db_path, now_unix());
     let partial = sibling(db_path, ".v1-backup.tmp");
-    let written = if backup.exists() {
-        Ok(())
-    } else {
-        write_backup(pool, &partial, &backup).await
-    };
+    let written = write_backup(pool, &partial, &backup).await;
     if written.is_err() {
         let _ = std::fs::remove_file(&partial);
     }
@@ -451,6 +448,23 @@ fn backup_failed(error: impl std::fmt::Display) -> StoreError {
     StoreError::MigrationFailed(format!("backup before migrating: {error}"))
 }
 
+/// The first free name of `<db path>.v1-backup`, `.v1-backup-<unix seconds>`,
+/// `.v1-backup-<unix seconds>-2`, … Chosen under the write lock, so no other backup races it.
+fn backup_path(db_path: &Path, now: i64) -> PathBuf {
+    let first = sibling(db_path, ".v1-backup");
+    if !first.exists() {
+        return first;
+    }
+    let stamped = format!(".v1-backup-{now}");
+    let mut candidate = sibling(db_path, &stamped);
+    let mut n = 2;
+    while candidate.exists() {
+        candidate = sibling(db_path, &format!("{stamped}-{n}"));
+        n += 1;
+    }
+    candidate
+}
+
 fn sibling(db_path: &Path, suffix: &str) -> PathBuf {
     let mut path = db_path.as_os_str().to_owned();
     path.push(suffix);
@@ -482,7 +496,7 @@ mod tests {
     use crate::store::test_support::*;
     use crate::store::{now_unix, Store};
 
-    use super::back_up_v1_database;
+    use super::{back_up_v1_database, backup_path};
 
     const OTHER: Uuid = Uuid::from_u128(0xB);
 
@@ -1269,12 +1283,51 @@ mod tests {
             .await
             .unwrap();
         raw.close().await;
+        let first = std::fs::read(backup_of(&path)).unwrap();
         Store::open(&path).await.unwrap().close().await;
         assert_eq!(
-            backed_up_content(&path, doc(1)).await,
-            json!({"n": 1}).to_string(),
-            "the retry keeps the first backup"
+            std::fs::read(backup_of(&path)).unwrap(),
+            first,
+            "the retry leaves the first backup byte for byte"
         );
+        assert_eq!(
+            backed_up_content(&path, doc(1)).await,
+            json!({"n": 1}).to_string()
+        );
+        let prefix = format!("{}.v1-backup-", path.file_name().unwrap().to_string_lossy());
+        let stamped: Vec<PathBuf> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .strip_prefix(&prefix)
+                    .is_some_and(|secs| secs.parse::<i64>().is_ok())
+            })
+            .collect();
+        assert_eq!(stamped.len(), 1, "the retry writes a timestamped backup");
+        let second = raw_pool(&stamped[0]).await;
+        let content: String = sqlx::query_scalar("SELECT content FROM documents")
+            .fetch_one(&second)
+            .await
+            .unwrap();
+        second.close().await;
+        assert_eq!(content, json!({"n": 2}).to_string());
+    }
+
+    #[test]
+    fn a_backup_name_already_taken_gets_the_next_free_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("lib.sqlite3");
+        let named = |suffix: &str| dir.path().join(format!("lib.sqlite3{suffix}"));
+        assert_eq!(backup_path(&db, 7), named(".v1-backup"));
+        std::fs::write(named(".v1-backup"), b"a").unwrap();
+        assert_eq!(backup_path(&db, 7), named(".v1-backup-7"));
+        std::fs::write(named(".v1-backup-7"), b"b").unwrap();
+        assert_eq!(backup_path(&db, 7), named(".v1-backup-7-2"));
+        std::fs::write(named(".v1-backup-7-2"), b"c").unwrap();
+        assert_eq!(backup_path(&db, 7), named(".v1-backup-7-3"));
     }
 
     #[tokio::test]
