@@ -52,6 +52,12 @@ pub(crate) async fn migrate_v1_data(pool: &SqlitePool) -> StoreResult<()> {
         markers = counts.markers,
         "migrated v1 sync data"
     );
+    if counts.dropped_queue_rows > 0 {
+        warn!(
+            rows = counts.dropped_queue_rows,
+            "v1 queue rows dropped: their documents are missing or were set aside"
+        );
+    }
     if counts.pending_without_base > 0 {
         warn!(
             documents = counts.pending_without_base,
@@ -67,6 +73,18 @@ async fn migrate(conn: &mut SqliteConnection) -> StoreResult<Counts> {
         .await?
         .map(|user_id| Uuid::parse_str(&user_id))
         .transpose()?;
+    // Without the account there is no telling whose documents are pending edits, and
+    // treating them all as someone else's would let the curated sweep remove them.
+    if me.is_none()
+        && sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM documents")
+            .fetch_one(&mut *conn)
+            .await?
+            > 0
+    {
+        return Err(StoreError::MigrationFailed(
+            "the v1 database holds documents but no user_config row".into(),
+        ));
+    }
 
     let mut queue: HashMap<Uuid, Vec<QueueRow>> = HashMap::new();
     let queued = sqlx::query(
@@ -251,6 +269,9 @@ async fn migrate(conn: &mut SqliteConnection) -> StoreResult<Counts> {
         }
     }
 
+    // What is left belongs to documents that are missing or were set aside.
+    counts.dropped_queue_rows += queue.values().map(Vec::len).sum::<usize>();
+
     sqlx::query("DROP TABLE IF EXISTS change_events")
         .execute(&mut *conn)
         .await?;
@@ -335,7 +356,7 @@ async fn document_exists(conn: &mut SqliteConnection, id: &str) -> StoreResult<b
 /// SQLITE_BUSY stays as it is, so `retry_open` retries it; anything else is this migration's
 /// failure, which retrying cannot fix.
 fn migration_failed(error: StoreError) -> StoreError {
-    if error.is_busy() {
+    if error.is_busy() || error.is_migration_failed() {
         error
     } else {
         StoreError::MigrationFailed(error.to_string())
@@ -1087,6 +1108,83 @@ mod tests {
         assert!(has_table(&raw, "sync_queue").await, "015 rolled back");
         raw.close().await;
         assert!(backup_of(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn v1_documents_with_no_user_config_fail_the_migration_and_leave_the_v1_data_in_place() {
+        let (_dir, path, pool) = v012_db().await;
+        v1_doc(&pool, &id(1), Some(ME), json!({"n": 1}), "pending", None).await;
+        pool.close().await;
+        let error = Store::open(&path).await.err().expect("015 must fail");
+        assert!(error.is_migration_failed(), "{error}");
+        let raw = raw_pool(&path).await;
+        assert!(has_table(&raw, "sync_queue").await, "015 rolled back");
+        raw.close().await;
+        assert!(backup_of(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn an_empty_v1_database_with_no_user_config_still_migrates() {
+        let (_dir, path, pool) = v012_db().await;
+        let store = migrated(pool, &path).await;
+        store.close().await;
+        let raw = raw_pool(&path).await;
+        assert!(!has_table(&raw, "sync_queue").await);
+        raw.close().await;
+    }
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = LogBuffer;
+        fn make_writer(&'a self) -> LogBuffer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_rows_of_missing_or_unmigratable_documents_are_counted_as_dropped() {
+        let (_dir, path, pool) = v012_db().await;
+        v1_user(&pool, ME, true).await;
+        v1_doc(&pool, &id(1), Some(ME), json!({"n": 1}), "pending", None).await;
+        v1_queue_row(&pool, &id(1), "update", None).await;
+        // A document whose content is not JSON is set aside, and so is its queue row.
+        v1_doc(&pool, &id(2), Some(ME), json!("x"), "pending", None).await;
+        sqlx::query("UPDATE documents SET content = 'not json' WHERE id = ?")
+            .bind(id(2))
+            .execute(&pool)
+            .await
+            .unwrap();
+        v1_queue_row(&pool, &id(2), "update", None).await;
+        // No document 3 exists.
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        v1_queue_row(&pool, &id(3), "update", None).await;
+        let log = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let store = migrated(pool, &path).await;
+        drop(guard);
+        store.close().await;
+        let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("rows=2"), "{logged}");
     }
 
     fn partial_backup_of(path: &Path) -> PathBuf {
