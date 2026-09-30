@@ -22,7 +22,7 @@ struct Counts {
     pending_without_base: usize,
     rejected_creates: usize,
     unmigratable: usize,
-    unowned_edits: usize,
+    kept_aside: usize,
     dropped_queue_rows: usize,
     markers: u64,
 }
@@ -49,7 +49,7 @@ pub(crate) async fn migrate_v1_data(pool: &SqlitePool) -> StoreResult<()> {
         pending = counts.pending,
         rejected_creates = counts.rejected_creates,
         unmigratable = counts.unmigratable,
-        unowned_edits = counts.unowned_edits,
+        kept_aside = counts.kept_aside,
         dropped_queue_rows = counts.dropped_queue_rows,
         markers = counts.markers,
         "migrated v1 sync data"
@@ -57,13 +57,13 @@ pub(crate) async fn migrate_v1_data(pool: &SqlitePool) -> StoreResult<()> {
     if counts.dropped_queue_rows > 0 {
         warn!(
             rows = counts.dropped_queue_rows,
-            "v1 queue rows dropped: their documents are missing or were set aside"
+            "v1 queue rows dropped: their documents are missing, set aside, or kept aside"
         );
     }
-    if counts.unowned_edits > 0 {
+    if counts.kept_aside > 0 {
         warn!(
-            documents = counts.unowned_edits,
-            "v1 edits to documents that are not ours: kept aside, as only the owner can send them"
+            documents = counts.kept_aside,
+            "v1 local work that cannot be uploaded: each document's content is kept aside"
         );
     }
     if counts.pending_without_base > 0 {
@@ -181,15 +181,19 @@ async fn migrate(conn: &mut SqliteConnection) -> StoreResult<Counts> {
             == Some("public");
         let rows = queue.remove(&doc_id).unwrap_or_default();
         let mine = owner.is_some() && owner == me;
+        let has_create = rows.iter().any(|row| row.kind == "create");
         let pending = mine && status == "pending";
-        // Only the owner can send an edit: another's is kept aside and the document migrates as
-        // synced.
-        if !mine && status == "pending" {
-            keep_aside(&mut *conn, &id, &content, "unmigratable").await?;
-            counts.unowned_edits += 1;
+        let rejected_create = mine && status == "conflict" && has_create;
+        // Only the owner's pending work becomes uploads. Anything else queued, and content only
+        // this device holds on a document that is not ours, is kept aside unless it was deleted.
+        if !pending && !rejected_create {
+            counts.dropped_queue_rows += rows.len();
+            let local_only = !mine && (status == "pending" || (status == "conflict" && has_create));
+            if !deleted && (local_only || !rows.is_empty()) {
+                keep_aside(&mut *conn, &id, &content, "unmigratable").await?;
+                counts.kept_aside += 1;
+            }
         }
-        let rejected_create =
-            mine && status == "conflict" && rows.iter().any(|row| row.kind == "create");
 
         if deleted && !pending {
             let deleted_at = document
@@ -202,7 +206,6 @@ async fn migrate(conn: &mut SqliteConnection) -> StoreResult<Counts> {
 
         let (shadow, markers) = if pending {
             counts.pending += 1;
-            let has_create = rows.iter().any(|row| row.kind == "create");
             // With a shadow the first upload would be an update of a document the server
             // may never have had.
             let shadow = if has_create {
@@ -524,16 +527,13 @@ mod tests {
         let (_dir, path, pool) = v012_db().await;
         v1_user(&pool, ME, true).await;
         v1_doc(&pool, &id(1), Some(ME), json!({"n": 1}), "synced", None).await;
-        v1_queue_row(&pool, &id(1), "update", None).await;
         let store = migrated(pool, &path).await;
         let snap = snapshot(&store, doc(1)).await;
         let shadow = snap.shadow.expect("a synced document has a shadow");
         assert_eq!((shadow.content.clone(), shadow.seq), (json!({"n": 1}), 0));
         assert_eq!(shadow.hash, content_hash(&json!({"n": 1})));
-        assert!(
-            snap.rows.is_empty(),
-            "stale rows on a synced document are dropped"
-        );
+        assert!(snap.rows.is_empty());
+        assert!(kept_copies(&store).await.is_empty());
         store.close().await;
     }
 
@@ -567,6 +567,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(tombstoned_at, yesterday, "the v1 deletion time");
+        assert!(kept_copies(&store).await.is_empty(), "the user deleted it");
         store.close().await;
     }
 
@@ -1184,6 +1185,30 @@ mod tests {
         }
     }
 
+    /// Migrates with a WARN-level subscriber and returns what it logged.
+    async fn migrated_with_warnings(pool: SqlitePool, path: &Path) -> (Store, String) {
+        let log = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        let store = migrated(pool, path).await;
+        drop(guard);
+        let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        (store, logged)
+    }
+
+    fn assert_dropped(logged: &str, rows: usize) {
+        assert!(
+            logged.lines().any(|line| line.contains(
+                "v1 queue rows dropped: their documents are missing, set aside, or kept aside"
+            ) && line.contains(&format!("rows={rows}"))),
+            "{logged}"
+        );
+    }
+
     #[tokio::test]
     async fn queue_rows_of_missing_or_unmigratable_documents_are_counted_as_dropped() {
         let (_dir, path, pool) = v012_db().await;
@@ -1204,22 +1229,9 @@ mod tests {
             .await
             .unwrap();
         v1_queue_row(&pool, &id(3), "update", None).await;
-        let log = LogBuffer::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(log.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        let store = migrated(pool, &path).await;
-        drop(guard);
+        let (store, logged) = migrated_with_warnings(pool, &path).await;
         store.close().await;
-        let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
-        assert!(
-            logged.contains("v1 queue rows dropped: their documents are missing or were set aside")
-                && logged.contains("rows=2"),
-            "{logged}"
-        );
+        assert_dropped(&logged, 2);
     }
 
     fn partial_backup_of(path: &Path) -> PathBuf {
@@ -1574,6 +1586,82 @@ mod tests {
             1,
             "the first join still adopts or checks it"
         );
+        store.close().await;
+    }
+
+    fn kept(n: u128, content: Value) -> Vec<(Uuid, Value, String)> {
+        vec![(doc(n), content, "unmigratable".to_string())]
+    }
+
+    #[tokio::test]
+    async fn a_conflict_with_a_queued_update_keeps_its_content_aside_and_drops_the_rows() {
+        let (_dir, path, pool) = v012_db().await;
+        v1_user(&pool, ME, true).await;
+        v1_doc(&pool, &id(1), Some(ME), json!({"n": 2}), "conflict", None).await;
+        v1_queue_row(&pool, &id(1), "update", Some(json!({"n": 1}))).await;
+        v1_queue_row(&pool, &id(1), "update", None).await;
+        let (store, logged) = migrated_with_warnings(pool, &path).await;
+        assert!(outbox(&store, doc(1)).await.is_empty());
+        assert_eq!(kept_copies(&store).await, kept(1, json!({"n": 2})));
+        assert_dropped(&logged, 2);
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_create_on_another_accounts_document_keeps_its_content_aside() {
+        let (_dir, path, pool) = v012_db().await;
+        v1_user(&pool, ME, true).await;
+        v1_doc(
+            &pool,
+            &id(1),
+            Some(OTHER),
+            json!({"n": 3}),
+            "conflict",
+            None,
+        )
+        .await;
+        v1_queue_row(&pool, &id(1), "create", None).await;
+        let (store, logged) = migrated_with_warnings(pool, &path).await;
+        let snap = snapshot(&store, doc(1)).await;
+        assert!(snap.read_only && snap.rows.is_empty());
+        assert_eq!(kept_copies(&store).await, kept(1, json!({"n": 3})));
+        assert_dropped(&logged, 1);
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_synced_document_with_queue_rows_keeps_its_content_aside_and_drops_the_rows() {
+        let (_dir, path, pool) = v012_db().await;
+        v1_user(&pool, ME, true).await;
+        v1_doc(&pool, &id(1), Some(ME), json!({"n": 4}), "synced", None).await;
+        v1_queue_row(&pool, &id(1), "update", None).await;
+        let (store, logged) = migrated_with_warnings(pool, &path).await;
+        let snap = snapshot(&store, doc(1)).await;
+        assert!(snap.rows.is_empty());
+        assert_eq!(snap.shadow.map(|s| s.content), Some(json!({"n": 4})));
+        assert_eq!(kept_copies(&store).await, kept(1, json!({"n": 4})));
+        assert_dropped(&logged, 1);
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_pending_delete_on_another_accounts_document_keeps_no_copy() {
+        let (_dir, path, pool) = v012_db().await;
+        v1_user(&pool, ME, true).await;
+        v1_doc(
+            &pool,
+            &id(1),
+            Some(OTHER),
+            json!({"n": 5}),
+            "pending",
+            Some("2026-01-03T00:00:00+00:00"),
+        )
+        .await;
+        v1_queue_row(&pool, &id(1), "delete", None).await;
+        let (store, logged) = migrated_with_warnings(pool, &path).await;
+        assert!(!snapshot(&store, doc(1)).await.exists);
+        assert!(kept_copies(&store).await.is_empty());
+        assert_dropped(&logged, 1);
         store.close().await;
     }
 }
