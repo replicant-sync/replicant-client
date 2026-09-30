@@ -412,6 +412,7 @@ fn reason_str(reason: RecoverReason) -> &'static str {
         RecoverReason::BecamePublication => "became_publication",
         RecoverReason::CreateRejected => "create_rejected",
         RecoverReason::DeleteSuperseded => "delete_superseded",
+        RecoverReason::DeleteRefused => "delete_refused",
     }
 }
 
@@ -481,6 +482,24 @@ mod tests {
         let after = snapshot(&t.store, DOC).await;
         assert_eq!(after.content, json!({"a": 1, "mine": true, "theirs": true}));
         assert!(after.rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refused_delete_copy_is_listed_as_delete_refused() {
+        let t = temp_store().await;
+        seed_synced(&t.store, DOC, SCOPE_OWN, Some(ME), json!({"a": 1}), 1).await;
+        apply(&t.store, DOC, |_| {
+            vec![DocOp::Recover {
+                content: json!({"a": 2}),
+                reason: RecoverReason::DeleteRefused,
+            }]
+        })
+        .await;
+
+        let copies = t.store.list_recovered().await.unwrap();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].reason, "delete_refused");
+        assert_eq!(copies[0].content, json!({"a": 2}));
     }
 
     #[tokio::test]

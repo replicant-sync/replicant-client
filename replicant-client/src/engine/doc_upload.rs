@@ -34,7 +34,7 @@ pub enum BuildResult {
 pub fn build_upload(snap: &DocSnapshot, me: Uuid) -> BuildResult {
     let ends_in_delete = snap.rows.last().is_some_and(|r| r.kind == RowKind::Delete);
     // A pending delete goes out even behind parked rows: nothing else can unpark a deleted
-    // document. A delete the server refused is parked itself and waits like any other row.
+    // document. A refused delete with no shadow is parked itself and waits like any other row.
     let sendable_delete = snap
         .rows
         .last()
@@ -235,6 +235,29 @@ pub fn settle(
                 DocOp::DropAllRows,
                 DocOp::HardDelete,
             ]),
+            // The server keeps its version: show it again, and keep local edits made before the
+            // delete aside. With no shadow there is no server version to show, so the rows park.
+            "validation" | "forbidden" | "too_large"
+                if inflight.kind == UploadKind::Delete && snap.shadow.is_some() =>
+            {
+                let shadow = snap.shadow.as_ref().expect("guarded above");
+                let mut ops = Vec::new();
+                if content_hash(&snap.content) != content_hash(&shadow.content) {
+                    ops.push(DocOp::Recover {
+                        content: snap.content.clone(),
+                        reason: RecoverReason::DeleteRefused,
+                    });
+                }
+                ops.extend([
+                    DocOp::DropAllRows,
+                    DocOp::Undelete,
+                    DocOp::SetContent(shadow.content.clone()),
+                    DocOp::Emit(DocEvent::SyncError {
+                        code: e.code.clone(),
+                    }),
+                ]);
+                SettleResult::Ops(ops)
+            }
             "validation" | "forbidden" | "too_large" => SettleResult::Ops(vec![
                 DocOp::Park {
                     rows: inflight.covered.clone(),
@@ -806,6 +829,104 @@ mod upload_tests {
                 }),
             ]
         );
+    }
+
+    fn refused_delete_ops(s: &DocSnapshot, code: &str) -> Vec<DocOp> {
+        let (_, f) = sent(build_upload(s, ME));
+        assert_eq!(f.kind, UploadKind::Delete);
+        let SettleResult::Ops(ops) = settle(s, &f, &Err(ServerError::new(code)), ME, 0, 0) else {
+            panic!()
+        };
+        ops
+    }
+
+    #[test]
+    fn a_refused_delete_after_edits_keeps_them_aside_and_shows_the_server_version() {
+        let mut s = synced(json!({"n": 1}), 1);
+        s.content = json!({"n": 2});
+        s.soft_deleted = true;
+        let mut parked_update = row(1, RowKind::Update);
+        parked_update.parked = true;
+        s.rows = vec![parked_update, row(2, RowKind::Delete)];
+
+        let ops = refused_delete_ops(&s, "forbidden");
+
+        let recovered: Vec<_> = ops
+            .iter()
+            .filter(|o| matches!(o, DocOp::Recover { .. }))
+            .collect();
+        assert_eq!(
+            recovered,
+            vec![&DocOp::Recover {
+                content: json!({"n": 2}),
+                reason: RecoverReason::DeleteRefused
+            }]
+        );
+        let errors: Vec<_> = ops.iter().filter(|o| matches!(o, DocOp::Emit(_))).collect();
+        assert_eq!(
+            errors,
+            vec![&DocOp::Emit(DocEvent::SyncError {
+                code: "forbidden".into()
+            })]
+        );
+        let after = s.project(&ops);
+        assert!(after.exists);
+        assert!(!after.soft_deleted);
+        assert!(after.rows.is_empty());
+        assert_eq!(after.content, json!({"n": 1}));
+        assert_eq!(after.shadow, s.shadow);
+    }
+
+    #[test]
+    fn a_refused_unedited_delete_shows_the_server_version_without_a_copy() {
+        let mut s = synced(json!({"n": 1}), 1);
+        s.soft_deleted = true;
+        s.rows = vec![row(1, RowKind::Delete)];
+
+        let ops = refused_delete_ops(&s, "validation");
+
+        assert!(!ops.iter().any(|o| matches!(o, DocOp::Recover { .. })));
+        assert_eq!(
+            ops.iter()
+                .filter(|o| matches!(o, DocOp::Emit(_)))
+                .collect::<Vec<_>>(),
+            vec![&DocOp::Emit(DocEvent::SyncError {
+                code: "validation".into()
+            })]
+        );
+        let after = s.project(&ops);
+        assert!(after.exists);
+        assert!(!after.soft_deleted);
+        assert!(after.rows.is_empty());
+        assert_eq!(after.content, json!({"n": 1}));
+    }
+
+    #[test]
+    fn a_refused_delete_with_no_shadow_parks_its_rows() {
+        let s = DocSnapshot {
+            shadow: None,
+            soft_deleted: true,
+            rows: vec![row(1, RowKind::Create), row(2, RowKind::Delete)],
+            ..synced(sample(), 0)
+        };
+
+        let ops = refused_delete_ops(&s, "too_large");
+
+        assert_eq!(
+            ops,
+            vec![
+                DocOp::Park {
+                    rows: vec![m(1), m(2)],
+                    error: "too_large".into()
+                },
+                DocOp::Emit(DocEvent::SyncError {
+                    code: "too_large".into()
+                }),
+            ]
+        );
+        let after = s.project(&ops);
+        assert!(after.soft_deleted);
+        assert!(matches!(build_upload(&after, ME), BuildResult::Nothing));
     }
 
     #[test]

@@ -1313,8 +1313,9 @@ async fn a_trimmed_cursor_holds_uploads_until_the_resync_and_keeps_no_copy() {
     engine.stop().await;
 }
 
-#[tokio::test]
-async fn a_delete_the_server_refuses_parks_once_and_is_not_resent() {
+/// Syncs `{"n": 1}`, optionally edits it locally to `local_edit`, deletes it, and has the server
+/// refuse the delete. Returns the kept copies' reason and content.
+async fn refuse_a_delete(local_edit: Option<Value>) -> Vec<(String, Value)> {
     let server = ScriptedServer::start(ME).await;
     let (_dir, path) = seeded_db(ME, true).await;
     let (engine, mut events) = live_engine(&server, &path).await;
@@ -1326,6 +1327,9 @@ async fn a_delete_the_server_refuses_parks_once_and_is_not_resent() {
     engine.notify_outbox();
     eventually("synced", || async { outbox_rows(&store).await == 0 }).await;
     server.reject_deletes("forbidden");
+    if let Some(edit) = local_edit {
+        store.update_document(ME, doc_id, edit).await.unwrap();
+    }
     store.delete_document(ME, doc_id).await.unwrap();
     engine.notify_outbox();
     let refusal = EngineEvent::Doc(DocNotice {
@@ -1334,24 +1338,51 @@ async fn a_delete_the_server_refuses_parks_once_and_is_not_resent() {
             code: "forbidden".into(),
         },
     });
-    wait_for(&mut events, "the park", |event| *event == refusal).await;
+    wait_for(&mut events, "the refusal", |event| *event == refusal).await;
+    let uploads_then = server.uploads_for(doc_id).len();
     tokio::time::sleep(Duration::from_millis(500)).await;
     let mut refusals = 0;
     while let Ok(event) = events.try_recv() {
         refusals += usize::from(event == refusal);
     }
-    let deletes = server
-        .uploads_for(doc_id)
+    let uploads = server.uploads_for(doc_id);
+    let deletes = uploads
         .iter()
         .filter(|upload| upload["kind"] == "delete")
         .count();
-    let parked_deletes = count(
-        &store,
-        "SELECT COUNT(*) FROM outbox WHERE kind = 'delete' AND parked_error IS NOT NULL",
-    )
-    .await;
+    let after = snapshot(&store, doc_id).await;
+    let outbox = outbox_rows(&store).await;
+    let kept: Vec<(String, Value)> = store
+        .list_recovered()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|copy| copy.doc_id == doc_id)
+        .map(|copy| (copy.reason, copy.content))
+        .collect();
     engine.stop().await;
     assert_eq!(deletes, 1, "the refused delete is sent once");
+    assert_eq!(
+        uploads.len(),
+        uploads_then,
+        "nothing is sent after the refusal"
+    );
     assert_eq!(refusals, 0, "no second SyncError after the first");
-    assert_eq!(parked_deletes, 1);
+    assert!(after.exists && !after.soft_deleted, "visible again");
+    assert_eq!(after.content, json!({"n": 1}), "the server's version");
+    assert_eq!(outbox, 0);
+    kept
+}
+
+#[tokio::test]
+async fn a_delete_the_server_refuses_brings_the_server_version_back() {
+    assert_eq!(refuse_a_delete(None).await, vec![], "no kept copy");
+}
+
+#[tokio::test]
+async fn a_refused_delete_after_a_local_edit_keeps_the_edit_as_a_copy() {
+    assert_eq!(
+        refuse_a_delete(Some(json!({"n": 2}))).await,
+        vec![("delete_refused".to_string(), json!({"n": 2}))]
+    );
 }

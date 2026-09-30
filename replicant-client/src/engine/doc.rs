@@ -66,6 +66,7 @@ pub enum RecoverReason {
     BecamePublication,
     CreateRejected,
     DeleteSuperseded,
+    DeleteRefused,
 }
 
 #[derive(Debug, Clone, PartialEq)]
