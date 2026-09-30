@@ -14,7 +14,7 @@ Register callbacks on a handle, then call `replicant_process_events` from the sa
 
 - **Origins:** `Local` (a handle of this engine wrote it), `Remote` (sync wrote it, in any process), `OtherProcess` (another process or library copy on the same data dir).
 - **One event per document per pass**, to every handle, the writer included.
-- **Per connection:** `ConnectionSucceeded` → `SyncStarted` → `SyncCompleted` (at most once) → `ConnectionLost`. A handle created mid-connection first receives the events of that connection so far. Dials not yet delivered with no success or loss between them arrive as one `ConnectionAttempted` (the latest); connection events keep their order.
+- **Per connection:** `ConnectionSucceeded` → `SyncStarted` → `SyncCompleted` (at most once) → `ConnectionLost`. A handle created mid-connection first receives the events of that connection so far. Dials not yet delivered with no other event between them arrive as one `ConnectionAttempted` (the latest); all events keep their order.
 - **`DatabaseChanged`:** changes were trimmed before this engine read them, or this handle fell 4096 events behind (its document events were collapsed); reload every list.
 - **Conflicts** are raised only in the process that applied the rule; every process sees the kept copy in `replicant_list_recovered`, the source of truth. A `recovered_id` may already be dismissed or restored elsewhere (`ErrorNotFound`).
 - **State** for a status indicator comes from `replicant_get_state`, not from counting events; call it right after `replicant_create`. Parked documents come from `replicant_list_parked` and are not in `replicant_count_pending_sync`.

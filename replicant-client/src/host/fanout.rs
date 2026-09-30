@@ -88,15 +88,6 @@ fn is_document_event(event: &HostEvent) -> bool {
     )
 }
 
-fn is_connection_event(event: &HostEvent) -> bool {
-    matches!(
-        event,
-        HostEvent::ConnectionAttempted { .. }
-            | HostEvent::ConnectionSucceeded
-            | HostEvent::ConnectionLost
-    )
-}
-
 impl EventQueue {
     pub(super) fn push(&self, event: HostEvent) {
         let mut queued = lock(&self.0);
@@ -106,13 +97,8 @@ impl EventQueue {
         }
         if matches!(event, HostEvent::ConnectionAttempted { .. }) {
             // Back-to-back dials collapse into the latest, so a long offline spell cannot push
-            // other events out; a dial after a success or loss stays after it.
-            if let Some(last @ HostEvent::ConnectionAttempted { .. }) = queued
-                .events
-                .iter_mut()
-                .rev()
-                .find(|queued_event| is_connection_event(queued_event))
-            {
+            // other events out; a dial after any other event stays after it.
+            if let Some(last @ HostEvent::ConnectionAttempted { .. }) = queued.events.back_mut() {
                 *last = event;
                 return;
             }
@@ -476,6 +462,29 @@ mod tests {
                 HostEvent::ConnectionAttempted { attempt: 1 },
                 HostEvent::ConnectionSucceeded,
                 HostEvent::ConnectionLost,
+                HostEvent::ConnectionAttempted { attempt: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_dial_after_a_fatal_sync_error_stays_after_it() {
+        let queue = EventQueue::default();
+        let fatal = HostEvent::SyncError {
+            code: "update_required".into(),
+            doc_id: None,
+            scope: None,
+            fatal: true,
+            recovered_id: None,
+        };
+        queue.push(HostEvent::ConnectionAttempted { attempt: 1 });
+        queue.push(fatal.clone());
+        queue.push(HostEvent::ConnectionAttempted { attempt: 1 });
+        assert_eq!(
+            queue.take(),
+            vec![
+                HostEvent::ConnectionAttempted { attempt: 1 },
+                fatal,
                 HostEvent::ConnectionAttempted { attempt: 1 },
             ]
         );
