@@ -3279,8 +3279,9 @@ mod property_tests {
     }
 
     /// At a rebase, `pitches` is either set aside whole (the server's list taken) or merged with
-    /// nothing lost, duplicated or revived, and with the order kept for every pair both sides
-    /// hold and agree on. Nothing comes from neither side. An atomic list both sides changed to
+    /// nothing lost, duplicated or revived. The order of a pair is kept when at least one side
+    /// holds both elements and no side holding both disagrees; a pair is skipped when either
+    /// side holds exactly one of the two. Nothing comes from neither side. An atomic list both sides changed to
     /// different lists is always set aside whole.
     fn check_pitches(
         what: &str,
@@ -3348,20 +3349,30 @@ mod property_tests {
         }
         for (at, first) in result.iter().enumerate() {
             for second in &result[at + 1..] {
-                let orders = [&mine, &theirs].map(|side| {
-                    let first_at = side.iter().position(|e| e == first)?;
-                    let second_at = side.iter().position(|e| e == second)?;
-                    Some(first_at < second_at)
-                });
-                if let [Some(in_mine), Some(in_theirs)] = orders {
-                    if in_mine == in_theirs {
-                        assert!(
-                            in_mine,
-                            "{what}: {first} and {second} are out of order \
-                             (mine {mine:?}, theirs {theirs:?}, result {result:?})"
-                        );
+                // Per side: None if it holds exactly one of the pair, else whether it holds both
+                // (and, if so, whether `first` comes before `second`).
+                let sides = [&mine, &theirs].map(|side| {
+                    let first_at = side.iter().position(|e| e == first);
+                    let second_at = side.iter().position(|e| e == second);
+                    match (first_at, second_at) {
+                        (Some(a), Some(b)) => Some(Some(a < b)),
+                        (None, None) => Some(None),
+                        _ => None,
                     }
-                }
+                });
+                let [Some(in_mine), Some(in_theirs)] = sides else {
+                    continue;
+                };
+                let kept_before = match (in_mine, in_theirs) {
+                    (Some(a), Some(b)) if a != b => continue,
+                    (Some(a), _) | (_, Some(a)) => a,
+                    (None, None) => continue,
+                };
+                assert!(
+                    kept_before,
+                    "{what}: {first} and {second} are out of order \
+                     (mine {mine:?}, theirs {theirs:?}, result {result:?})"
+                );
             }
         }
         if !both_changed {
