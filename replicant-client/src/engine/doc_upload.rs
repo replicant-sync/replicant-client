@@ -67,9 +67,12 @@ pub fn build_upload(snap: &DocSnapshot, me: Uuid) -> BuildResult {
     };
 
     match (&snap.shadow, ends_in_delete) {
-        // A sent row may have landed, and another device may have edited it since: the delete
-        // waits for the server's version to go out on.
-        (None, true) if snap.unacked_upload.is_some() => BuildResult::NeedsServerCopy,
+        // The server may hold a version this device never saw (a sent row landed, or the
+        // document came from the server): the delete waits for that version to go out on.
+        // Only a create that was never sent is deleted unconditionally.
+        (None, true) if snap.unacked_upload.is_some() || !has_create => {
+            BuildResult::NeedsServerCopy
+        }
         (shadow, true) => send(
             UploadKind::Delete,
             shadow.as_ref().map(|sh| sh.hash.clone()),
@@ -305,16 +308,42 @@ mod upload_tests {
         assert_eq!(build_upload(&s, ME), BuildResult::NeedsServerCopy);
     }
 
-    #[test]
-    fn migrated_update_then_delete_sends_delete() {
-        let s = DocSnapshot {
+    fn migrated_then_deleted() -> DocSnapshot {
+        DocSnapshot {
             shadow: None,
             soft_deleted: true,
             rows: vec![row(1, RowKind::Update), row(2, RowKind::Delete)],
             ..synced(sample(), 0)
-        };
-        let (u, _) = sent(build_upload(&s, ME));
+        }
+    }
+
+    #[test]
+    fn a_migrated_update_then_delete_goes_out_on_the_server_copy() {
+        let s = migrated_then_deleted();
+        assert_eq!(build_upload(&s, ME), BuildResult::NeedsServerCopy);
+        let server = env(sample(), 4);
+        let after = s.project(&apply_server_copy(&s, &server, ME, &APPEND));
+        assert!(after.soft_deleted);
+        assert_eq!(after.rows, s.rows);
+        let (u, _) = sent(build_upload(&after, ME));
         assert_eq!(u.kind, UploadKind::Delete);
+        assert_eq!(u.base_hash, Some(server.hash));
+    }
+
+    #[test]
+    fn a_migrated_delete_is_superseded_by_a_different_server_copy() {
+        let s = migrated_then_deleted();
+        let theirs = json!({"theirs": true});
+        let ops = apply_server_copy(&s, &env(theirs.clone(), 4), ME, &APPEND);
+        assert!(ops.contains(&DocOp::Emit(DocEvent::DeleteSuperseded)));
+        assert!(ops.contains(&DocOp::Recover {
+            content: sample(),
+            reason: RecoverReason::DeleteSuperseded
+        }));
+        let after = s.project(&ops);
+        assert!(after.exists && !after.soft_deleted);
+        assert!(after.rows.is_empty());
+        assert_eq!(after.content, theirs);
     }
 
     #[test]
