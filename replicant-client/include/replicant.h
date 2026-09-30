@@ -297,11 +297,12 @@ enum ReplicantSyncResult
    */
   ReplicantSyncResult_ErrorAlreadyExists = -9,
   /**
-   * Migrating a v1 library failed. The documents are unchanged, and a copy of the v1 database
-   * sits next to it (`<database>.v1-backup`, or `<database>.v1-backup-<unix seconds>` when that
-   * name is taken). Schema changes already applied mean 0.6 builds cannot open the database;
-   * restoring the backup is the way back. Show "Your library needs attention"; never fall back
-   * to a temporary library.
+   * Migrating a v1 library failed. Show "Your library needs attention"; never fall back to a
+   * temporary library. Either the backup itself failed: no backup was written and the
+   * database is unchanged. Or the migration failed after the backup: the documents are
+   * unchanged but 0.6 builds cannot open the database; restoring the backup
+   * (`<database>.v1-backup`, or `<database>.v1-backup-<unix seconds>` when that name was
+   * taken) is the way back.
    */
   ReplicantSyncResult_ErrorMigrationFailed = -10,
   /**

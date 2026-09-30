@@ -38,7 +38,7 @@ private:
             case ReplicantSyncResult_ErrorNotFound: return "Not found";
             case ReplicantSyncResult_ErrorNotWritable: return "This document cannot be changed";
             case ReplicantSyncResult_ErrorAlreadyExists: return "A document with this id exists or was deleted";
-            case ReplicantSyncResult_ErrorMigrationFailed: return "The library could not be upgraded; a backup was kept";
+            case ReplicantSyncResult_ErrorMigrationFailed: return "The library could not be upgraded";
             case ReplicantSyncResult_ErrorBusy: return "The database is busy in another program";
             case ReplicantSyncResult_ErrorWrongThread: return "Callbacks must be registered and events processed on the bound thread";
             case ReplicantSyncResult_ErrorNoCallbacks: return "No callbacks are registered";
