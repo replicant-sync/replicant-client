@@ -8,8 +8,7 @@ use super::list_merge::{ListMergeConfig, ListMergePolicy};
 use super::types::{Change, ChangeKind, DocEnvelope, Scope, Seq};
 
 pub use super::doc_upload::{
-    build_upload, server_rolled_back, settle, BuildResult, InFlight, SettleResult,
-    MAX_MISMATCH_ATTEMPTS,
+    build_upload, settle, BuildResult, InFlight, SettleResult, MAX_MISMATCH_ATTEMPTS,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3060,14 +3059,6 @@ mod property_tests {
                 !reply_diverged(&self.snap, &inflight, &reply),
                 "the model server never transforms content, so a divergent reply is false"
             );
-            // The store clears a refused upload's sent marks.
-            if let Err(error) = &reply {
-                if server_rolled_back(&error.code)
-                    && self.snap.unacked_upload == Some(inflight.upload_id)
-                {
-                    self.snap.unacked_upload = None;
-                }
-            }
             match settle(&self.snap, &inflight, &reply, ME, self.mismatches, 0) {
                 SettleResult::Ops(ops) => {
                     if inflight.kind == UploadKind::Delete {

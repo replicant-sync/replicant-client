@@ -10,13 +10,6 @@ use super::types::{DocEnvelope, Seq, ServerError, Upload, UploadKind};
 
 pub const MAX_MISMATCH_ATTEMPTS: u32 = 3;
 
-/// The server refused this upload: nothing of this send landed.
-pub fn server_rolled_back(code: &str) -> bool {
-    matches!(
-        code,
-        "hash_mismatch" | "exists" | "not_found" | "validation" | "forbidden" | "too_large"
-    )
-}
 /// Consecutive replies whose content differs from what was sent before the document is parked.
 pub const MAX_DIVERGENT_REPLIES: u32 = 3;
 
