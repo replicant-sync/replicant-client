@@ -497,6 +497,128 @@
     }
   },
   {
+    "name": "exponent-form numbers",
+    "doc": {
+      "a": 0.00001,
+      "b": 1e20,
+      "c": -1e19
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/a",
+        "value": 0.00002
+      },
+      {
+        "op": "replace",
+        "path": "/b",
+        "value": -1e20
+      },
+      {
+        "op": "replace",
+        "path": "/c",
+        "value": 1e19
+      },
+      {
+        "op": "add",
+        "path": "/d",
+        "value": 1.5e-7
+      }
+    ],
+    "result": {
+      "a": 0.00002,
+      "b": -1e20,
+      "c": 1e19,
+      "d": 1.5e-7
+    }
+  },
+  {
+    "name": "keys that look like indices",
+    "doc": {
+      "-": 3,
+      "0": 1,
+      "01": 2,
+      "1abc": 4
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/-",
+        "value": 7
+      },
+      {
+        "op": "replace",
+        "path": "/0",
+        "value": 5
+      },
+      {
+        "op": "replace",
+        "path": "/01",
+        "value": 6
+      },
+      {
+        "op": "replace",
+        "path": "/1abc",
+        "value": 8
+      },
+      {
+        "op": "add",
+        "path": "/2",
+        "value": 9
+      }
+    ],
+    "result": {
+      "-": 7,
+      "0": 5,
+      "01": 6,
+      "1abc": 8,
+      "2": 9
+    }
+  },
+  {
+    "name": "index-like keys nested in a list",
+    "doc": {
+      "l": [
+        {
+          "-": 1,
+          "0": [
+            1,
+            2
+          ]
+        }
+      ]
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/l/0/-",
+        "value": null
+      },
+      {
+        "op": "replace",
+        "path": "/l/0/0/1",
+        "value": 3
+      },
+      {
+        "op": "add",
+        "path": "/l/0/0/2",
+        "value": 2
+      }
+    ],
+    "result": {
+      "l": [
+        {
+          "-": null,
+          "0": [
+            1,
+            3,
+            2
+          ]
+        }
+      ]
+    }
+  },
+  {
     "name": "random 0",
     "doc": {
       "k1": 258

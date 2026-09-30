@@ -24,7 +24,9 @@ fn fixture_path() -> PathBuf {
         .join("tests/fixtures/server_v2/json_patch_fixture.json")
 }
 
-/// (name, doc, result): the patch is whatever `json_patch::diff` makes of the pair.
+/// (name, doc, result): the patch is whatever `json_patch::diff` makes of the pair. The client
+/// sends canonical content, so only canonical numbers appear in the cases below (and every
+/// document is an object, so `diff` never emits a root replace).
 fn inputs() -> Vec<(String, Value, Value)> {
     let scale = |pitches: Value| json!({"name": "12-TET", "pitches": pitches});
     let base = scale(json!([0, 200, 400, 500, 700, 900]));
@@ -84,6 +86,21 @@ fn inputs() -> Vec<(String, Value, Value)> {
             "numbers",
             json!({"cents": 1.5, "big": 9_007_199_254_740_993_i64, "neg": -3}),
             json!({"cents": 386.3137, "big": 9_007_199_254_740_994_i64, "neg": -0.5}),
+        ),
+        (
+            "exponent-form numbers",
+            json!({"a": 1e-5, "b": 1e20, "c": -1e19}),
+            json!({"a": 2e-5, "b": -1e20, "c": 1e19, "d": 1.5e-7}),
+        ),
+        (
+            "keys that look like indices",
+            json!({"0": 1, "01": 2, "-": 3, "1abc": 4}),
+            json!({"0": 5, "01": 6, "-": 7, "1abc": 8, "2": 9}),
+        ),
+        (
+            "index-like keys nested in a list",
+            json!({"l": [{"0": [1, 2], "-": 1}]}),
+            json!({"l": [{"0": [1, 3, 2], "-": null}]}),
         ),
     ]
     .into_iter()
