@@ -83,7 +83,6 @@ pub enum OpenError {
 }
 
 struct Shared {
-    data_dir: PathBuf,
     config: HostConfig,
     engine: Engine,
     fanout: Arc<Mutex<FanOut>>,
@@ -109,7 +108,7 @@ impl Shared {
             server_url: config.server_url.clone(),
             host_app: config.host_app.clone(),
             host_version: config.host_version.clone(),
-            credentials: credential_loader(data_dir.clone(), config.fallback_email.clone()),
+            credentials: credential_loader(data_dir, config.fallback_email.clone()),
             jitter_seed: rand::random(),
             list_merge: config.list_merge.clone(),
         };
@@ -128,8 +127,9 @@ impl Shared {
         let first = fanout.attach();
         let fanout = Arc::new(Mutex::new(fanout));
         let fanout_task = runtime.spawn(fanout::run(engine.store(), events_rx, fanout.clone()));
+        #[cfg(test)]
+        tests::after_fanout_spawn(&fanout);
         let shared = Shared {
-            data_dir,
             config,
             engine,
             fanout,
@@ -197,20 +197,25 @@ pub fn attach(config: HostConfig) -> Result<Handle, OpenError> {
 }
 
 /// Tells every engine in this process on `data_dir` that its stored credentials changed.
-/// Returns how many were told. Waits for an engine of that data dir that is starting.
+/// Returns how many were told. Waits for an engine of that data dir that is starting, never for
+/// one on another data dir.
 pub fn credentials_changed(data_dir: &Path) -> usize {
     let Ok(data_dir) = std::fs::canonicalize(data_dir) else {
         return 0;
     };
-    let slots: Vec<Arc<Slot>> = lock(&REGISTRY).values().cloned().collect();
+    let slots: Vec<Arc<Slot>> = lock(&REGISTRY)
+        .iter()
+        .filter(|(key, _)| key.parent() == Some(data_dir.as_path()))
+        .map(|(_, slot)| slot.clone())
+        .collect();
     slots
         .iter()
         .filter(|slot| {
             // The strong reference drops under the slot lock, so it can never be the last one.
             let current = lock(&slot.0);
-            current.upgrade().is_some_and(|shared| {
-                shared.data_dir == data_dir && shared.engine.command(Command::CredentialsChanged)
-            })
+            current
+                .upgrade()
+                .is_some_and(|shared| shared.engine.command(Command::CredentialsChanged))
         })
         .count()
 }

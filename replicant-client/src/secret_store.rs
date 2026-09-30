@@ -44,6 +44,10 @@ fn load_or_create_key(dir: &Path) -> io::Result<[u8; 32]> {
     std::fs::create_dir_all(dir)?;
     let key_path = dir.join(KEY_FILE);
     let temp = write_temp(&key_path, &key)?;
+    #[cfg(test)]
+    if let Some(hook) = tests::BEFORE_KEY_LINK.take() {
+        hook();
+    }
     // `hard_link` fails if the key exists, like O_EXCL, but never exposes a partial key.
     let linked = std::fs::hard_link(&temp, &key_path);
     let _ = std::fs::remove_file(&temp);
@@ -269,20 +273,29 @@ mod tests {
         writer.join().unwrap();
     }
 
+    thread_local! {
+        pub(super) static BEFORE_KEY_LINK: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::Cell::new(None) };
+    }
+
     #[test]
     fn two_racing_first_stores_leave_readable_credentials() {
-        for _ in 0..50 {
-            let dir = tempfile::tempdir().unwrap();
-            let racers: Vec<_> = ["a", "b"]
-                .into_iter()
-                .map(|api_key| {
-                    let path = dir.path().to_path_buf();
-                    std::thread::spawn(move || store(&path, &creds(api_key)).unwrap())
-                })
-                .collect();
-            racers.into_iter().for_each(|racer| racer.join().unwrap());
-            let loaded = load(dir.path()).unwrap().expect("one of the two is stored");
-            assert!(["a", "b"].contains(&loaded.api_key.as_str()));
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        // The other store runs whole after this one found no key and before it installs its own.
+        BEFORE_KEY_LINK.set(Some(Box::new(move || {
+            std::thread::spawn(move || store(&path, &creds("b")).unwrap())
+                .join()
+                .unwrap();
+        })));
+        let key = load_or_create_key(dir.path()).unwrap();
+        assert_eq!(
+            load(dir.path()).unwrap().unwrap().api_key,
+            "b",
+            "the winner's key was not replaced"
+        );
+        assert_eq!(read_key(dir.path()).unwrap(), Some(key));
+        store(dir.path(), &creds("a")).unwrap();
+        assert_eq!(load(dir.path()).unwrap().unwrap().api_key, "a");
     }
 }

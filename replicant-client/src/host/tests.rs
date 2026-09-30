@@ -1,13 +1,15 @@
+use std::cell::Cell;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 use tokio::runtime::Runtime;
 
+use super::fanout::FanOut;
 use super::{
-    attach, credential_loader, credentials_changed, Handle, HostConfig, HostEvent, OpenError,
-    Origin,
+    attach, credential_loader, credentials_changed, lock, Handle, HostConfig, HostEvent, OpenError,
+    Origin, REGISTRY,
 };
 use crate::driver::test_server::ScriptedServer;
 use crate::engine::list_merge::{ListMergeConfig, ListMergePolicy};
@@ -19,6 +21,19 @@ use crate::store::Store;
 /// Nothing listens here, so an engine with credentials keeps failing to connect.
 const OFFLINE: &str = "ws://127.0.0.1:9";
 const WAIT: Duration = Duration::from_secs(10);
+
+type FanOutHook = Box<dyn FnOnce(&Mutex<FanOut>)>;
+
+thread_local! {
+    static AFTER_FANOUT_SPAWN: Cell<Option<FanOutHook>> = const { Cell::new(None) };
+}
+
+/// Runs this thread's hook once the new engine's fan-out task is running.
+pub(super) fn after_fanout_spawn(fanout: &Mutex<FanOut>) {
+    if let Some(hook) = AFTER_FANOUT_SPAWN.take() {
+        hook(fanout);
+    }
+}
 
 fn config(data_dir: &Path, server_url: &str) -> HostConfig {
     HostConfig {
@@ -264,13 +279,78 @@ fn repeated_attach_and_close_cycles_finish_within_the_bound() {
 #[test]
 fn the_first_handle_hears_the_engines_first_events() {
     let dir = tempfile::tempdir().unwrap();
+    // `attach` returns only after the fan-out has published the engine's first event.
+    AFTER_FANOUT_SPAWN.set(Some(Box::new(|fanout: &Mutex<FanOut>| {
+        wait_until("the first published event", || lock(fanout).published > 0)
+    })));
     let handle = attach(config(dir.path(), OFFLINE)).unwrap();
-    events_until(&handle, "the not-enrolled halt", |seen| {
-        seen.iter().any(|event| {
-            matches!(event, HostEvent::SyncError { code, fatal: true, .. } if code == "not_enrolled")
-        })
-    });
+    let first_events = handle.take_events();
+    assert!(
+        matches!(first_events.first(), Some(HostEvent::SyncError { code, fatal: true, .. }) if code == "not_enrolled"),
+        "{first_events:?}"
+    );
     assert!(handle.close().wait(WAIT));
+}
+
+#[test]
+fn credentials_for_one_data_dir_never_wait_for_an_engine_starting_on_another() {
+    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::{ConnectOptions, Connection};
+
+    let signed_in_dir = tempfile::tempdir().unwrap();
+    let starting_dir = tempfile::tempdir().unwrap();
+    assert!(attach(config(starting_dir.path(), OFFLINE))
+        .unwrap()
+        .close()
+        .wait(WAIT));
+    let starting_key = std::fs::canonicalize(starting_dir.path())
+        .unwrap()
+        .join("replicant.sqlite3");
+    let lock_runtime = Runtime::new().unwrap();
+    let mut write_lock = lock_runtime.block_on(async {
+        let mut connection = SqliteConnectOptions::new()
+            .filename(&starting_key)
+            .connect()
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        connection
+    });
+    let starting = std::thread::spawn({
+        let config = config(starting_dir.path(), OFFLINE);
+        move || attach(config).map(Handle::close)
+    });
+    wait_until("the other engine is starting", || {
+        lock(&REGISTRY)
+            .get(&starting_key)
+            .is_some_and(|slot| slot.0.try_lock().is_err())
+    });
+
+    let signed_in = attach(config(signed_in_dir.path(), OFFLINE)).unwrap();
+    sign_in(signed_in_dir.path(), "k1");
+    let told = std::thread::spawn({
+        let dir = signed_in_dir.path().to_path_buf();
+        move || credentials_changed(&dir)
+    });
+    wait_until("credentials_changed returns", || told.is_finished());
+    assert_eq!(told.join().unwrap(), 1);
+    assert!(
+        !starting.is_finished(),
+        "the other engine was still starting"
+    );
+
+    lock_runtime.block_on(async {
+        sqlx::query("ROLLBACK")
+            .execute(&mut write_lock)
+            .await
+            .unwrap();
+        write_lock.close().await.unwrap();
+    });
+    assert!(starting.join().unwrap().unwrap().wait(WAIT));
+    assert!(signed_in.close().wait(WAIT));
 }
 
 #[test]
@@ -325,4 +405,6 @@ fn the_join_email_comes_from_the_stored_credentials_before_the_fallback() {
     assert_eq!(without_fallback().unwrap().unwrap().api_key, "k2");
     std::fs::write(dir.path().join("credentials.enc"), b"torn").unwrap();
     assert!(with_fallback().is_err(), "unreadable is not signed out");
+    std::fs::write(dir.path().join("credentials.enc"), [7u8; 40]).unwrap();
+    assert!(with_fallback().is_err(), "undecryptable is not signed out");
 }

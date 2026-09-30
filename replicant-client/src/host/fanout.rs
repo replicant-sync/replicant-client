@@ -131,6 +131,8 @@ struct Seed {
 pub(super) struct FanOut {
     queues: Vec<Arc<EventQueue>>,
     seed: Seed,
+    #[cfg(test)]
+    pub(super) published: usize,
 }
 
 impl FanOut {
@@ -171,6 +173,10 @@ impl FanOut {
                 }
             }
             _ => {}
+        }
+        #[cfg(test)]
+        {
+            self.published += 1;
         }
         for queue in &self.queues {
             queue.push(event.clone());
