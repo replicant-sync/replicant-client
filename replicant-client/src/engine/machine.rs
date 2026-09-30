@@ -23,16 +23,19 @@ const STABLE_AFTER: Duration = Duration::from_secs(60);
 const QUIET: Duration = Duration::from_millis(200);
 const QUIET_CAP: Duration = Duration::from_secs(1);
 const HALT_RETRY: Duration = Duration::from_secs(300);
+/// A sign-in in another process is noticed this soon (0.6 polled every 3 s).
+const NOT_ENROLLED_RECHECK: Duration = Duration::from_secs(3);
 const MAX_CATCH_UP_FAILURES: u32 = 3;
 const UNREADABLE_PUSHES_BEFORE_ERROR: u32 = 3;
 
-/// Halts that another process's sign-in can end, so the stored credentials are read again
-/// every `HALT_RETRY`.
-fn rechecks_credentials(reason: &HaltReason) -> bool {
+/// Halts that another process's sign-in can end, so the stored credentials are read again:
+/// every `NOT_ENROLLED_RECHECK` when signed out, every `HALT_RETRY` otherwise.
+fn credentials_recheck(reason: &HaltReason) -> Option<Duration> {
     match reason {
-        HaltReason::NotEnrolled | HaltReason::AuthInvalid => true,
-        HaltReason::Other(code) => code == "identity_drift",
-        HaltReason::UpdateRequired | HaltReason::AccountDisabled => false,
+        HaltReason::NotEnrolled => Some(NOT_ENROLLED_RECHECK),
+        HaltReason::AuthInvalid => Some(HALT_RETRY),
+        HaltReason::Other(code) if code == "identity_drift" => Some(HALT_RETRY),
+        HaltReason::Other(_) | HaltReason::UpdateRequired | HaltReason::AccountDisabled => None,
     }
 }
 
@@ -506,10 +509,10 @@ impl Core {
                 if let Conn::Halted(reason) = &self.conn {
                     if has_credentials {
                         self.connect_now(fx);
-                    } else if rechecks_credentials(reason) {
+                    } else if let Some(after) = credentials_recheck(reason) {
                         fx.push(Effect::Schedule {
                             timer: TimerId::HaltRetry,
-                            after: HALT_RETRY,
+                            after,
                         });
                     }
                 } else if !has_credentials {
@@ -638,10 +641,10 @@ impl Core {
             doc_id: None,
             fatal: true,
         }));
-        if rechecks_credentials(&reason) {
+        if let Some(after) = credentials_recheck(&reason) {
             fx.push(Effect::Schedule {
                 timer: TimerId::HaltRetry,
-                after: HALT_RETRY,
+                after,
             });
         }
         self.conn = Conn::Halted(reason);
@@ -1830,7 +1833,7 @@ mod connection_tests {
         );
         assert!(fx.contains(&Effect::Schedule {
             timer: TimerId::HaltRetry,
-            after: Duration::from_secs(300)
+            after: Duration::from_secs(3)
         }));
         assert!(emitted(&fx)
             .iter()
@@ -2295,7 +2298,7 @@ mod connection_tests {
         assert_eq!(emitted(&fx).first(), Some(&Lifecycle::ConnectionLost));
         assert!(fx.contains(&Effect::Schedule {
             timer: TimerId::HaltRetry,
-            after: Duration::from_secs(300)
+            after: Duration::from_secs(3)
         }));
     }
 

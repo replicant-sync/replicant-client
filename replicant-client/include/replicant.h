@@ -813,7 +813,8 @@ ReplicantSyncResult replicant_enroll_request(const char *base_url, const char *e
  * with `email`; the api key and secret never leave the library. Writes the user id into
  * `out_user_id` (`user_id_cap` bytes, at least `REPLICANT_USER_ID_LEN + 1`).
  * Results:
- * - `Success`: stored; this process's engines on `data_dir` sign in.
+ * - `Success`: stored; this process's engines on `data_dir` sign in at once, and engines in
+ *   other processes within about 3 s.
  * - `ErrorInvalidInput`: a null or non-UTF-8 argument, an empty or over-long email, or a
  *   `base_url` that is not https (localhost excepted). The server is not contacted.
  * - `ErrorBufferTooSmall`: `user_id_cap` is too small. The server is not contacted.

@@ -363,6 +363,31 @@ async fn a_sign_out_in_another_process_ends_a_live_connection_within_a_second() 
 }
 
 #[tokio::test]
+async fn a_sign_in_in_another_process_is_picked_up_within_three_seconds() {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    keys.sign_out();
+    let mut h = harness(&server.url, keys.loader(), ME, true).await;
+    h.start().await;
+    assert_eq!(
+        connection(&h.owner),
+        ConnectionView::Halted(HaltReason::NotEnrolled)
+    );
+    // Stored by another process: this engine is never told.
+    keys.set("k1");
+    for _ in 0..(3250 / LOG_TICK.as_millis()) {
+        jump(LOG_TICK).await;
+        h.turns(2).await;
+    }
+    assert_ne!(
+        connection(&h.owner),
+        ConnectionView::Halted(HaltReason::NotEnrolled)
+    );
+    h.turn_until("live", is_live).await;
+    assert_eq!(server.join_keys(), vec!["k1".to_string()]);
+}
+
+#[tokio::test]
 async fn nothing_but_the_join_is_sent_while_connecting() {
     let server = ScriptedServer::start(ME).await;
     server.set_mode(Mode::SilentAfterUpgrade);
