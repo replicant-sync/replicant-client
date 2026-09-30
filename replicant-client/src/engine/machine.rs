@@ -32,7 +32,7 @@ fn rechecks_credentials(reason: &HaltReason) -> bool {
     match reason {
         HaltReason::NotEnrolled | HaltReason::AuthInvalid => true,
         HaltReason::Other(code) => code == "identity_drift",
-        _ => false,
+        HaltReason::UpdateRequired | HaltReason::AccountDisabled => false,
     }
 }
 
@@ -937,7 +937,7 @@ impl Core {
         });
     }
 
-    /// A fatal error ends the Connected period like lose_connection, then halts
+    /// A fatal error ends the Connected period like `lose_connection`, then halts
     /// instead of scheduling a reconnect.
     fn catch_up_fatal(&mut self, reason: HaltReason, fx: &mut Vec<Effect>) {
         fx.push(Effect::Emit(Lifecycle::ConnectionLost));

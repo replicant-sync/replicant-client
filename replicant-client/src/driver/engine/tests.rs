@@ -8,7 +8,7 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use super::owner_support::{connection, harness, is_live, Harness};
-use super::{retry_open, twice, Command, Engine, EngineError, Queued};
+use super::{retry_open, twice, Command, Engine, EngineError, Queued, LOG_TICK};
 use crate::driver::test_server::{Mode, ScriptedServer};
 use crate::driver::test_support::{
     config, credentials, eventually, jump, no_credentials, seeded_db, SwitchableCredentials, WAIT,
@@ -332,15 +332,11 @@ async fn unreadable_credentials_are_retried_and_never_read_as_a_sign_out() {
     keys.set_unreadable(true);
     server.drop_connections();
     jump(Duration::from_millis(2100)).await;
-    h.turn_until("a dial that did not join", |o| {
-        server.stats.upgrades() == 2 && connection(o) != ConnectionView::Connected
+    h.turn_until("a dial abandoned before its join, backing off", |o| {
+        server.stats.upgrades() == 2 && connection(o) == ConnectionView::Disconnected
     })
     .await;
-    assert_ne!(
-        connection(&h.owner),
-        ConnectionView::Halted(HaltReason::NotEnrolled),
-        "a torn read is not a sign-out"
-    );
+    assert_eq!(server.join_keys(), vec!["k1".to_string()]);
     keys.set_unreadable(false);
     jump(Duration::from_secs(10)).await;
     h.turn_until("live again with k1", is_live).await;
@@ -353,12 +349,17 @@ async fn a_sign_out_in_another_process_ends_a_live_connection_within_a_second() 
     let keys = SwitchableCredentials::new("k1");
     let mut h = harness(&server.url, keys.loader(), ME, true).await;
     h.live().await;
-    keys.sign_out(); // this engine is never told
-    jump(Duration::from_millis(1100)).await;
-    h.turn_until("halted as not enrolled", |o| {
-        connection(o) == ConnectionView::Halted(HaltReason::NotEnrolled)
-    })
-    .await;
+    // This engine is never told. The tick count at sign-out is unknown, so the halt must land
+    // within a second of ticks.
+    keys.sign_out();
+    for _ in 0..(1000 / LOG_TICK.as_millis()) {
+        jump(LOG_TICK).await;
+        h.turns(2).await;
+    }
+    assert_eq!(
+        connection(&h.owner),
+        ConnectionView::Halted(HaltReason::NotEnrolled)
+    );
 }
 
 #[tokio::test]
