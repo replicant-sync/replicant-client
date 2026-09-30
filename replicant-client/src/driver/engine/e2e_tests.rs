@@ -238,11 +238,11 @@ async fn cursor_too_old_resync_sweeps_missing_docs() {
         &mut events,
         "ConflictDetected for the edited document",
         |event| {
-            *event
-                == EngineEvent::Doc(DocNotice {
-                    doc_id: edited,
-                    event: DocEvent::ConflictDetected,
-                })
+            matches!(
+                event,
+                EngineEvent::Doc(DocNotice { doc_id, event: DocEvent::ConflictDetected, .. })
+                    if *doc_id == edited
+            )
         },
     )
     .await;
@@ -594,11 +594,11 @@ async fn snapshot_of_a_doc_with_only_a_pending_create_surfaces_conflict_detected
         .await
         .unwrap();
     wait_for(&mut events, "ConflictDetected", |event| {
-        *event
-            == EngineEvent::Doc(DocNotice {
-                doc_id,
-                event: DocEvent::ConflictDetected,
-            })
+        matches!(
+            event,
+            EngineEvent::Doc(DocNotice { doc_id: noticed, event: DocEvent::ConflictDetected, .. })
+                if *noticed == doc_id
+        )
     })
     .await;
     let store = engine.store();
@@ -629,13 +629,11 @@ async fn new_edit_unparks_a_rejected_document() {
     let doc_id = store.create_document(None, json!({"n": 1})).await.unwrap();
     engine.notify_outbox();
     wait_for(&mut events, "the park", |event| {
-        *event
-            == EngineEvent::Doc(DocNotice {
-                doc_id,
-                event: DocEvent::SyncError {
-                    code: "validation".into(),
-                },
-            })
+        matches!(
+            event,
+            EngineEvent::Doc(DocNotice { doc_id: noticed, event: DocEvent::SyncError { code }, .. })
+                if *noticed == doc_id && code == "validation"
+        )
     })
     .await;
     assert_eq!(
@@ -782,11 +780,11 @@ async fn a_delete_after_a_lost_create_reply_never_destroys_another_devices_edit(
         .unwrap();
     let store = engine.store();
     wait_for(&mut events, "DeleteSuperseded", |event| {
-        *event
-            == EngineEvent::Doc(DocNotice {
-                doc_id,
-                event: DocEvent::DeleteSuperseded,
-            })
+        matches!(
+            event,
+            EngineEvent::Doc(DocNotice { doc_id: noticed, event: DocEvent::DeleteSuperseded, .. })
+                if *noticed == doc_id
+        )
     })
     .await;
     eventually("settled", || async { outbox_rows(&store).await == 0 }).await;
@@ -938,14 +936,18 @@ async fn an_edit_from_another_device_supersedes_an_offline_delete() {
         .await
         .unwrap();
     let store = engine.store();
-    wait_for(&mut events, "DeleteSuperseded", |event| {
-        *event
-            == EngineEvent::Doc(DocNotice {
-                doc_id,
-                event: DocEvent::DeleteSuperseded,
-            })
+    let superseded = wait_for(&mut events, "DeleteSuperseded", |event| {
+        matches!(
+            event,
+            EngineEvent::Doc(DocNotice { doc_id: noticed, event: DocEvent::DeleteSuperseded, .. })
+                if *noticed == doc_id
+        )
     })
     .await;
+    assert!(
+        matches!(superseded, EngineEvent::Doc(DocNotice { kept: None, .. })),
+        "unedited: no kept copy is named"
+    );
     eventually("settled", || async { outbox_rows(&store).await == 0 }).await;
     let after = snapshot(&store, doc_id).await;
     assert!(
@@ -982,14 +984,21 @@ async fn an_offline_edit_then_delete_superseded_by_another_device_keeps_the_edit
         .await
         .unwrap();
     let store = engine.store();
-    wait_for(&mut events, "DeleteSuperseded", |event| {
-        *event
-            == EngineEvent::Doc(DocNotice {
-                doc_id,
-                event: DocEvent::DeleteSuperseded,
-            })
+    let EngineEvent::Doc(superseded) = wait_for(&mut events, "DeleteSuperseded", |event| {
+        matches!(
+            event,
+            EngineEvent::Doc(DocNotice { doc_id: noticed, event: DocEvent::DeleteSuperseded, .. })
+                if *noticed == doc_id
+        )
     })
-    .await;
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        superseded.kept.map(|kept| kept.reason).as_deref(),
+        Some("delete_superseded")
+    );
     eventually("settled", || async { outbox_rows(&store).await == 0 }).await;
     let after = snapshot(&store, doc_id).await;
     assert!(after.exists && !after.soft_deleted);
@@ -1023,11 +1032,11 @@ async fn a_delete_on_a_stale_version_is_refused_and_can_be_repeated() {
     store.delete_document(doc_id).await.unwrap();
     engine.notify_outbox();
     wait_for(&mut events, "DeleteSuperseded", |event| {
-        *event
-            == EngineEvent::Doc(DocNotice {
-                doc_id,
-                event: DocEvent::DeleteSuperseded,
-            })
+        matches!(
+            event,
+            EngineEvent::Doc(DocNotice { doc_id: noticed, event: DocEvent::DeleteSuperseded, .. })
+                if *noticed == doc_id
+        )
     })
     .await;
     let uploads = server.uploads_for(doc_id);
@@ -1162,13 +1171,11 @@ async fn a_persistent_divergent_reply_parks_the_document_after_a_bounded_number_
         .unwrap();
     engine.notify_outbox();
     wait_for(&mut events, "the park", |event| {
-        *event
-            == EngineEvent::Doc(DocNotice {
-                doc_id,
-                event: DocEvent::SyncError {
-                    code: "diverged".into(),
-                },
-            })
+        matches!(
+            event,
+            EngineEvent::Doc(DocNotice { doc_id: noticed, event: DocEvent::SyncError { code }, .. })
+                if *noticed == doc_id && code == "diverged"
+        )
     })
     .await;
     let bound = 1 + MAX_DIVERGENT_REPLIES as usize + 1;
@@ -1297,23 +1304,31 @@ async fn refuse_a_delete(local_edit: Option<Value>) -> Vec<(String, Value)> {
     engine.notify_outbox();
     eventually("synced", || async { outbox_rows(&store).await == 0 }).await;
     server.reject_deletes("forbidden");
+    let edited = local_edit.is_some();
     if let Some(edit) = local_edit {
         store.update_document(doc_id, edit).await.unwrap();
     }
     store.delete_document(doc_id).await.unwrap();
     engine.notify_outbox();
-    let refusal = EngineEvent::Doc(DocNotice {
-        doc_id,
-        event: DocEvent::SyncError {
-            code: "forbidden".into(),
-        },
-    });
-    wait_for(&mut events, "the refusal", |event| *event == refusal).await;
+    let refused = |event: &EngineEvent| {
+        matches!(
+            event,
+            EngineEvent::Doc(DocNotice { doc_id: noticed, event: DocEvent::SyncError { code }, .. })
+                if *noticed == doc_id && code == "forbidden"
+        )
+    };
+    let EngineEvent::Doc(refusal) = wait_for(&mut events, "the refusal", refused).await else {
+        unreachable!()
+    };
+    assert_eq!(refusal.kept.is_some(), edited, "a copy exactly when edited");
+    if let Some(kept) = &refusal.kept {
+        assert_eq!(kept.reason, "delete_refused");
+    }
     let uploads_then = server.uploads_for(doc_id).len();
     tokio::time::sleep(Duration::from_millis(500)).await;
     let mut refusals = 0;
     while let Ok(event) = events.try_recv() {
-        refusals += usize::from(event == refusal);
+        refusals += usize::from(refused(&event));
     }
     let uploads = server.uploads_for(doc_id);
     let deletes = uploads

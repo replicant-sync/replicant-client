@@ -269,7 +269,11 @@ mod tests {
             notices,
             vec![crate::store::DocNotice {
                 doc_id: doc(1),
-                event: crate::engine::doc::DocEvent::ConflictDetected
+                event: crate::engine::doc::DocEvent::ConflictDetected,
+                kept: Some(crate::store::KeptCopy {
+                    recovered_id: 1,
+                    reason: "conflict".into()
+                })
             }]
         );
         let recovered: Vec<(String, String)> =
@@ -528,5 +532,53 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(last_kind, "upsert", "the host is told it is back");
+    }
+
+    #[tokio::test]
+    async fn an_edited_pending_delete_on_a_document_that_became_a_publication_names_its_kept_copy()
+    {
+        let t = temp_store().await;
+        seed_synced(
+            &t.store,
+            doc(1),
+            SCOPE_OWN,
+            Some(ME),
+            json!({"title": "Mine"}),
+            3,
+        )
+        .await;
+        let edited = json!({"title": "Mine", "n": 2});
+        t.store
+            .update_document(doc(1), edited.clone())
+            .await
+            .unwrap();
+        t.store.delete_document(doc(1)).await.unwrap();
+        let mut publication = envelope(doc(1), Some(ME), json!({"title": "Mine"}), 4);
+        publication.read_only = true;
+        let notices = t
+            .store
+            .apply_changes(
+                ME,
+                SCOPE_CURATED,
+                &[upsert_change(SCOPE_CURATED, publication)],
+                4,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            notices,
+            vec![crate::store::DocNotice {
+                doc_id: doc(1),
+                event: crate::engine::doc::DocEvent::SyncError {
+                    code: "became_publication".into()
+                },
+                kept: Some(crate::store::KeptCopy {
+                    recovered_id: 1,
+                    reason: "delete_publication".into()
+                })
+            }]
+        );
+        let kept = t.store.list_recovered().await.unwrap();
+        assert_eq!(kept[0].content, edited);
     }
 }

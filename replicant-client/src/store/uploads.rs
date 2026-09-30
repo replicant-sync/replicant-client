@@ -161,6 +161,7 @@ mod tests {
     use crate::engine::doc::{DocEvent, RowKind};
     use crate::engine::types::{Upload, UploadKind, SCOPE_OWN};
     use crate::store::test_support::*;
+    use crate::store::KeptCopy;
 
     async fn sent(store: &Store, doc_id: Uuid) -> (Upload, InFlight) {
         match store.build_upload(ME, doc_id).await.unwrap() {
@@ -485,7 +486,11 @@ mod tests {
             notices,
             vec![DocNotice {
                 doc_id: DOC,
-                event: DocEvent::ConflictDetected
+                event: DocEvent::ConflictDetected,
+                kept: Some(KeptCopy {
+                    recovered_id: 1,
+                    reason: "conflict".into()
+                })
             }]
         );
         assert_eq!(recovered(&t).await, vec![(local, "conflict".to_string())]);
@@ -526,7 +531,8 @@ mod tests {
                 doc_id: DOC,
                 event: DocEvent::SyncError {
                     code: "validation".into()
-                }
+                },
+                kept: None
             }]
         );
         // An error reply does not clear the mark: an earlier send of the same rows may have
@@ -551,7 +557,11 @@ mod tests {
             notices,
             vec![DocNotice {
                 doc_id: DOC,
-                event: DocEvent::ConflictDetected
+                event: DocEvent::ConflictDetected,
+                kept: Some(KeptCopy {
+                    recovered_id: 1,
+                    reason: "conflict".into()
+                })
             }]
         );
     }
@@ -568,7 +578,11 @@ mod tests {
             notices,
             vec![DocNotice {
                 doc_id: DOC,
-                event: DocEvent::ConflictDetected
+                event: DocEvent::ConflictDetected,
+                kept: Some(KeptCopy {
+                    recovered_id: 1,
+                    reason: "delete_wins".into()
+                })
             }]
         );
         assert_eq!(
@@ -631,7 +645,11 @@ mod tests {
             notices,
             vec![DocNotice {
                 doc_id: DOC,
-                event: DocEvent::ConflictDetected
+                event: DocEvent::ConflictDetected,
+                kept: Some(KeptCopy {
+                    recovered_id: 1,
+                    reason: "conflict".into()
+                })
             }]
         );
         assert_eq!(
@@ -690,7 +708,11 @@ mod tests {
             notices,
             vec![DocNotice {
                 doc_id: DOC,
-                event: DocEvent::ConflictDetected
+                event: DocEvent::ConflictDetected,
+                kept: Some(KeptCopy {
+                    recovered_id: 1,
+                    reason: "conflict".into()
+                })
             }]
         );
         assert_eq!(recovered(&t).await, vec![(local, "conflict".to_string())]);

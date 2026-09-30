@@ -42,6 +42,10 @@ pub enum StoreError {
     NilServerUserId,
     #[error("no field-conflict copy with id {0}")]
     NoFieldConflict(i64),
+    #[error("no kept copy with id {0}")]
+    NoKeptCopy(i64),
+    #[error("document {0} is gone; restore its kept copy as a new document")]
+    DocumentGone(Uuid),
     /// Migrating v1 sync data failed; the v1 tables are untouched and a backup sits next to
     /// the database.
     #[error("v1 data migration failed: {0}")]
@@ -71,11 +75,22 @@ impl StoreError {
     }
 }
 
+/// The kept copy a rule wrote just before its notice (`Store::list_recovered`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeptCopy {
+    pub recovered_id: i64,
+    /// `conflict`, `field_conflict`, `delete_wins`, `became_publication`, `create_rejected`,
+    /// `delete_superseded`, `delete_refused` or `delete_publication`. `unmigratable` copies are
+    /// written by the v1 migration without a notice.
+    pub reason: String,
+}
+
 /// An event a rule asked for (`DocOp::Emit`), for the driver to hand to the host.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DocNotice {
     pub doc_id: Uuid,
     pub event: DocEvent,
+    pub kept: Option<KeptCopy>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

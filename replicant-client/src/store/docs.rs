@@ -4,7 +4,7 @@ use serde_json::Value;
 use sqlx::{Row, SqliteConnection};
 use uuid::Uuid;
 
-use super::{now_rfc3339, now_unix, DocNotice, StoreError, StoreResult};
+use super::{now_rfc3339, now_unix, DocNotice, KeptCopy, StoreError, StoreResult};
 use crate::engine::doc::{
     DocOp, DocSnapshot, Membership, OutboxRow, RecoverReason, RowKind, Shadow,
 };
@@ -133,6 +133,7 @@ pub(crate) async fn apply_ops(
 ) -> StoreResult<Vec<DocNotice>> {
     let id = snap.doc_id.to_string();
     let mut notices = Vec::new();
+    let mut kept: Option<KeptCopy> = None;
     for op in ops {
         match op {
             DocOp::DeleteRows(mutation_ids) => {
@@ -190,7 +191,7 @@ pub(crate) async fn apply_ops(
                 .await?;
             }
             DocOp::Recover { content, reason } => {
-                sqlx::query(
+                let inserted = sqlx::query(
                     "INSERT INTO recovered (doc_id, content, reason, recovered_at) VALUES (?, ?, ?, ?)",
                 )
                 .bind(&id)
@@ -199,9 +200,13 @@ pub(crate) async fn apply_ops(
                 .bind(now_unix())
                 .execute(&mut *conn)
                 .await?;
+                kept = Some(KeptCopy {
+                    recovered_id: inserted.last_insert_rowid(),
+                    reason: reason_str(*reason).to_string(),
+                });
             }
             DocOp::RecoverFields { content, fields } => {
-                sqlx::query(
+                let inserted = sqlx::query(
                     "INSERT INTO recovered (doc_id, content, reason, recovered_at, fields) \
                      VALUES (?, ?, 'field_conflict', ?, ?)",
                 )
@@ -211,10 +216,15 @@ pub(crate) async fn apply_ops(
                 .bind(serde_json::to_string(fields)?)
                 .execute(&mut *conn)
                 .await?;
+                kept = Some(KeptCopy {
+                    recovered_id: inserted.last_insert_rowid(),
+                    reason: "field_conflict".to_string(),
+                });
             }
             DocOp::Emit(event) => notices.push(DocNotice {
                 doc_id: snap.doc_id,
                 event: event.clone(),
+                kept: kept.clone(),
             }),
             DocOp::SetShadow(_)
             | DocOp::SetContent(_)
@@ -443,6 +453,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_kept_copy_is_named_in_the_notice_that_reports_it() {
+        let t = temp_store().await;
+        seed_synced(&t.store, DOC, "own", Some(ME), json!({"a": 1}), 1).await;
+        let notices = apply(&t.store, DOC, |_| {
+            vec![
+                DocOp::Emit(DocEvent::SyncError {
+                    code: "validation".into(),
+                }),
+                DocOp::Recover {
+                    content: json!({"a": 2}),
+                    reason: RecoverReason::DeleteWins,
+                },
+                DocOp::Emit(DocEvent::ConflictDetected),
+            ]
+        })
+        .await;
+        assert_eq!(
+            notices[0].kept, None,
+            "no copy was written before this notice"
+        );
+        let kept = notices[1]
+            .kept
+            .clone()
+            .expect("the copy written just before it");
+        assert_eq!(kept.reason, "delete_wins");
+        assert_eq!(
+            t.store.list_recovered().await.unwrap()[0].id,
+            kept.recovered_id
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_and_refused_deletes_name_their_kept_copy() {
+        let t = temp_store().await;
+        seed_synced(&t.store, DOC, "own", Some(ME), json!({"a": 1}), 1).await;
+        let notices = apply(&t.store, DOC, |_| {
+            vec![
+                DocOp::Recover {
+                    content: json!({"a": 2}),
+                    reason: RecoverReason::DeleteSuperseded,
+                },
+                DocOp::Emit(DocEvent::DeleteSuperseded),
+                DocOp::Recover {
+                    content: json!({"a": 3}),
+                    reason: RecoverReason::DeleteRefused,
+                },
+                DocOp::Emit(DocEvent::SyncError {
+                    code: "forbidden".into(),
+                }),
+            ]
+        })
+        .await;
+        let reasons: Vec<Option<String>> = notices
+            .iter()
+            .map(|notice| notice.kept.as_ref().map(|kept| kept.reason.clone()))
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                Some("delete_superseded".to_string()),
+                Some("delete_refused".to_string())
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn recover_keeps_local_content_in_recovered() {
         let t = temp_store().await;
         seed_synced(&t.store, DOC, SCOPE_OWN, Some(ME), json!({"a": 1}), 1).await;
@@ -471,7 +547,11 @@ mod tests {
             notices,
             vec![DocNotice {
                 doc_id: DOC,
-                event: DocEvent::ConflictDetected
+                event: DocEvent::ConflictDetected,
+                kept: Some(KeptCopy {
+                    recovered_id: 1,
+                    reason: "conflict".into()
+                })
             }]
         );
         let recovered: Vec<(String, String)> =

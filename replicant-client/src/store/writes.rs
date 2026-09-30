@@ -76,7 +76,11 @@ impl Store {
         };
         let doc_id = Uuid::parse_str(&doc_id)?;
         let fields: Vec<FieldConflict> = serde_json::from_str(&fields)?;
-        let mut content = load_snapshot(&mut tx, doc_id).await?.content;
+        let snap = load_snapshot(&mut tx, doc_id).await?;
+        if !snap.exists || snap.soft_deleted {
+            return Err(StoreError::DocumentGone(doc_id));
+        }
+        let mut content = snap.content;
         for field in &fields {
             put_field(&mut content, field)?;
         }
@@ -87,6 +91,28 @@ impl Store {
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Re-creates a kept copy's full content as a new document (its old id may be tombstoned on
+    /// the server) and deletes the copy, in one transaction. A field copy holds the whole local
+    /// document too, so this is also the way out when its document is gone or read-only.
+    pub async fn restore_document(&self, recovered_id: i64) -> StoreResult<Uuid> {
+        let mut tx = self.begin().await?;
+        let content: Option<String> =
+            sqlx::query_scalar("SELECT content FROM recovered WHERE id = ?")
+                .bind(recovered_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let content: Value =
+            serde_json::from_str(&content.ok_or(StoreError::NoKeptCopy(recovered_id))?)?;
+        let doc_id = Uuid::new_v4();
+        self.create_in(&mut tx, doc_id, content).await?;
+        sqlx::query("DELETE FROM recovered WHERE id = ?")
+            .bind(recovered_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(doc_id)
     }
 
     async fn update_in(
@@ -583,7 +609,11 @@ mod tests {
                 doc_id: doc(1),
                 event: crate::engine::doc::DocEvent::FieldConflict {
                     paths: vec!["/s".into()]
-                }
+                },
+                kept: Some(crate::store::KeptCopy {
+                    recovered_id: 1,
+                    reason: "field_conflict".into()
+                })
             }]
         );
         let fields: String = sqlx::query_scalar("SELECT fields FROM recovered WHERE doc_id = ?")
@@ -657,7 +687,11 @@ mod tests {
                 doc_id: doc(1),
                 event: crate::engine::doc::DocEvent::FieldConflict {
                     paths: vec!["/pitches".into()]
-                }
+                },
+                kept: Some(crate::store::KeptCopy {
+                    recovered_id: 1,
+                    reason: "field_conflict".into()
+                })
             }]
         );
         assert_eq!(snapshot(&t.store, doc(1)).await.content, theirs);
@@ -692,5 +726,128 @@ mod tests {
             t.store.restore_fields(id).await,
             Err(StoreError::NoFieldConflict(refused)) if refused == id
         ));
+    }
+
+    async fn keep_whole(store: &Store, content: &str) -> i64 {
+        exec(
+            store,
+            &format!(
+                "INSERT INTO recovered (doc_id, content, reason, recovered_at) \
+                 VALUES ('{}', '{content}', 'delete_wins', 1)",
+                doc(9)
+            ),
+        )
+        .await;
+        store.list_recovered().await.unwrap()[0].id
+    }
+
+    #[tokio::test]
+    async fn restore_document_creates_a_new_document_and_removes_the_copy() {
+        let t = temp_store().await;
+        let recovered_id = keep_whole(&t.store, r#"{"title":"Mine"}"#).await;
+        let restored = t.store.restore_document(recovered_id).await.unwrap();
+        assert_ne!(
+            restored,
+            doc(9),
+            "a new id: the old one may be tombstoned on the server"
+        );
+        let snap = snapshot(&t.store, restored).await;
+        assert_eq!(snap.content, json!({"title": "Mine"}));
+        assert_eq!(snap.owner_id, Some(ME));
+        assert_eq!(
+            snap.rows.iter().map(|row| row.kind).collect::<Vec<_>>(),
+            vec![RowKind::Create]
+        );
+        assert!(t.store.list_recovered().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_document_takes_a_field_copy_whole_and_refuses_an_unknown_id() {
+        let t = temp_store().await;
+        exec(
+            &t.store,
+            &format!(
+                "INSERT INTO recovered (doc_id, content, reason, recovered_at, fields) \
+                 VALUES ('{}', '{{\"s\":\"mine\"}}', 'field_conflict', 1, '[]')",
+                doc(1)
+            ),
+        )
+        .await;
+        assert!(matches!(
+            t.store.restore_document(999).await,
+            Err(StoreError::NoKeptCopy(999))
+        ));
+        let field_copy = t.store.list_recovered().await.unwrap()[0].id;
+        let restored = t.store.restore_document(field_copy).await.unwrap();
+        assert_eq!(
+            snapshot(&t.store, restored).await.content,
+            json!({"s": "mine"})
+        );
+        assert!(t.store.list_recovered().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn restoring_fields_of_a_deleted_document_reports_it_gone_and_keeps_the_copy() {
+        let t = temp_store().await;
+        exec(
+            &t.store,
+            &format!(
+                "INSERT INTO recovered (doc_id, content, reason, recovered_at, fields) \
+                 VALUES ('{}', '{{}}', 'field_conflict', 1, \
+                 '[{{\"path\":\"/s\",\"local_value\":\"mine\",\"local_removed\":false}}]')",
+                doc(1)
+            ),
+        )
+        .await;
+        let recovered_id = t.store.list_recovered().await.unwrap()[0].id;
+        assert!(matches!(
+            t.store.restore_fields(recovered_id).await,
+            Err(StoreError::DocumentGone(id)) if id == doc(1)
+        ));
+        assert_eq!(t.store.list_recovered().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restore_fields_records_a_local_change_and_unparks_the_rows() {
+        let t = temp_store().await;
+        let doc_id = t
+            .store
+            .create_document(None, json!({"s": "theirs", "k": 1}))
+            .await
+            .unwrap();
+        exec(
+            &t.store,
+            &format!("UPDATE outbox SET parked_error = 'validation' WHERE doc_id = '{doc_id}'"),
+        )
+        .await;
+        exec(
+            &t.store,
+            &format!(
+                "INSERT INTO recovered (doc_id, content, reason, recovered_at, fields) \
+                 VALUES ('{doc_id}', '{{}}', 'field_conflict', 1, \
+                 '[{{\"path\":\"/s\",\"local_value\":\"mine\",\"local_removed\":false}}]')"
+            ),
+        )
+        .await;
+        let recovered_id = t.store.list_recovered().await.unwrap()[0].id;
+        t.store.restore_fields(recovered_id).await.unwrap();
+        assert_eq!(
+            snapshot(&t.store, doc_id).await.content,
+            json!({"s": "mine", "k": 1})
+        );
+        assert_eq!(
+            count(
+                &t.store,
+                "SELECT COUNT(*) FROM outbox WHERE parked_error IS NOT NULL"
+            )
+            .await,
+            0
+        );
+        let last: (String, String) =
+            sqlx::query_as("SELECT doc_id, origin FROM change_log ORDER BY local_seq DESC LIMIT 1")
+                .fetch_one(&t.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(last, (doc_id.to_string(), "local".to_string()));
     }
 }
