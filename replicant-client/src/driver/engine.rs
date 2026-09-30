@@ -80,6 +80,11 @@ pub enum EngineEvent {
     Changed(DocChange),
     /// Changes were trimmed before this engine read them; the host reloads its lists.
     DatabaseChanged,
+    /// The join's user id differs from the one this engine started with: this engine or another
+    /// process adopted it and restamped the owned documents.
+    IdentityAdopted {
+        user_id: Uuid,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -422,6 +427,9 @@ impl Owner {
             }
         };
         if result.is_ok() {
+            if self.me != user_id {
+                self.emit(EngineEvent::IdentityAdopted { user_id });
+            }
             self.me = user_id;
             self.rejected = None;
         }

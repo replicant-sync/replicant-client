@@ -1914,6 +1914,7 @@ pub unsafe extern "C" fn replicant_store_credentials(
         api_key: api_key.to_string(),
         secret: secret.to_string(),
         user_id,
+        email: None,
     };
 
     match crate::secret_store::store(std::path::Path::new(data_dir), &creds) {

@@ -2,7 +2,7 @@
 
 pub mod engine;
 #[cfg(test)]
-mod test_server;
+pub(crate) mod test_server;
 #[cfg(test)]
 mod test_support;
 pub mod timers;

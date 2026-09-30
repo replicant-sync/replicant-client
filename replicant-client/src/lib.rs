@@ -14,6 +14,7 @@ pub mod websocket;
 
 // C FFI module
 pub mod ffi;
+pub mod host;
 
 // C FFI test functions (debug builds only)
 #[cfg(debug_assertions)]
