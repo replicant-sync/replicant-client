@@ -59,7 +59,7 @@ impl From<Origin> for EventOrigin {
 /// `DocumentChanged` / `DocumentDeleted`. For a deletion only `document_id` is set.
 /// `visibility` is `public` (curated or read-only) or `private`.
 /// Strings are valid only during the call; copy what you keep.
-pub type DocumentEventCallback = Option<
+pub type ReplicantDocumentEventCallback = Option<
     extern "C" fn(
         event_type: EventType,
         document_id: *const c_char,
@@ -74,7 +74,7 @@ pub type DocumentEventCallback = Option<
     ),
 >;
 
-/// `DocumentEventCallback` once registered (never null).
+/// `ReplicantDocumentEventCallback` once registered (never null).
 type DocumentFn = extern "C" fn(
     event_type: EventType,
     document_id: *const c_char,
@@ -90,38 +90,42 @@ type DocumentFn = extern "C" fn(
 
 /// `SyncStarted`, `SyncCompleted`, `DatabaseChanged`, `IdentityAdopted`.
 /// Strings are valid only during the call; copy what you keep.
-pub type SyncEventCallback = Option<extern "C" fn(event_type: EventType, context: *mut c_void)>;
+pub type ReplicantSyncEventCallback =
+    Option<extern "C" fn(event_type: EventType, context: *mut c_void)>;
 
-/// `SyncEventCallback` once registered (never null).
+/// `ReplicantSyncEventCallback` once registered (never null).
 type SyncFn = extern "C" fn(event_type: EventType, context: *mut c_void);
 
 /// `error_code` is a `ReplicantErrorCode`; `error` is the protocol code, e.g. "clock_skew";
-/// `document_id` is null unless the error is about one document; `fatal` means halted;
+/// `document_id` is null unless the error is about one document; `scope` is null unless it is
+/// about one subscribed scope (e.g. `subscription_forbidden`); `fatal` means halted;
 /// `recovered_id` names local content kept aside with the error (a Kept copies id, reasons as
-/// in `ConflictEventCallback`), -1 if none.
+/// in `ReplicantConflictEventCallback`), -1 if none.
 /// Per engine: only the handles of the engine that applied the rule get this event; another
 /// process, or another copy of the library, sees just `DocumentChanged`.
 /// `replicant_list_recovered` is the durable record. `recovered_id` may already be dismissed or
 /// restored by another process: `restore_*` then returns `ErrorNotFound`.
 /// Strings are valid only during the call; copy what you keep.
-pub type ErrorEventCallback = Option<
+pub type ReplicantErrorEventCallback = Option<
     extern "C" fn(
         event_type: EventType,
         error_code: i32,
         error: *const c_char,
         document_id: *const c_char,
+        scope: *const c_char,
         fatal: bool,
         recovered_id: i64,
         context: *mut c_void,
     ),
 >;
 
-/// `ErrorEventCallback` once registered (never null).
+/// `ReplicantErrorEventCallback` once registered (never null).
 type ErrorFn = extern "C" fn(
     event_type: EventType,
     error_code: i32,
     error: *const c_char,
     document_id: *const c_char,
+    scope: *const c_char,
     fatal: bool,
     recovered_id: i64,
     context: *mut c_void,
@@ -129,7 +133,7 @@ type ErrorFn = extern "C" fn(
 
 /// `attempt_number` counts dials since the last successful connection.
 /// Strings are valid only during the call; copy what you keep.
-pub type ConnectionEventCallback = Option<
+pub type ReplicantConnectionEventCallback = Option<
     extern "C" fn(
         event_type: EventType,
         connected: bool,
@@ -138,7 +142,7 @@ pub type ConnectionEventCallback = Option<
     ),
 >;
 
-/// `ConnectionEventCallback` once registered (never null).
+/// `ReplicantConnectionEventCallback` once registered (never null).
 type ConnectionFn = extern "C" fn(
     event_type: EventType,
     connected: bool,
@@ -157,7 +161,7 @@ type ConnectionFn = extern "C" fn(
 /// `replicant_list_recovered` is the durable record. `recovered_id` may already be dismissed or
 /// restored by another process: `restore_*` then returns `ErrorNotFound`.
 /// Strings are valid only during the call; copy what you keep.
-pub type ConflictEventCallback = Option<
+pub type ReplicantConflictEventCallback = Option<
     extern "C" fn(
         event_type: EventType,
         document_id: *const c_char,
@@ -168,7 +172,7 @@ pub type ConflictEventCallback = Option<
     ),
 >;
 
-/// `ConflictEventCallback` once registered (never null).
+/// `ReplicantConflictEventCallback` once registered (never null).
 type ConflictFn = extern "C" fn(
     event_type: EventType,
     document_id: *const c_char,
@@ -326,18 +330,20 @@ impl Callbacks {
             HostEvent::SyncError {
                 code,
                 doc_id,
+                scope,
                 fatal,
                 recovered_id,
-                ..
             } => {
                 let error = text(code);
                 let document_id = doc_id.map(|id| text(&id.to_string()));
+                let scope = scope.as_deref().map(text);
                 for entry in &self.error {
                     (entry.callback)(
                         EventType::SyncError,
                         error_code_for(code) as i32,
                         error.as_ptr(),
                         or_null(&document_id),
+                        or_null(&scope),
                         *fatal,
                         recovered_id.unwrap_or(-1),
                         entry.context,
@@ -453,14 +459,16 @@ mod tests {
         error_code: i32,
         error: *const c_char,
         document_id: *const c_char,
+        scope: *const c_char,
         fatal: bool,
         recovered_id: i64,
         context: *mut c_void,
     ) {
         log(context).lock().unwrap().push(format!(
-            "{event_type:?} {error_code} {} {} {fatal} {recovered_id}",
+            "{event_type:?} {error_code} {} {} {} {fatal} {recovered_id}",
             read(error),
-            read(document_id)
+            read(document_id),
+            read(scope)
         ));
     }
 
@@ -543,6 +551,13 @@ mod tests {
                 recovered_id: None,
             },
             HostEvent::SyncError {
+                code: "subscription_forbidden".into(),
+                doc_id: None,
+                scope: Some("collection:curated".into()),
+                fatal: false,
+                recovered_id: None,
+            },
+            HostEvent::SyncError {
                 code: "forbidden".into(),
                 doc_id: Some(doc_id),
                 scope: None,
@@ -554,7 +569,7 @@ mod tests {
             HostEvent::IdentityAdopted { user_id: owner },
             HostEvent::ConnectionLost,
         ];
-        assert_eq!(dispatcher.process(|| events, || false), Ok(12));
+        assert_eq!(dispatcher.process(|| events, || false), Ok(13));
         assert_eq!(
             *seen.lock().unwrap(),
             vec![
@@ -564,8 +579,10 @@ mod tests {
                 format!("DocumentChanged {doc_id} T {owner} private false OtherProcess"),
                 format!("DocumentDeleted {doc_id} null null null false Remote"),
                 format!("ConflictDetected {doc_id} field_conflict 3 [\"/s\"]"),
-                "SyncError 2101 clock_skew null false -1".to_string(),
-                format!("SyncError 5003 forbidden {doc_id} false 4"),
+                "SyncError 2101 clock_skew null null false -1".to_string(),
+                "SyncError 3004 subscription_forbidden null collection:curated false -1"
+                    .to_string(),
+                format!("SyncError 5003 forbidden {doc_id} null false 4"),
                 "SyncCompleted".to_string(),
                 "DatabaseChanged".to_string(),
                 "IdentityAdopted".to_string(),

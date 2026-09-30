@@ -16,8 +16,9 @@ use uuid::Uuid;
 use crate::engine::list_merge::{ListMergeConfig, ListMergePolicy, PathPattern};
 use crate::engine::machine::{ConnectionView, EngineState, HaltReason, SyncView};
 use crate::events::{
-    ConflictEventCallback, ConnectionEventCallback, DispatchError, Dispatcher,
-    DocumentEventCallback, ErrorEventCallback, EventType, SyncEventCallback,
+    DispatchError, Dispatcher, EventType, ReplicantConflictEventCallback,
+    ReplicantConnectionEventCallback, ReplicantDocumentEventCallback, ReplicantErrorEventCallback,
+    ReplicantSyncEventCallback,
 };
 use crate::host::{self, Handle, HostConfig, OpenError};
 use crate::store::StoreError;
@@ -36,8 +37,10 @@ const PUMP_IDLE: u8 = 0;
 const PUMP_DISPATCHING: u8 = 1;
 const PUMP_DESTROY_REQUESTED: u8 = 2;
 
-/// The version of this C ABI: bumped on any change to a struct layout, enum value or
-/// signature. A host compares it with `REPLICANT_ABI_VERSION` from the header it compiled.
+/// The version of this C ABI. A host compares it with `REPLICANT_ABI_VERSION` from the header it
+/// compiled. Only a breaking change increments it; new struct fields (at the end) and new enum
+/// values do not. `struct_size` must be at least this version's size; the library reads and
+/// writes only the fields that size covers, and later versions accept every earlier size.
 pub const REPLICANT_ABI_VERSION: i32 = 1;
 
 #[no_mangle]
@@ -92,8 +95,8 @@ pub enum SyncResult {
 /// Every string is UTF-8 and copied by `replicant_create`.
 #[repr(C)]
 pub struct ReplicantConfig {
-    /// `sizeof(ReplicantConfig)`; any other value is refused (`ErrorInvalidInput`), so a later
-    /// version can add fields without reading past an older host's struct.
+    /// `sizeof(ReplicantConfig)`; smaller than this version's size is refused
+    /// (`ErrorInvalidInput`). The library reads only the fields it knows.
     pub struct_size: u32,
     /// Holds the database file and the stored credentials.
     pub data_dir: *const c_char,
@@ -211,8 +214,8 @@ pub enum ReplicantHaltReason {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplicantState {
-    /// Set to `sizeof(ReplicantState)` before `replicant_get_state`; any other value is
-    /// refused, so a later version never writes past an older host's struct.
+    /// Set to `sizeof(ReplicantState)` before `replicant_get_state`; smaller than this version's
+    /// size is refused. The library writes only the fields it knows and leaves this one as set.
     pub struct_size: u32,
     pub connection: ReplicantConnection,
     pub sync: ReplicantSync,
@@ -351,7 +354,7 @@ pub unsafe extern "C" fn replicant_create(
         }
         *out_handle = ptr::null_mut();
         let config = &*config;
-        if config.struct_size as usize != std::mem::size_of::<ReplicantConfig>() {
+        if (config.struct_size as usize) < std::mem::size_of::<ReplicantConfig>() {
             return SyncResult::ErrorInvalidInput;
         }
         let (
@@ -736,7 +739,10 @@ pub unsafe extern "C" fn replicant_count_pending_sync(
 /// `handle` must be valid or null.
 #[no_mangle]
 pub unsafe extern "C" fn replicant_is_connected(handle: *mut Replicant) -> bool {
-    !handle.is_null() && (*handle).handle.state().connection == ConnectionView::Connected
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        !handle.is_null() && (*handle).handle.state().connection == ConnectionView::Connected
+    }))
+    .unwrap_or(false)
 }
 
 /// Connection, sync phase and halt reason, for a status indicator. Set
@@ -753,10 +759,14 @@ pub unsafe extern "C" fn replicant_get_state(
         if handle.is_null() || out_state.is_null() {
             return SyncResult::ErrorInvalidInput;
         }
-        if (*out_state).struct_size as usize != std::mem::size_of::<ReplicantState>() {
+        let out = &mut *out_state;
+        if (out.struct_size as usize) < std::mem::size_of::<ReplicantState>() {
             return SyncResult::ErrorInvalidInput;
         }
-        *out_state = ReplicantState::from(&(*handle).handle.state());
+        let state = ReplicantState::from(&(*handle).handle.state());
+        out.connection = state.connection;
+        out.sync = state.sync;
+        out.halt_reason = state.halt_reason;
         SyncResult::Success
     })
 }
@@ -884,7 +894,7 @@ pub unsafe extern "C" fn replicant_rebuild_search_index(handle: *mut Replicant) 
 #[no_mangle]
 pub unsafe extern "C" fn replicant_register_document_callback(
     handle: *mut Replicant,
-    callback: DocumentEventCallback,
+    callback: ReplicantDocumentEventCallback,
     context: *mut c_void,
     event_filter: i32,
 ) -> SyncResult {
@@ -912,7 +922,7 @@ pub unsafe extern "C" fn replicant_register_document_callback(
 #[no_mangle]
 pub unsafe extern "C" fn replicant_register_sync_callback(
     handle: *mut Replicant,
-    callback: SyncEventCallback,
+    callback: ReplicantSyncEventCallback,
     context: *mut c_void,
 ) -> SyncResult {
     guard(|| {
@@ -929,7 +939,7 @@ pub unsafe extern "C" fn replicant_register_sync_callback(
 #[no_mangle]
 pub unsafe extern "C" fn replicant_register_error_callback(
     handle: *mut Replicant,
-    callback: ErrorEventCallback,
+    callback: ReplicantErrorEventCallback,
     context: *mut c_void,
 ) -> SyncResult {
     guard(|| {
@@ -946,7 +956,7 @@ pub unsafe extern "C" fn replicant_register_error_callback(
 #[no_mangle]
 pub unsafe extern "C" fn replicant_register_connection_callback(
     handle: *mut Replicant,
-    callback: ConnectionEventCallback,
+    callback: ReplicantConnectionEventCallback,
     context: *mut c_void,
 ) -> SyncResult {
     guard(|| {
@@ -963,7 +973,7 @@ pub unsafe extern "C" fn replicant_register_connection_callback(
 #[no_mangle]
 pub unsafe extern "C" fn replicant_register_conflict_callback(
     handle: *mut Replicant,
-    callback: ConflictEventCallback,
+    callback: ReplicantConflictEventCallback,
     context: *mut c_void,
 ) -> SyncResult {
     guard(|| {
@@ -1080,13 +1090,9 @@ unsafe fn write_cstr_buf(out: *mut c_char, cap: usize, s: &str) -> bool {
     true
 }
 
-/// Requests an enrollment token be emailed to `email`. Standalone HTTP call
-/// (no engine handle); runs on a dedicated thread with its own short-lived
-/// runtime so this is safe to call even from inside an async runtime context.
-///
-/// BLOCKING: waits for the HTTP round-trip (connect ~10s / request ~30s
-/// timeouts). TODO(#40): add a completion-callback async variant
-/// (`replicant_enroll_request_async`) so consumers don't block a caller thread.
+/// Requests an enrollment token be emailed to `email`. Needs no handle. Blocks the calling
+/// thread for the HTTP round trip (up to about 10 s to connect and 30 s for the request); never
+/// call it from an audio or UI thread.
 ///
 /// # Safety
 /// `base_url` and `email` must be valid, non-null C strings.
@@ -1131,9 +1137,8 @@ pub unsafe extern "C" fn replicant_enroll_request(
 /// out buffers; each `*_cap` is the writable size of its buffer in bytes and
 /// the call fails (without overflowing) when a value does not fit.
 ///
-/// BLOCKING: waits for the HTTP round-trip (connect ~10s / request ~30s
-/// timeouts). TODO(#40): add a completion-callback async variant
-/// (`replicant_enroll_claim_async`) so consumers don't block a caller thread.
+/// Blocks the calling thread for the HTTP round trip (up to about 10 s to connect and 30 s for
+/// the request); never call it from an audio or UI thread.
 ///
 /// # Safety
 /// All string pointers must be valid, non-null C strings; each out pointer

@@ -11,6 +11,7 @@
 
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 
@@ -30,8 +31,10 @@ namespace replicant {
 #define PAGE_LIMIT 500
 
 /**
- * The version of this C ABI: bumped on any change to a struct layout, enum value or
- * signature. A host compares it with `REPLICANT_ABI_VERSION` from the header it compiled.
+ * The version of this C ABI. A host compares it with `REPLICANT_ABI_VERSION` from the header it
+ * compiled. Only a breaking change increments it; new struct fields (at the end) and new enum
+ * values do not. `struct_size` must be at least this version's size; the library reads and
+ * writes only the fields that size covers, and later versions accept every earlier size.
  */
 #define REPLICANT_ABI_VERSION 1
 
@@ -268,8 +271,8 @@ typedef struct Replicant Replicant;
  */
 typedef struct ReplicantConfig {
   /**
-   * `sizeof(ReplicantConfig)`; any other value is refused (`ErrorInvalidInput`), so a later
-   * version can add fields without reading past an older host's struct.
+   * `sizeof(ReplicantConfig)`; smaller than this version's size is refused
+   * (`ErrorInvalidInput`). The library reads only the fields it knows.
    */
   uint32_t struct_size;
   /**
@@ -305,8 +308,8 @@ typedef struct ReplicantConfig {
 
 typedef struct ReplicantState {
   /**
-   * Set to `sizeof(ReplicantState)` before `replicant_get_state`; any other value is
-   * refused, so a later version never writes past an older host's struct.
+   * Set to `sizeof(ReplicantState)` before `replicant_get_state`; smaller than this version's
+   * size is refused. The library writes only the fields it knows and leaves this one as set.
    */
   uint32_t struct_size;
   enum ReplicantConnection connection;
@@ -319,50 +322,52 @@ typedef struct ReplicantState {
  * `visibility` is `public` (curated or read-only) or `private`.
  * Strings are valid only during the call; copy what you keep.
  */
-typedef void (*DocumentEventCallback)(enum ReplicantEventType event_type,
-                                      const char *document_id,
-                                      const char *title,
-                                      const char *content,
-                                      const char *owner_id,
-                                      const char *author_id,
-                                      const char *visibility,
-                                      bool read_only,
-                                      enum ReplicantEventOrigin origin,
-                                      void *context);
+typedef void (*ReplicantDocumentEventCallback)(enum ReplicantEventType event_type,
+                                               const char *document_id,
+                                               const char *title,
+                                               const char *content,
+                                               const char *owner_id,
+                                               const char *author_id,
+                                               const char *visibility,
+                                               bool read_only,
+                                               enum ReplicantEventOrigin origin,
+                                               void *context);
 
 /**
  * `SyncStarted`, `SyncCompleted`, `DatabaseChanged`, `IdentityAdopted`.
  * Strings are valid only during the call; copy what you keep.
  */
-typedef void (*SyncEventCallback)(enum ReplicantEventType event_type, void *context);
+typedef void (*ReplicantSyncEventCallback)(enum ReplicantEventType event_type, void *context);
 
 /**
  * `error_code` is a `ReplicantErrorCode`; `error` is the protocol code, e.g. "clock_skew";
- * `document_id` is null unless the error is about one document; `fatal` means halted;
+ * `document_id` is null unless the error is about one document; `scope` is null unless it is
+ * about one subscribed scope (e.g. `subscription_forbidden`); `fatal` means halted;
  * `recovered_id` names local content kept aside with the error (a Kept copies id, reasons as
- * in `ConflictEventCallback`), -1 if none.
+ * in `ReplicantConflictEventCallback`), -1 if none.
  * Per engine: only the handles of the engine that applied the rule get this event; another
  * process, or another copy of the library, sees just `DocumentChanged`.
  * `replicant_list_recovered` is the durable record. `recovered_id` may already be dismissed or
  * restored by another process: `restore_*` then returns `ErrorNotFound`.
  * Strings are valid only during the call; copy what you keep.
  */
-typedef void (*ErrorEventCallback)(enum ReplicantEventType event_type,
-                                   int32_t error_code,
-                                   const char *error,
-                                   const char *document_id,
-                                   bool fatal,
-                                   int64_t recovered_id,
-                                   void *context);
+typedef void (*ReplicantErrorEventCallback)(enum ReplicantEventType event_type,
+                                            int32_t error_code,
+                                            const char *error,
+                                            const char *document_id,
+                                            const char *scope,
+                                            bool fatal,
+                                            int64_t recovered_id,
+                                            void *context);
 
 /**
  * `attempt_number` counts dials since the last successful connection.
  * Strings are valid only during the call; copy what you keep.
  */
-typedef void (*ConnectionEventCallback)(enum ReplicantEventType event_type,
-                                        bool connected,
-                                        uint32_t attempt_number,
-                                        void *context);
+typedef void (*ReplicantConnectionEventCallback)(enum ReplicantEventType event_type,
+                                                 bool connected,
+                                                 uint32_t attempt_number,
+                                                 void *context);
 
 /**
  * `reason`: `conflict`, `field_conflict`, `delete_wins` or `delete_superseded` (a delete undone
@@ -377,12 +382,12 @@ typedef void (*ConnectionEventCallback)(enum ReplicantEventType event_type,
  * restored by another process: `restore_*` then returns `ErrorNotFound`.
  * Strings are valid only during the call; copy what you keep.
  */
-typedef void (*ConflictEventCallback)(enum ReplicantEventType event_type,
-                                      const char *document_id,
-                                      const char *reason,
-                                      int64_t recovered_id,
-                                      const char *paths_json,
-                                      void *context);
+typedef void (*ReplicantConflictEventCallback)(enum ReplicantEventType event_type,
+                                               const char *document_id,
+                                               const char *reason,
+                                               int64_t recovered_id,
+                                               const char *paths_json,
+                                               void *context);
 
 #ifdef __cplusplus
 extern "C" {
@@ -582,7 +587,7 @@ enum ReplicantSyncResult replicant_rebuild_search_index(struct Replicant *handle
  * Valid handle; `context` must outlive the handle.
  */
 enum ReplicantSyncResult replicant_register_document_callback(struct Replicant *handle,
-                                                              DocumentEventCallback callback,
+                                                              ReplicantDocumentEventCallback callback,
                                                               void *context,
                                                               int32_t event_filter);
 
@@ -593,7 +598,7 @@ enum ReplicantSyncResult replicant_register_document_callback(struct Replicant *
  * Valid handle; `context` must outlive the handle.
  */
 enum ReplicantSyncResult replicant_register_sync_callback(struct Replicant *handle,
-                                                          SyncEventCallback callback,
+                                                          ReplicantSyncEventCallback callback,
                                                           void *context);
 
 /**
@@ -601,7 +606,7 @@ enum ReplicantSyncResult replicant_register_sync_callback(struct Replicant *hand
  * Valid handle; `context` must outlive the handle.
  */
 enum ReplicantSyncResult replicant_register_error_callback(struct Replicant *handle,
-                                                           ErrorEventCallback callback,
+                                                           ReplicantErrorEventCallback callback,
                                                            void *context);
 
 /**
@@ -609,7 +614,7 @@ enum ReplicantSyncResult replicant_register_error_callback(struct Replicant *han
  * Valid handle; `context` must outlive the handle.
  */
 enum ReplicantSyncResult replicant_register_connection_callback(struct Replicant *handle,
-                                                                ConnectionEventCallback callback,
+                                                                ReplicantConnectionEventCallback callback,
                                                                 void *context);
 
 /**
@@ -617,7 +622,7 @@ enum ReplicantSyncResult replicant_register_connection_callback(struct Replicant
  * Valid handle; `context` must outlive the handle.
  */
 enum ReplicantSyncResult replicant_register_conflict_callback(struct Replicant *handle,
-                                                              ConflictEventCallback callback,
+                                                              ReplicantConflictEventCallback callback,
                                                               void *context);
 
 /**
@@ -644,13 +649,9 @@ void replicant_string_free(char *s);
 char *replicant_get_version(void);
 
 /**
- * Requests an enrollment token be emailed to `email`. Standalone HTTP call
- * (no engine handle); runs on a dedicated thread with its own short-lived
- * runtime so this is safe to call even from inside an async runtime context.
- *
- * BLOCKING: waits for the HTTP round-trip (connect ~10s / request ~30s
- * timeouts). TODO(#40): add a completion-callback async variant
- * (`replicant_enroll_request_async`) so consumers don't block a caller thread.
+ * Requests an enrollment token be emailed to `email`. Needs no handle. Blocks the calling
+ * thread for the HTTP round trip (up to about 10 s to connect and 30 s for the request); never
+ * call it from an audio or UI thread.
  *
  * # Safety
  * `base_url` and `email` must be valid, non-null C strings.
@@ -663,9 +664,8 @@ enum ReplicantSyncResult replicant_enroll_request(const char *base_url, const ch
  * out buffers; each `*_cap` is the writable size of its buffer in bytes and
  * the call fails (without overflowing) when a value does not fit.
  *
- * BLOCKING: waits for the HTTP round-trip (connect ~10s / request ~30s
- * timeouts). TODO(#40): add a completion-callback async variant
- * (`replicant_enroll_claim_async`) so consumers don't block a caller thread.
+ * Blocks the calling thread for the HTTP round trip (up to about 10 s to connect and 30 s for
+ * the request); never call it from an audio or UI thread.
  *
  * # Safety
  * All string pointers must be valid, non-null C strings; each out pointer
@@ -675,11 +675,11 @@ enum ReplicantSyncResult replicant_enroll_claim(const char *base_url,
                                                 const char *email,
                                                 const char *token,
                                                 char *out_api_key,
-                                                uintptr_t api_key_cap,
+                                                size_t api_key_cap,
                                                 char *out_secret,
-                                                uintptr_t secret_cap,
+                                                size_t secret_cap,
                                                 char *out_user_id,
-                                                uintptr_t user_id_cap);
+                                                size_t user_id_cap);
 
 /**
  * Loads stored credentials from `data_dir`. Returns Success and fills the
@@ -693,11 +693,11 @@ enum ReplicantSyncResult replicant_enroll_claim(const char *base_url,
  */
 enum ReplicantSyncResult replicant_load_credentials(const char *data_dir,
                                                     char *out_api_key,
-                                                    uintptr_t api_key_cap,
+                                                    size_t api_key_cap,
                                                     char *out_secret,
-                                                    uintptr_t secret_cap,
+                                                    size_t secret_cap,
                                                     char *out_user_id,
-                                                    uintptr_t user_id_cap);
+                                                    size_t user_id_cap);
 
 /**
  * Stores credentials in `data_dir` (encrypted at rest) and tells this process's engines on

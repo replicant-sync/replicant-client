@@ -65,14 +65,16 @@ extern "C" fn on_error(
     error_code: i32,
     error: *const c_char,
     document_id: *const c_char,
+    scope: *const c_char,
     fatal: bool,
     recovered_id: i64,
     context: *mut c_void,
 ) {
     log(context).lock().unwrap().push(format!(
-        "{event_type:?} {error_code} {} {} {fatal} {recovered_id}",
+        "{event_type:?} {error_code} {} {} {} {fatal} {recovered_id}",
         read(error),
-        read(document_id)
+        read(document_id),
+        read(scope)
     ));
 }
 
@@ -405,7 +407,7 @@ fn a_handle_without_credentials_reports_halted_not_enrolled() {
     pump_until(handle, &seen, "the not_enrolled error", |lines| {
         lines
             .iter()
-            .any(|line| line == "SyncError 1003 not_enrolled null true -1")
+            .any(|line| line == "SyncError 1003 not_enrolled null null true -1")
     });
     assert!(!unsafe { replicant_is_connected(handle) });
     close(handle);
@@ -592,7 +594,7 @@ fn null_arguments_are_refused_without_crashing() {
 }
 
 #[test]
-fn a_config_or_state_with_an_unknown_struct_size_is_refused() {
+fn a_config_or_state_smaller_than_this_version_is_refused() {
     assert_eq!(replicant_abi_version(), REPLICANT_ABI_VERSION);
     let dir = tempfile::tempdir().unwrap();
     let (result, handle) = create_with(dir.path(), |config| config.struct_size -= 4);
@@ -607,6 +609,44 @@ fn a_config_or_state_with_an_unknown_struct_size_is_refused() {
         unsafe { replicant_get_state(handle, &mut state) },
         SyncResult::ErrorInvalidInput
     );
+    close(handle);
+}
+
+/// A struct from a later header: this version's fields, then one it does not know.
+#[repr(C)]
+struct Later<T> {
+    known: T,
+    added: u64,
+}
+
+#[test]
+fn a_config_or_state_from_a_later_version_is_accepted_and_its_new_fields_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (result, handle) = create_with(dir.path(), |config| {
+        config.struct_size = std::mem::size_of::<Later<ReplicantConfig>>() as u32
+    });
+    assert_eq!(result, SyncResult::Success);
+    let mut later = Later {
+        known: ReplicantState {
+            struct_size: std::mem::size_of::<Later<ReplicantState>>() as u32,
+            connection: ReplicantConnection::ConnectionStopped,
+            sync: ReplicantSync::SyncLive,
+            halt_reason: ReplicantHaltReason::HaltOther,
+        },
+        added: 0xDEAD_BEEF,
+    };
+    wait_until("halted as not enrolled", || {
+        assert_eq!(
+            unsafe { replicant_get_state(handle, &mut later.known) },
+            SyncResult::Success
+        );
+        later.known.halt_reason == ReplicantHaltReason::HaltNotEnrolled
+    });
+    assert_eq!(
+        later.known.struct_size as usize,
+        std::mem::size_of::<Later<ReplicantState>>()
+    );
+    assert_eq!(later.added, 0xDEAD_BEEF);
     close(handle);
 }
 
