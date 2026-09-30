@@ -3054,7 +3054,7 @@ mod property_tests {
             let Some((inflight, reply)) = self.in_flight.take() else {
                 return;
             };
-            match settle(&self.snap, &inflight, &reply, ME, self.mismatches) {
+            match settle(&self.snap, &inflight, &reply, ME, self.mismatches, 0) {
                 SettleResult::Ops(ops) => {
                     if inflight.kind == UploadKind::Delete {
                         self.hits.local_deletes_settled += 1;

@@ -9,6 +9,7 @@ use super::{Engine, EngineEvent};
 use crate::driver::test_server::ScriptedServer;
 use crate::driver::test_support::{config, credentials, eventually, jump, seeded_db, wait_for};
 use crate::engine::doc::DocEvent;
+use crate::engine::doc_upload::MAX_DIVERGENT_REPLIES;
 use crate::engine::machine::Lifecycle;
 use crate::store::change_log::{ChangeOrigin, DocChange};
 use crate::store::test_support::{count, snapshot, ME};
@@ -1031,5 +1032,95 @@ async fn a_skewed_clock_joins_on_the_second_try_without_an_error() {
         "the second join is signed with the server's clock: {joins:?}"
     );
     assert_eq!(server.stats.upgrades(), 1, "on the same socket");
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn a_one_off_divergent_reply_is_corrected_by_one_more_upload() {
+    let server = ScriptedServer::start(ME).await;
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, _events) = live_engine(&server, &path).await;
+    let store = engine.store();
+    let doc_id = store
+        .create_document(ME, None, json!({"n": 1}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    eventually("the create settles", || async {
+        in_sync(&store, &server, doc_id).await
+    })
+    .await;
+
+    server.stamp_updates(1);
+    store
+        .update_document(ME, doc_id, json!({"n": 2}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    eventually("the correction settles", || async {
+        server.uploads_for(doc_id).len() == 3 && in_sync(&store, &server, doc_id).await
+    })
+    .await;
+
+    assert_eq!(server_content(&server, doc_id), Some(json!({"n": 2})));
+    assert_eq!(snapshot(&store, doc_id).await.content, json!({"n": 2}));
+    let uploads = server.uploads_for(doc_id);
+    assert_eq!(uploads.len(), 3, "create, the stamped edit, one correction");
+    assert_eq!(
+        uploads[2]["payload"],
+        json!([{"op": "remove", "path": "/stamped"}])
+    );
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn a_persistent_divergent_reply_parks_the_document_after_a_bounded_number_of_uploads() {
+    let server = ScriptedServer::start(ME).await;
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, mut events) = live_engine(&server, &path).await;
+    let store = engine.store();
+    let doc_id = store
+        .create_document(ME, None, json!({"n": 1}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    eventually("the create settles", || async {
+        in_sync(&store, &server, doc_id).await
+    })
+    .await;
+
+    server.stamp_updates(u32::MAX);
+    store
+        .update_document(ME, doc_id, json!({"n": 2}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    wait_for(&mut events, "the park", |event| {
+        *event
+            == EngineEvent::Doc(DocNotice {
+                doc_id,
+                event: DocEvent::SyncError {
+                    code: "diverged".into(),
+                },
+            })
+    })
+    .await;
+    let bound = 1 + MAX_DIVERGENT_REPLIES as usize + 1;
+    assert_eq!(server.uploads_for(doc_id).len(), bound);
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM outbox WHERE parked_error = 'diverged'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(snapshot(&store, doc_id).await.content, json!({"n": 2}));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        server.uploads_for(doc_id).len(),
+        bound,
+        "no uploads after the park"
+    );
     engine.stop().await;
 }

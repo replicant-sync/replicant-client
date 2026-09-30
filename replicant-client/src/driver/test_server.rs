@@ -113,6 +113,7 @@ struct Model {
     lose_next_upload: bool,
     drop_after_next_upload: bool,
     reject_next_upload: Option<String>,
+    stamp_updates: u32,
     drop_next_push: bool,
     frames: Vec<Frame>,
     user_agents: Vec<Option<String>>,
@@ -196,6 +197,12 @@ impl ScriptedServer {
 
     pub fn reject_next_upload(&self, code: &str) {
         self.model().reject_next_upload = Some(code.to_string());
+    }
+
+    /// The next `times` updates store `"stamped": true` on top of the patched content
+    /// (`u32::MAX`: every update), so the reply differs from what the client sent.
+    pub fn stamp_updates(&self, times: u32) {
+        self.model().stamp_updates = times;
     }
 
     pub fn drop_next_push(&self) {
@@ -304,6 +311,7 @@ impl Model {
             lose_next_upload: false,
             drop_after_next_upload: false,
             reject_next_upload: None,
+            stamp_updates: 0,
             drop_next_push: false,
             frames: Vec::new(),
             user_agents: Vec::new(),
@@ -510,6 +518,12 @@ impl Model {
                 let mut rounded = jsonb(&doc.content);
                 if json_patch::patch(&mut rounded, &patch).is_err() {
                     return error("validation");
+                }
+                if self.stamp_updates > 0 {
+                    rounded["stamped"] = json!(true);
+                    if self.stamp_updates != u32::MAX {
+                        self.stamp_updates -= 1;
+                    }
                 }
                 doc.content = rounded;
             }

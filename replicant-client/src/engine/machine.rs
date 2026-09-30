@@ -144,6 +144,8 @@ pub enum BuildOutcome {
 pub enum SettleOutcome {
     Done {
         rows_remain: bool,
+        /// The reply held content other than what was sent.
+        diverged: bool,
     },
     FetchServerCopy,
     Retry {
@@ -274,6 +276,7 @@ pub enum Effect {
         inflight: InFlight,
         reply: Result<DocEnvelope, ServerError>,
         mismatch_attempts: u32,
+        divergent_replies: u32,
     },
     /// Answered with `Input::ServerCopyApplied`.
     ApplyServerCopy {
@@ -353,6 +356,7 @@ struct Session {
     settling: HashSet<Uuid>,
     doc_failures: HashMap<Uuid, u32>,
     mismatch_attempts: HashMap<Uuid, u32>,
+    divergent_replies: HashMap<Uuid, u32>,
     catch_up_failures: HashMap<Scope, u32>,
     unreadable_pushes: HashMap<Option<Scope>, u32>,
     /// Scopes that took an unreadable push while not `Live`; the push may be the one change
@@ -1034,6 +1038,7 @@ impl Core {
                 };
                 s.settling.insert(doc_id);
                 let mismatch_attempts = *s.mismatch_attempts.get(&doc_id).unwrap_or(&0);
+                let divergent_replies = *s.divergent_replies.get(&doc_id).unwrap_or(&0);
                 let reply = match result {
                     Ok(Response::Uploaded(doc)) => Ok(doc),
                     Ok(other) => Err(ServerError::new(&format!("unexpected_response:{other:?}"))),
@@ -1044,6 +1049,7 @@ impl Core {
                     inflight,
                     reply,
                     mismatch_attempts,
+                    divergent_replies,
                 });
                 self.refill(fx);
             }
@@ -1385,6 +1391,7 @@ impl Core {
     fn forget_failures(&mut self, doc_id: Uuid) {
         if let Some(s) = self.session() {
             s.mismatch_attempts.remove(&doc_id);
+            s.divergent_replies.remove(&doc_id);
             s.doc_failures.remove(&doc_id);
         }
     }
@@ -1503,8 +1510,19 @@ impl Core {
                     s.settling.remove(&doc_id);
                 }
                 match outcome {
-                    SettleOutcome::Done { rows_remain } => {
+                    SettleOutcome::Done {
+                        rows_remain,
+                        diverged,
+                    } => {
+                        let divergent_replies = self
+                            .session()
+                            .map_or(0, |s| *s.divergent_replies.get(&doc_id).unwrap_or(&0));
                         self.forget_failures(doc_id);
+                        if diverged {
+                            if let Some(s) = self.session() {
+                                s.divergent_replies.insert(doc_id, divergent_replies + 1);
+                            }
+                        }
                         if rows_remain {
                             self.try_build(doc_id, fx);
                         }
@@ -3295,7 +3313,10 @@ mod upload_orchestration_tests {
         connected(&mut c);
         let fx = c.step(Input::Settled {
             doc_id: doc(1),
-            outcome: SettleOutcome::Done { rows_remain: true },
+            outcome: SettleOutcome::Done {
+                rows_remain: true,
+                diverged: false,
+            },
         });
         assert!(fx.contains(&Effect::BuildUpload { doc_id: doc(1) }));
     }
@@ -3401,12 +3422,16 @@ mod upload_orchestration_tests {
             e,
             Effect::SettleUpload {
                 mismatch_attempts: 2,
+                divergent_replies: 0,
                 ..
             }
         )));
         c.step(Input::Settled {
             doc_id: doc(1),
-            outcome: SettleOutcome::Done { rows_remain: false },
+            outcome: SettleOutcome::Done {
+                rows_remain: false,
+                diverged: false,
+            },
         });
         c.step(Input::PendingDocs(vec![doc(1)]));
         let req = upload_req(&c.step(Input::UploadBuilt {
@@ -3421,6 +3446,7 @@ mod upload_orchestration_tests {
             e,
             Effect::SettleUpload {
                 mismatch_attempts: 0,
+                divergent_replies: 0,
                 ..
             }
         )));
@@ -3496,7 +3522,10 @@ mod upload_orchestration_tests {
         assert!(!builds(&c.step(Input::PendingDocs(vec![doc(1)]))));
         c.step(Input::Settled {
             doc_id: doc(1),
-            outcome: SettleOutcome::Done { rows_remain: false },
+            outcome: SettleOutcome::Done {
+                rows_remain: false,
+                diverged: false,
+            },
         });
         assert!(builds(&c.step(Input::PendingDocs(vec![doc(1)]))));
     }
@@ -3519,7 +3548,10 @@ mod upload_orchestration_tests {
         assert!(!builds(&c.step(Input::PendingDocs(vec![doc(9)]))));
         let fx = c.step(Input::Settled {
             doc_id: doc(0),
-            outcome: SettleOutcome::Done { rows_remain: false },
+            outcome: SettleOutcome::Done {
+                rows_remain: false,
+                diverged: false,
+            },
         });
         assert!(fx.contains(&Effect::LoadPending));
     }
@@ -3644,6 +3676,7 @@ mod upload_orchestration_tests {
             e,
             Effect::SettleUpload {
                 mismatch_attempts: 0,
+                divergent_replies: 0,
                 ..
             }
         )));

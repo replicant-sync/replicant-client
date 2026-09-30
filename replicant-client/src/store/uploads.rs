@@ -5,9 +5,9 @@ use uuid::Uuid;
 use super::docs::{apply_ops, load_snapshot, LogOrigin};
 use super::{DocNotice, Store, StoreError, StoreResult};
 use crate::engine::doc::{self as rules, DocOp, DocSnapshot, InFlight};
-use crate::engine::hash::content_hash;
+use crate::engine::doc_upload::reply_diverged;
 use crate::engine::machine::{BuildOutcome, SettleOutcome};
-use crate::engine::types::{DocEnvelope, Seq, ServerError, UploadKind};
+use crate::engine::types::{DocEnvelope, Seq, ServerError};
 
 impl Store {
     /// `Effect::LoadPending`: documents with outbox rows and none parked, oldest row first.
@@ -66,22 +66,33 @@ impl Store {
         inflight: &InFlight,
         reply: &Result<DocEnvelope, ServerError>,
         mismatch_attempts: u32,
+        divergent_replies: u32,
     ) -> StoreResult<(SettleOutcome, Vec<DocNotice>)> {
         let mut tx = self.begin().await?;
         let snap = load_snapshot(&mut tx, doc_id).await?;
-        if let Ok(doc) = reply {
-            if inflight.kind != UploadKind::Delete
-                && content_hash(&doc.content) != content_hash(&inflight.sent_content)
-            {
-                tracing::warn!(%doc_id, seq = doc.seq, "the server's copy differs from what was uploaded; uploading the difference");
-            }
+        let diverged = reply_diverged(&snap, inflight, reply);
+        if diverged {
+            tracing::warn!(%doc_id, "the server's copy differs from what was uploaded");
         }
-        let settled = match rules::settle(&snap, inflight, reply, me, mismatch_attempts) {
+        let settled = match rules::settle(
+            &snap,
+            inflight,
+            reply,
+            me,
+            mismatch_attempts,
+            divergent_replies,
+        ) {
             rules::SettleResult::Ops(ops) => {
                 let writer = self.writer(LogOrigin::Server);
                 let notices = apply_ops(&mut tx, &writer, &snap, &ops, reply.as_ref().ok()).await?;
                 let rows_remain = !snap.project(&ops).rows.is_empty();
-                (SettleOutcome::Done { rows_remain }, notices)
+                (
+                    SettleOutcome::Done {
+                        rows_remain,
+                        diverged,
+                    },
+                    notices,
+                )
             }
             rules::SettleResult::FetchServerCopy => (SettleOutcome::FetchServerCopy, Vec::new()),
             rules::SettleResult::Retry { after_ms, mismatch } => {
@@ -266,11 +277,17 @@ mod tests {
         reply.hash = "server-hash-2".into();
         let (outcome, notices) = t
             .store
-            .settle_upload(ME, DOC, &inflight, &Ok(reply), 0)
+            .settle_upload(ME, DOC, &inflight, &Ok(reply), 0, 0)
             .await
             .unwrap();
 
-        assert_eq!(outcome, SettleOutcome::Done { rows_remain: true });
+        assert_eq!(
+            outcome,
+            SettleOutcome::Done {
+                rows_remain: true,
+                diverged: false
+            }
+        );
         assert!(notices.is_empty());
         let after = snapshot(&t.store, DOC).await;
         assert_eq!(after.rows.len(), 1);
@@ -296,21 +313,33 @@ mod tests {
 
         let (first_outcome, _) = t
             .store
-            .settle_upload(ME, DOC, &inflight, &Ok(reply.clone()), 0)
+            .settle_upload(ME, DOC, &inflight, &Ok(reply.clone()), 0, 0)
             .await
             .unwrap();
-        assert_eq!(first_outcome, SettleOutcome::Done { rows_remain: false });
+        assert_eq!(
+            first_outcome,
+            SettleOutcome::Done {
+                rows_remain: false,
+                diverged: false
+            }
+        );
         let before = snapshot(&t.store, DOC).await;
 
         // Two processes (or an ack retried after a dropped ack) settling the same upload_id
         // with the same reply: the second settle must be a no-op, not a second write.
         let (second_outcome, second_notices) = t
             .store
-            .settle_upload(ME, DOC, &inflight, &Ok(reply), 0)
+            .settle_upload(ME, DOC, &inflight, &Ok(reply), 0, 0)
             .await
             .unwrap();
 
-        assert_eq!(second_outcome, SettleOutcome::Done { rows_remain: false });
+        assert_eq!(
+            second_outcome,
+            SettleOutcome::Done {
+                rows_remain: false,
+                diverged: false
+            }
+        );
         assert!(second_notices.is_empty());
         let after = snapshot(&t.store, DOC).await;
         assert_eq!(after.shadow, before.shadow);
@@ -371,11 +400,17 @@ mod tests {
         let reply = envelope(DOC, Some(ME), json!({"n": 1}), 2);
         let (outcome, _) = t
             .store
-            .settle_upload(ME, DOC, &inflight, &Ok(reply.clone()), 0)
+            .settle_upload(ME, DOC, &inflight, &Ok(reply.clone()), 0, 0)
             .await
             .unwrap();
 
-        assert_eq!(outcome, SettleOutcome::Done { rows_remain: true });
+        assert_eq!(
+            outcome,
+            SettleOutcome::Done {
+                rows_remain: true,
+                diverged: false
+            }
+        );
         let (upload, _) = sent(&t.store, DOC).await;
         assert_eq!(upload.base_hash, Some(reply.hash));
         assert_eq!(
@@ -397,10 +432,16 @@ mod tests {
         reply.hash = "jsonb-normalised-hash".into();
         let (outcome, _) = t
             .store
-            .settle_upload(ME, DOC, &inflight, &Ok(reply), 0)
+            .settle_upload(ME, DOC, &inflight, &Ok(reply), 0, 0)
             .await
             .unwrap();
-        assert_eq!(outcome, SettleOutcome::Done { rows_remain: false });
+        assert_eq!(
+            outcome,
+            SettleOutcome::Done {
+                rows_remain: false,
+                diverged: false
+            }
+        );
         assert!(snapshot(&t.store, DOC).await.rows.is_empty());
         assert!(t.store.load_pending().await.unwrap().is_empty());
     }
@@ -421,11 +462,17 @@ mod tests {
 
         let (outcome, notices) = t
             .store
-            .settle_upload(ME, DOC, &inflight, &Err(mismatch), 3)
+            .settle_upload(ME, DOC, &inflight, &Err(mismatch), 3, 0)
             .await
             .unwrap();
 
-        assert_eq!(outcome, SettleOutcome::Done { rows_remain: false });
+        assert_eq!(
+            outcome,
+            SettleOutcome::Done {
+                rows_remain: false,
+                diverged: false
+            }
+        );
         assert_eq!(
             notices,
             vec![DocNotice {
@@ -450,11 +497,24 @@ mod tests {
 
         let (outcome, notices) = t
             .store
-            .settle_upload(ME, DOC, &inflight, &Err(ServerError::new("validation")), 0)
+            .settle_upload(
+                ME,
+                DOC,
+                &inflight,
+                &Err(ServerError::new("validation")),
+                0,
+                0,
+            )
             .await
             .unwrap();
 
-        assert_eq!(outcome, SettleOutcome::Done { rows_remain: true });
+        assert_eq!(
+            outcome,
+            SettleOutcome::Done {
+                rows_remain: true,
+                diverged: false
+            }
+        );
         assert_eq!(
             notices,
             vec![DocNotice {

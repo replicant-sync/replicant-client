@@ -331,7 +331,10 @@ async fn stale_settle_after_reconnect_is_dropped() {
         .unwrap();
     let settled = Input::Settled {
         doc_id,
-        outcome: SettleOutcome::Done { rows_remain: true },
+        outcome: SettleOutcome::Done {
+            rows_remain: true,
+            diverged: false,
+        },
     };
     h.owner.queue.push_back(Queued {
         epoch: Some(stale_gen),

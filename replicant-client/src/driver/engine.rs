@@ -537,9 +537,17 @@ impl Owner {
                 inflight,
                 reply,
                 mismatch_attempts,
+                divergent_replies,
             } => {
                 let outcome = match store
-                    .settle_upload(me, doc_id, &inflight, &reply, mismatch_attempts)
+                    .settle_upload(
+                        me,
+                        doc_id,
+                        &inflight,
+                        &reply,
+                        mismatch_attempts,
+                        divergent_replies,
+                    )
                     .await
                 {
                     Ok((outcome, notices)) => {

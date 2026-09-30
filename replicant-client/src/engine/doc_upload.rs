@@ -5,9 +5,12 @@ use super::doc::{
     conflict_ops, delete_pending, with_settle_invariant, DocEvent, DocOp, DocSnapshot,
     RecoverReason, RowKind, Shadow,
 };
+use super::hash::content_hash;
 use super::types::{DocEnvelope, Seq, ServerError, Upload, UploadKind};
 
 pub const MAX_MISMATCH_ATTEMPTS: u32 = 3;
+/// Consecutive replies whose content differs from what was sent before the document is parked.
+pub const MAX_DIVERGENT_REPLIES: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct InFlight {
@@ -90,6 +93,18 @@ pub fn build_upload(snap: &DocSnapshot, me: Uuid) -> BuildResult {
     }
 }
 
+/// A successful update or create whose reply holds content other than what was sent. A push
+/// may have applied it already, so the reply need not advance the shadow.
+pub fn reply_diverged(
+    snap: &DocSnapshot,
+    inflight: &InFlight,
+    reply: &Result<DocEnvelope, ServerError>,
+) -> bool {
+    matches!(reply, Ok(doc) if inflight.kind != UploadKind::Delete
+        && snap.exists
+        && content_hash(&doc.content) != content_hash(&inflight.sent_content))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SettleResult {
     Ops(Vec<DocOp>),
@@ -106,6 +121,7 @@ pub fn settle(
     reply: &Result<DocEnvelope, ServerError>,
     me: Uuid,
     mismatch_attempts: u32,
+    divergent_replies: u32,
 ) -> SettleResult {
     if !snap.exists && inflight.kind != UploadKind::Delete {
         return SettleResult::Ops(vec![DocOp::DeleteRows(inflight.covered.clone())]);
@@ -120,8 +136,19 @@ pub fn settle(
     match reply {
         Ok(doc) if inflight.kind == UploadKind::Delete => delete_done(doc.seq),
         Ok(doc) => {
-            let mut ops = vec![DocOp::DeleteRows(inflight.covered.clone())];
-            if doc.seq > snap.server_seq() {
+            let advances = doc.seq > snap.server_seq();
+            let diverged = reply_diverged(snap, inflight, reply);
+            let park = diverged && divergent_replies >= MAX_DIVERGENT_REPLIES;
+            let mut ops = if park {
+                // A push of this upload may have replaced the covered rows with a marker.
+                vec![DocOp::Park {
+                    rows: snap.rows.iter().map(|r| r.mutation_id).collect(),
+                    error: "diverged".into(),
+                }]
+            } else {
+                vec![DocOp::DeleteRows(inflight.covered.clone())]
+            };
+            if advances {
                 ops.push(DocOp::SetMeta {
                     owner_id: doc.owner_id,
                     read_only: doc.read_only,
@@ -132,6 +159,11 @@ pub fn settle(
                     content: doc.content.clone(),
                     hash: doc.hash.clone(),
                     seq: doc.seq,
+                }));
+            }
+            if park {
+                ops.push(DocOp::Emit(DocEvent::SyncError {
+                    code: "diverged".into(),
                 }));
             }
             SettleResult::Ops(with_settle_invariant(snap, ops, me))
@@ -345,7 +377,7 @@ mod upload_tests {
         s.content = json!({"a": 3});
         s.rows = vec![row(1, RowKind::Update), row(2, RowKind::Update)];
         let f = inflight_update(vec![m(1)], json!({"a": 2}));
-        let SettleResult::Ops(ops) = settle(&s, &f, &Ok(env(json!({"a": 2}), 2)), ME, 0) else {
+        let SettleResult::Ops(ops) = settle(&s, &f, &Ok(env(json!({"a": 2}), 2)), ME, 0, 0) else {
             panic!()
         };
         let after = s.project(&ops);
@@ -364,7 +396,7 @@ mod upload_tests {
         let f = inflight_update(vec![m(1)], json!({"n": 100}));
         let mut reply = env(json!({"n": 100}), 2);
         reply.hash = "server-hash".into();
-        let SettleResult::Ops(ops) = settle(&s, &f, &Ok(reply), ME, 0) else {
+        let SettleResult::Ops(ops) = settle(&s, &f, &Ok(reply), ME, 0, 0) else {
             panic!()
         };
         let after = s.project(&ops);
@@ -384,7 +416,7 @@ mod upload_tests {
         s.rows = vec![row(1, RowKind::Update)];
         let f = inflight_update(vec![m(1)], json!({"n": 2}));
         let reply = env(json!({"n": 2, "added": true}), 2);
-        let SettleResult::Ops(ops) = settle(&s, &f, &Ok(reply), ME, 0) else {
+        let SettleResult::Ops(ops) = settle(&s, &f, &Ok(reply), ME, 0, 0) else {
             panic!()
         };
         let after = s.project(&ops);
@@ -400,12 +432,52 @@ mod upload_tests {
         assert_eq!(after.rows.len(), 1, "a marker uploads the difference");
     }
 
+    fn divergent_settle(divergent_replies: u32) -> (DocSnapshot, Vec<DocOp>) {
+        let mut s = synced(json!({"n": 1}), 1);
+        s.content = json!({"n": 2});
+        s.rows = vec![row(1, RowKind::Update)];
+        let f = inflight_update(vec![m(1)], json!({"n": 2}));
+        let reply = env(json!({"n": 2, "added": true}), 2);
+        let SettleResult::Ops(ops) = settle(&s, &f, &Ok(reply), ME, 0, divergent_replies) else {
+            panic!()
+        };
+        (s, ops)
+    }
+
+    #[test]
+    fn a_divergent_reply_below_the_limit_queues_a_marker_without_parking() {
+        let (s, ops) = divergent_settle(MAX_DIVERGENT_REPLIES - 1);
+        assert!(!ops.iter().any(|o| matches!(o, DocOp::Park { .. })));
+        assert!(!ops.iter().any(|o| matches!(o, DocOp::Emit(_))));
+        assert_eq!(s.project(&ops).rows.len(), 1);
+    }
+
+    #[test]
+    fn a_divergent_reply_at_the_limit_parks_the_rows_and_keeps_local_content() {
+        let (s, ops) = divergent_settle(MAX_DIVERGENT_REPLIES);
+        assert!(ops.contains(&DocOp::Park {
+            rows: vec![m(1)],
+            error: "diverged".into()
+        }));
+        assert!(ops.contains(&DocOp::Emit(DocEvent::SyncError {
+            code: "diverged".into()
+        })));
+        let after = s.project(&ops);
+        assert_eq!(after.content, json!({"n": 2}));
+        assert_eq!(
+            after.shadow.unwrap().content,
+            json!({"n": 2, "added": true}),
+            "the reply's copy is still adopted"
+        );
+        assert!(after.rows.iter().all(|r| r.parked));
+    }
+
     #[test]
     fn success_older_than_shadow_only_deletes_rows() {
         let mut s = synced(json!({"n": 5}), 9);
         s.rows = vec![row(1, RowKind::Update)];
         let f = inflight_update(vec![m(1)], json!({"n": 4}));
-        let SettleResult::Ops(ops) = settle(&s, &f, &Ok(env(json!({"n": 4}), 7)), ME, 0) else {
+        let SettleResult::Ops(ops) = settle(&s, &f, &Ok(env(json!({"n": 4}), 7)), ME, 0, 0) else {
             panic!()
         };
         assert!(!ops.iter().any(|o| matches!(o, DocOp::SetShadow(_))));
@@ -421,7 +493,7 @@ mod upload_tests {
             base_hash: None,
             ..inflight_update(vec![m(1)], Value::Null)
         };
-        let SettleResult::Ops(ops) = settle(&s, &f, &Ok(env(Value::Null, 2)), ME, 0) else {
+        let SettleResult::Ops(ops) = settle(&s, &f, &Ok(env(Value::Null, 2)), ME, 0, 0) else {
             panic!()
         };
         let after = s.project(&ops);
@@ -439,7 +511,7 @@ mod upload_tests {
             base_hash: None,
             ..inflight_update(vec![m(1)], Value::Null)
         };
-        let SettleResult::Ops(ops) = settle(&s, &f, &Err(ServerError::new("not_found")), ME, 0)
+        let SettleResult::Ops(ops) = settle(&s, &f, &Err(ServerError::new("not_found")), ME, 0, 0)
         else {
             panic!()
         };
@@ -464,7 +536,7 @@ mod upload_tests {
         };
         let f = inflight_update(vec![m(1)], json!({"a": 2}));
         assert_eq!(
-            settle(&s, &f, &Err(mismatch("other")), ME, 0),
+            settle(&s, &f, &Err(mismatch("other")), ME, 0, 0),
             SettleResult::FetchServerCopy
         );
     }
@@ -478,7 +550,7 @@ mod upload_tests {
         let current = s.shadow.as_ref().unwrap().hash.clone();
         let f = inflight_update(vec![m(1)], json!({"a": 2}));
         assert_eq!(
-            settle(&s, &f, &Err(mismatch(&current)), ME, 0),
+            settle(&s, &f, &Err(mismatch(&current)), ME, 0, 0),
             SettleResult::Retry {
                 after_ms: None,
                 mismatch: true
@@ -492,7 +564,8 @@ mod upload_tests {
         s.content = json!({"a": 2});
         s.rows = vec![row(1, RowKind::Update)];
         let f = inflight_update(vec![m(1)], json!({"a": 2}));
-        let SettleResult::Ops(ops) = settle(&s, &f, &Err(mismatch("x")), ME, MAX_MISMATCH_ATTEMPTS)
+        let SettleResult::Ops(ops) =
+            settle(&s, &f, &Err(mismatch("x")), ME, MAX_MISMATCH_ATTEMPTS, 0)
         else {
             panic!()
         };
@@ -511,7 +584,7 @@ mod upload_tests {
         s.rows = vec![row(1, RowKind::Update), row(2, RowKind::Delete)];
         let f = inflight_update(vec![m(1)], json!({"a": 2}));
         assert_eq!(
-            settle(&s, &f, &Err(mismatch("x")), ME, MAX_MISMATCH_ATTEMPTS),
+            settle(&s, &f, &Err(mismatch("x")), ME, MAX_MISMATCH_ATTEMPTS, 0),
             SettleResult::FetchServerCopy
         );
     }
@@ -531,12 +604,12 @@ mod upload_tests {
         s.rows = vec![row(1, RowKind::Delete)];
         let f = inflight_delete(&s);
         assert_eq!(
-            settle(&s, &f, &Err(mismatch("newer")), ME, 0),
+            settle(&s, &f, &Err(mismatch("newer")), ME, 0, 0),
             SettleResult::FetchServerCopy
         );
         let current = s.shadow.as_ref().unwrap().hash.clone();
         assert_eq!(
-            settle(&s, &f, &Err(mismatch(&current)), ME, 0),
+            settle(&s, &f, &Err(mismatch(&current)), ME, 0, 0),
             SettleResult::FetchServerCopy,
             "a delete is never retried blind on the same base"
         );
@@ -553,7 +626,8 @@ mod upload_tests {
                 &inflight_delete(&s),
                 &Err(mismatch("newer")),
                 ME,
-                MAX_MISMATCH_ATTEMPTS
+                MAX_MISMATCH_ATTEMPTS,
+                0
             ),
             SettleResult::Retry {
                 after_ms: None,
@@ -579,7 +653,7 @@ mod upload_tests {
             ..ServerError::new("exists")
         };
         assert_eq!(
-            settle(&s, &f, &Err(err), ME, 0),
+            settle(&s, &f, &Err(err), ME, 0, 0),
             SettleResult::FetchServerCopy
         );
     }
@@ -600,7 +674,7 @@ mod upload_tests {
             existing_owner: Some(OTHER),
             ..ServerError::new("exists")
         };
-        let SettleResult::Ops(ops) = settle(&s, &f, &Err(err), ME, 0) else {
+        let SettleResult::Ops(ops) = settle(&s, &f, &Err(err), ME, 0, 0) else {
             panic!()
         };
         assert!(ops.contains(&DocOp::Recover {
@@ -617,7 +691,7 @@ mod upload_tests {
             ..synced(sample(), 1)
         };
         let f = inflight_update(vec![m(1)], sample());
-        let SettleResult::Ops(ops) = settle(&s, &f, &Err(ServerError::new("validation")), ME, 0)
+        let SettleResult::Ops(ops) = settle(&s, &f, &Err(ServerError::new("validation")), ME, 0, 0)
         else {
             panic!()
         };
@@ -641,7 +715,7 @@ mod upload_tests {
         s.content = json!({"a": 2});
         s.rows = vec![row(1, RowKind::Update)];
         let f = inflight_update(vec![m(1)], json!({"a": 2}));
-        let SettleResult::Ops(ops) = settle(&s, &f, &Err(ServerError::new("not_found")), ME, 0)
+        let SettleResult::Ops(ops) = settle(&s, &f, &Err(ServerError::new("not_found")), ME, 0, 0)
         else {
             panic!()
         };
@@ -664,7 +738,7 @@ mod upload_tests {
             ..ServerError::new("internal")
         };
         assert_eq!(
-            settle(&s, &f, &Err(err), ME, 0),
+            settle(&s, &f, &Err(err), ME, 0, 0),
             SettleResult::Retry {
                 after_ms: Some(5000),
                 mismatch: false
@@ -677,7 +751,7 @@ mod upload_tests {
         let s = empty();
         let f = inflight_update(vec![m(1)], sample());
         assert_eq!(
-            settle(&s, &f, &Ok(env(sample(), 3)), ME, 0),
+            settle(&s, &f, &Ok(env(sample(), 3)), ME, 0, 0),
             SettleResult::Ops(vec![DocOp::DeleteRows(vec![m(1)])])
         );
     }
