@@ -41,10 +41,6 @@ env_logger = "0.11"
 log = "0.4"
 serial_test = "3.0"
 
-[[example]]
-name = "phoenix_spike"
-path = "examples/phoenix_spike.rs"
-
 [build-dependencies]
 # Exact pin: the tracked replicant-client/include/replicant.h must be regenerated
 # with this exact cbindgen version to avoid banner/whitespace churn on commit.

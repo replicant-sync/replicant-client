@@ -42,7 +42,7 @@ def main():
 
     print("Creating dist directory structure...")
     dist = Path("dist")
-    for subdir in ["include", "lib", "examples", "cmake", "juce/replicant"]:
+    for subdir in ["include", "lib", "cmake"]:
         (dist / subdir).mkdir(parents=True, exist_ok=True)
 
     # Copy C header
@@ -93,37 +93,6 @@ def main():
             shutil.copy(lib, dist / "lib" / lib.name)
             print(f"[OK] {lib_type} copied to dist/lib/")
 
-    # Copy JUCE module
-    print("Copying JUCE module to dist...")
-    juce_src = Path("wrappers/juce/replicant")
-    juce_dst = dist / "juce" / "replicant"
-
-    if juce_src.exists():
-        # Clear destination
-        if juce_dst.exists():
-            shutil.rmtree(juce_dst)
-        juce_dst.mkdir(parents=True, exist_ok=True)
-
-        # Copy files
-        for file in ["replicant.h", "replicant.cpp"]:
-            src_file = juce_src / file
-            if src_file.exists():
-                shutil.copy(src_file, juce_dst / file)
-
-        # Fix include path for dist layout
-        header_file = juce_dst / "replicant.h"
-        if header_file.exists():
-            content = header_file.read_text()
-            content = content.replace(
-                '"../../../dist/include/replicant.hpp"',
-                '"../../include/replicant.hpp"'
-            )
-            header_file.write_text(content)
-
-        print("[OK] JUCE module copied to dist/juce/replicant/")
-    else:
-        print("[WARN] JUCE module not found at wrappers/juce/replicant/")
-
     # Get version from Cargo
     print("Adding version information...")
     result = run_command(["cargo", "metadata", "--no-deps", "--format-version", "1"], check=False)
@@ -154,8 +123,6 @@ Platform: {platform.system()} {platform.machine()}
     print("  - dist/include/replicant.h     (C header - auto-generated)")
     print("  - dist/include/replicant.hpp   (C++ wrapper)")
     print("  - dist/lib/                    (compiled libraries)")
-    print("  - dist/juce/replicant/         (JUCE module)")
-    print("  - dist/examples/               (usage examples)")
     print()
     print(f"Version: {version}")
 
