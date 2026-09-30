@@ -110,8 +110,7 @@ impl Store {
             .max_connections(POOL_SIZE)
             .connect_with(options.clone())
             .await?;
-        v1_data::back_up_v1_database(&pool, path).await?;
-        if let Err(error) = prepare(&pool).await {
+        if let Err(error) = prepare(&pool, path).await {
             pool.close().await;
             return Err(error);
         }
@@ -219,7 +218,8 @@ impl Store {
     }
 }
 
-async fn prepare(pool: &SqlitePool) -> StoreResult<()> {
+async fn prepare(pool: &SqlitePool, path: &Path) -> StoreResult<()> {
+    v1_data::back_up_v1_database(pool, path).await?;
     sqlx::migrate!("./migrations").run(pool).await?;
     v1_data::migrate_v1_data(pool).await?;
     sqlx::query("INSERT OR IGNORE INTO subscriptions (scope) VALUES (?), (?)")

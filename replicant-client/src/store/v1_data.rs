@@ -27,19 +27,14 @@ struct Counts {
 }
 
 struct QueueRow {
-    kind: String,
-    base_content: Option<String>,
+    kind: &'static str,
+    base: Option<Value>,
     created_at: Option<i64>,
 }
 
 pub(crate) async fn migrate_v1_data(pool: &SqlitePool) -> StoreResult<()> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
-    let v1_tables: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sync_queue'",
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-    if v1_tables == 0 {
+    if !holds_v1_data(&mut *tx).await? {
         tx.commit().await?;
         return Ok(());
     }
@@ -86,14 +81,17 @@ async fn migrate(conn: &mut SqliteConnection) -> StoreResult<Counts> {
             counts.dropped_queue_rows += 1;
             continue;
         };
-        let kind: String = row.try_get("operation_type")?;
         let base_content: Option<String> = row.try_get("base_content")?;
         // An unknown operation or an unreadable base still leaves an edit to send, with no base.
-        let known = matches!(kind.as_str(), "create" | "update" | "delete");
+        let (kind, base_content) = match row.try_get::<String, _>("operation_type")?.as_str() {
+            "create" => ("create", base_content),
+            "update" => ("update", base_content),
+            "delete" => ("delete", base_content),
+            _ => ("update", None),
+        };
         queue.entry(doc_id).or_default().push(QueueRow {
-            kind: if known { kind } else { "update".to_string() },
-            base_content: base_content
-                .filter(|base| known && serde_json::from_str::<Value>(base).is_ok()),
+            kind,
+            base: base_content.and_then(|base| serde_json::from_str(&base).ok()),
             created_at: row.try_get("created_unix")?,
         });
     }
@@ -180,9 +178,7 @@ async fn migrate(conn: &mut SqliteConnection) -> StoreResult<Counts> {
             } else {
                 rows.iter()
                     .rev()
-                    .find_map(|row| row.base_content.as_deref())
-                    .map(serde_json::from_str::<Value>)
-                    .transpose()?
+                    .find_map(|row| row.base.clone())
                     .map(|mut base| {
                         canonicalise_numbers(&mut base);
                         base
@@ -192,10 +188,10 @@ async fn migrate(conn: &mut SqliteConnection) -> StoreResult<Counts> {
             if shadow.is_none() && !has_create && (deleted || !rows.is_empty()) {
                 counts.pending_without_base += 1;
             }
-            let mut markers = rows
+            let mut markers: Vec<_> = rows
                 .iter()
-                .map(|row| Ok((row_kind(&row.kind)?, row.created_at.unwrap_or(now))))
-                .collect::<StoreResult<Vec<_>>>()?;
+                .map(|row| (row.kind, row.created_at.unwrap_or(now)))
+                .collect();
             if deleted {
                 markers.push(("delete", now));
             } else if markers.is_empty() {
@@ -346,42 +342,73 @@ fn migration_failed(error: StoreError) -> StoreError {
     }
 }
 
-/// Copies a data dir that still holds v1 sync data to `<db path>.v1-backup` before 015 changes
-/// it for good. Another process may have made the copy already.
-pub(crate) async fn back_up_v1_database(pool: &SqlitePool, db_path: &Path) -> StoreResult<()> {
+async fn holds_v1_data<'c>(conn: impl sqlx::SqliteExecutor<'c>) -> StoreResult<bool> {
     let v1_tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sync_queue'",
     )
-    .fetch_one(pool)
+    .fetch_one(conn)
     .await?;
-    let mut backup = db_path.as_os_str().to_owned();
-    backup.push(".v1-backup");
-    let backup = PathBuf::from(backup);
-    if v1_tables == 0 || backup.exists() {
-        return Ok(());
-    }
-    match sqlx::query("VACUUM INTO ?")
-        .bind(backup.to_string_lossy().into_owned())
-        .execute(pool)
-        .await
-    {
-        Ok(_) => Ok(()),
-        Err(_) if backup.exists() => Ok(()),
-        Err(error) => Err(StoreError::MigrationFailed(format!(
-            "backup before migrating: {error}"
-        ))),
-    }
+    Ok(v1_tables > 0)
 }
 
-fn row_kind(kind: &str) -> StoreResult<&'static str> {
-    match kind {
-        "create" => Ok("create"),
-        "update" => Ok("update"),
-        "delete" => Ok("delete"),
-        other => Err(StoreError::Corrupt(format!(
-            "v1 sync_queue operation {other}"
-        ))),
+/// Copies a data dir that still holds v1 sync data to `<db path>.v1-backup` before 015 changes
+/// it for good. The copy is written under a temporary name and renamed, so a backup that exists
+/// is complete; one that exists is never replaced, as it holds the v1 data as it was.
+pub(crate) async fn back_up_v1_database(pool: &SqlitePool, db_path: &Path) -> StoreResult<()> {
+    if !holds_v1_data(pool).await? {
+        return Ok(());
     }
+    // Holding the write lock serialises backups across processes, so a temporary file found
+    // here was left by a crash.
+    let lock = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let backup = sibling(db_path, ".v1-backup");
+    let partial = sibling(db_path, ".v1-backup.tmp");
+    let written = if backup.exists() {
+        Ok(())
+    } else {
+        write_backup(pool, &partial, &backup).await
+    };
+    if written.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    lock.rollback().await?;
+    written
+}
+
+async fn write_backup(pool: &SqlitePool, partial: &Path, backup: &Path) -> StoreResult<()> {
+    match std::fs::remove_file(partial) {
+        Ok(()) => warn!(path = %partial.display(), "removed a partial v1 backup"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(backup_failed(error)),
+    }
+    // A second pooled connection: VACUUM cannot run inside the lock's transaction.
+    sqlx::query("VACUUM INTO ?")
+        .bind(partial.to_string_lossy().into_owned())
+        .execute(pool)
+        .await
+        .map_err(|error| match StoreError::from(error) {
+            busy if busy.is_busy() => busy,
+            error => backup_failed(error),
+        })?;
+    std::fs::File::open(partial)
+        .and_then(|file| file.sync_all())
+        .map_err(backup_failed)?;
+    std::fs::rename(partial, backup).map_err(backup_failed)?;
+    if let Some(dir) = backup.parent() {
+        // Best effort: makes the rename durable where directories can be synced.
+        let _ = std::fs::File::open(dir).and_then(|dir| dir.sync_all());
+    }
+    Ok(())
+}
+
+fn backup_failed(error: impl std::fmt::Display) -> StoreError {
+    StoreError::MigrationFailed(format!("backup before migrating: {error}"))
+}
+
+fn sibling(db_path: &Path, suffix: &str) -> PathBuf {
+    let mut path = db_path.as_os_str().to_owned();
+    path.push(suffix);
+    PathBuf::from(path)
 }
 
 /// UUIDv7 at `unix_ms` with `counter` in the low bits: strictly increasing in migration
@@ -408,6 +435,8 @@ mod tests {
     use crate::engine::types::{UploadKind, SCOPE_CURATED, SCOPE_OWN};
     use crate::store::test_support::*;
     use crate::store::{now_unix, Store};
+
+    use super::back_up_v1_database;
 
     const OTHER: Uuid = Uuid::from_u128(0xB);
 
@@ -1060,6 +1089,120 @@ mod tests {
         assert!(backup_of(&path).exists());
     }
 
+    fn partial_backup_of(path: &Path) -> PathBuf {
+        PathBuf::from(format!("{}.v1-backup.tmp", path.display()))
+    }
+
+    async fn backed_up_content(path: &Path, doc_id: Uuid) -> String {
+        let backup = raw_pool(&backup_of(path)).await;
+        assert!(
+            has_table(&backup, "sync_queue").await,
+            "the copy is the v1 file"
+        );
+        let content = sqlx::query_scalar("SELECT content FROM documents WHERE id = ?")
+            .bind(doc_id.to_string())
+            .fetch_one(&backup)
+            .await
+            .unwrap();
+        backup.close().await;
+        content
+    }
+
+    #[tokio::test]
+    async fn a_partial_backup_left_by_a_crash_is_replaced_by_a_complete_one() {
+        let (_dir, path, pool) = v012_db().await;
+        v1_user(&pool, ME, true).await;
+        v1_doc(&pool, &id(1), Some(ME), json!({"n": 1}), "synced", None).await;
+        std::fs::write(partial_backup_of(&path), b"half a database").unwrap();
+        migrated(pool, &path).await.close().await;
+        assert!(!partial_backup_of(&path).exists());
+        assert_eq!(
+            backed_up_content(&path, doc(1)).await,
+            json!({"n": 1}).to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backup_from_an_earlier_failed_migration_is_kept_as_it_was() {
+        let (_dir, path, pool) = v012_db().await;
+        v1_user(&pool, ME, true).await;
+        v1_doc(
+            &pool,
+            &id(1),
+            Some(ME),
+            json!({"n": 1}),
+            "synced",
+            Some("2026-01-03T00:00:00+00:00"),
+        )
+        .await;
+        sqlx::query(
+            "CREATE TRIGGER refuse BEFORE DELETE ON documents BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+        assert!(Store::open(&path)
+            .await
+            .err()
+            .unwrap()
+            .is_migration_failed());
+
+        let raw = raw_pool(&path).await;
+        sqlx::query("DROP TRIGGER refuse")
+            .execute(&raw)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE documents SET content = '{\"n\":2}'")
+            .execute(&raw)
+            .await
+            .unwrap();
+        raw.close().await;
+        Store::open(&path).await.unwrap().close().await;
+        assert_eq!(
+            backed_up_content(&path, doc(1)).await,
+            json!({"n": 1}).to_string(),
+            "the retry keeps the first backup"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backup_blocked_by_another_writer_is_busy_and_succeeds_once_it_lets_go() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        use sqlx::ConnectOptions;
+
+        let (_dir, path, pool) = v012_db().await;
+        v1_user(&pool, ME, true).await;
+        v1_doc(&pool, &id(1), Some(ME), json!({"n": 1}), "synced", None).await;
+        pool.close().await;
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .busy_timeout(std::time::Duration::from_millis(1));
+        let mut writer = options.connect().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut writer)
+            .await
+            .unwrap();
+        let opener = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .unwrap();
+
+        let error = back_up_v1_database(&opener, &path).await.unwrap_err();
+        assert!(error.is_busy(), "retry_open retries it: {error}");
+        assert!(!backup_of(&path).exists());
+        assert!(!partial_backup_of(&path).exists());
+
+        sqlx::query("ROLLBACK").execute(&mut writer).await.unwrap();
+        back_up_v1_database(&opener, &path).await.unwrap();
+        opener.close().await;
+        assert_eq!(
+            backed_up_content(&path, doc(1)).await,
+            json!({"n": 1}).to_string()
+        );
+    }
+
     #[tokio::test]
     async fn unreadable_v1_documents_are_kept_aside_and_the_rest_migrate() {
         let (_dir, path, pool) = v012_db().await;
@@ -1137,9 +1280,18 @@ mod tests {
             .await
             .unwrap();
         v1_queue_row(&pool, &id(1), "patch", Some(json!({"n": 0}))).await;
+        v1_doc(&pool, &id(2), Some(ME), json!({"n": 2}), "pending", None).await;
+        v1_queue_row(&pool, &id(2), "update", None).await;
+        sqlx::query("UPDATE sync_queue SET base_content = 'not json' WHERE document_id = ?")
+            .bind(id(2))
+            .execute(&pool)
+            .await
+            .unwrap();
         let store = migrated(pool, &path).await;
-        assert_eq!(outbox(&store, doc(1)).await, kinds(&["update"]));
-        assert!(snapshot(&store, doc(1)).await.shadow.is_none());
+        for n in [1, 2] {
+            assert_eq!(outbox(&store, doc(n)).await, kinds(&["update"]));
+            assert!(snapshot(&store, doc(n)).await.shadow.is_none());
+        }
         store.close().await;
     }
 
