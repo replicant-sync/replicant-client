@@ -4,7 +4,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -302,20 +301,13 @@ private:
 };
 
 //==============================================================================
-// Enrollment and stored credentials (no Client needed)
-
-struct Credentials
-{
-    std::string api_key;
-    std::string secret;
-    std::string user_id; ///< Canonical user id (UUID) from the enrollment claim.
-    std::string email;   ///< Signs joins; empty for credentials stored by 0.6.
-};
+// Enrollment and sign-out (no Client needed). The api key and secret never leave the library;
+// a Client's state() and get_user_id() say who is signed in.
 
 /** Asks the server to email a one-time enrollment code. Blocks for the HTTP round trip. */
-inline bool request_enrollment(const std::string& base_url, const std::string& email)
+inline SyncResult request_enrollment(const std::string& base_url, const std::string& email)
 {
-    return replicant_enroll_request(base_url.c_str(), email.c_str()) == ReplicantSyncResult_Success;
+    return replicant_enroll_request(base_url.c_str(), email.c_str());
 }
 
 /** Exchanges the code for a credential and stores it in data_dir with the email; the api key
@@ -334,36 +326,11 @@ inline SyncResult claim_enrollment(const std::string& base_url, const std::strin
     return result;
 }
 
-/** Loads the stored credential (without its email). Empty when none is stored; throws
-    SyncException (ErrorDatabase) when it cannot be read. */
-inline std::optional<Credentials> load_credentials(const std::string& data_dir)
-{
-    char api_key[REPLICANT_CREDENTIAL_MAX_LEN + 1] = {};
-    char secret[REPLICANT_CREDENTIAL_MAX_LEN + 1] = {};
-    char user_id[REPLICANT_USER_ID_LEN + 1] = {};
-    const SyncResult result = replicant_load_credentials(data_dir.c_str(), api_key, sizeof(api_key), secret, sizeof(secret), user_id,
-                                                         sizeof(user_id));
-    if (result == ReplicantSyncResult_ErrorNotFound)
-        return std::nullopt;
-    if (result != ReplicantSyncResult_Success)
-        throw SyncException(result);
-    return Credentials {api_key, secret, user_id, {}};
-}
-
-/** Stores a credential and tells this binary's engines on data_dir to use it. This is the
-    sign-in: never re-create a Client to change credentials. */
-inline bool store_credentials(const std::string& data_dir, const Credentials& credentials)
-{
-    return replicant_store_credentials(data_dir.c_str(), credentials.email.empty() ? nullptr : credentials.email.c_str(),
-                                       credentials.api_key.c_str(), credentials.secret.c_str(), credentials.user_id.c_str())
-           == ReplicantSyncResult_Success;
-}
-
 /** Removes the stored credential (sign-out); this binary's engines on data_dir halt as not
     enrolled and never join with it again. */
-inline bool clear_credentials(const std::string& data_dir)
+inline SyncResult clear_credentials(const std::string& data_dir)
 {
-    return replicant_clear_credentials(data_dir.c_str()) == ReplicantSyncResult_Success;
+    return replicant_clear_credentials(data_dir.c_str());
 }
 
 inline bool is_credential_rejection(const int32_t error_code)

@@ -34,11 +34,6 @@ namespace replicant {
 #define REPLICANT_ABI_VERSION_MINOR 0
 
 /**
- * Longest `api_key` or `secret`, in bytes; a buffer for either needs one more for the NUL.
- */
-#define REPLICANT_CREDENTIAL_MAX_LEN 128
-
-/**
  * Longest email, in bytes.
  */
 #define REPLICANT_EMAIL_MAX_LEN 254
@@ -814,9 +809,9 @@ const char *replicant_get_version(void);
 ReplicantSyncResult replicant_enroll_request(const char *base_url, const char *email);
 
 /**
- * Exchanges an enrollment code for credentials and stores them in `data_dir` with `email`, as
- * `replicant_store_credentials` does; the api key and secret never leave the library. Writes the
- * user id into `out_user_id` (`user_id_cap` bytes, at least `REPLICANT_USER_ID_LEN + 1`).
+ * Exchanges an enrollment code for credentials and stores them in `data_dir` (encrypted at rest)
+ * with `email`; the api key and secret never leave the library. Writes the user id into
+ * `out_user_id` (`user_id_cap` bytes, at least `REPLICANT_USER_ID_LEN + 1`).
  * Results:
  * - `Success`: stored; this process's engines on `data_dir` sign in.
  * - `ErrorInvalidInput`: a null or non-UTF-8 argument, an empty or over-long email, or a
@@ -842,38 +837,6 @@ ReplicantSyncResult replicant_enroll_claim(const char *base_url,
                                            const char *token,
                                            char *out_user_id,
                                            size_t user_id_cap);
-
-/**
- * Loads the credentials stored in `data_dir` into the buffers (each `*_cap` is its buffer's
- * size; see the `REPLICANT_*_LEN` limits). `ErrorNotFound`: none are stored.
- * `ErrorDatabase`: they cannot be read. `ErrorBufferTooSmall`: a buffer is too small. Out
- * buffers are only valid on `Success`.
- *
- * # Safety
- * `data_dir` must be a valid, non-null C string; each out pointer must
- * reference a writable buffer of at least its stated capacity.
- */
-ReplicantSyncResult replicant_load_credentials(const char *data_dir,
-                                               char *out_api_key,
-                                               size_t api_key_cap,
-                                               char *out_secret,
-                                               size_t secret_cap,
-                                               char *out_user_id,
-                                               size_t user_id_cap);
-
-/**
- * Stores credentials in `data_dir` (encrypted at rest) and tells this process's engines on
- * that data dir. `email` (may be null; `""` counts as none) signs joins; `user_id` must be a
- * real UUID. A value longer than its `REPLICANT_*_LEN` limit is `ErrorInvalidInput`.
- *
- * # Safety
- * Valid C strings; `email` may be null.
- */
-ReplicantSyncResult replicant_store_credentials(const char *data_dir,
-                                                const char *email,
-                                                const char *api_key,
-                                                const char *secret,
-                                                const char *user_id);
 
 /**
  * Removes the stored credentials (sign-out) and tells this process's engines on `data_dir`:

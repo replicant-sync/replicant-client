@@ -53,8 +53,6 @@ pub extern "C" fn replicant_abi_version() -> u32 {
     (REPLICANT_ABI_VERSION_MAJOR << 16) | REPLICANT_ABI_VERSION_MINOR
 }
 
-/// Longest `api_key` or `secret`, in bytes; a buffer for either needs one more for the NUL.
-pub const REPLICANT_CREDENTIAL_MAX_LEN: usize = 128;
 /// Longest email, in bytes.
 pub const REPLICANT_EMAIL_MAX_LEN: usize = 254;
 /// A user id's length; its buffer needs one more for the NUL.
@@ -1301,31 +1299,7 @@ pub extern "C" fn replicant_get_version() -> *const c_char {
         .cast()
 }
 
-// ===== Enrollment and stored credentials =====
-
-/// Copies `s` plus a NUL terminator into `out` iff it fits within `cap`
-/// bytes. Returns `false` — writing an empty C string when `cap > 0` — when
-/// it does not fit; never writes past `cap`. On a multi-buffer call that
-/// fails partway, earlier out buffers may already be populated — callers
-/// must not read any out buffer unless the call returned success. Bytes of
-/// `s` are copied verbatim, so an embedded NUL makes C readers see the
-/// string truncated at that NUL.
-///
-/// # Safety
-/// `out` must point to a writable buffer of at least `cap` bytes.
-unsafe fn write_cstr_buf(out: *mut c_char, cap: usize, s: &str) -> bool {
-    if cap == 0 {
-        return false;
-    }
-    let bytes = s.as_bytes();
-    if bytes.len() + 1 > cap {
-        out.write(0);
-        return false;
-    }
-    ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, bytes.len());
-    out.add(bytes.len()).write(0);
-    true
-}
+// ===== Enrollment and sign-out =====
 
 /// Requests an enrollment token be emailed to `email`. Needs no handle. Blocks the calling
 /// thread for the HTTP round trip (up to about 10 s to connect and 30 s for the request); never
@@ -1369,52 +1343,9 @@ pub unsafe extern "C" fn replicant_enroll_request(
     })
 }
 
-/// Writes the three values into their buffers; `ErrorBufferTooSmall` when any does not fit.
-unsafe fn write_credentials(
-    credentials: &crate::secret_store::Credentials,
-    out_api_key: *mut c_char,
-    api_key_cap: usize,
-    out_secret: *mut c_char,
-    secret_cap: usize,
-    out_user_id: *mut c_char,
-    user_id_cap: usize,
-) -> SyncResult {
-    if write_cstr_buf(out_api_key, api_key_cap, &credentials.api_key)
-        && write_cstr_buf(out_secret, secret_cap, &credentials.secret)
-        && write_cstr_buf(out_user_id, user_id_cap, &credentials.user_id.to_string())
-    {
-        SyncResult::Success
-    } else {
-        SyncResult::ErrorBufferTooSmall
-    }
-}
-
-/// Refuses over-long values (`ErrorInvalidInput`), stores, and tells this process's engines.
-fn store_credentials_in(
-    data_dir: &Path,
-    credentials: &crate::secret_store::Credentials,
-) -> SyncResult {
-    if credentials.api_key.len() > REPLICANT_CREDENTIAL_MAX_LEN
-        || credentials.secret.len() > REPLICANT_CREDENTIAL_MAX_LEN
-        || credentials
-            .email
-            .as_ref()
-            .is_some_and(|email| email.len() > REPLICANT_EMAIL_MAX_LEN)
-    {
-        return SyncResult::ErrorInvalidInput;
-    }
-    match crate::secret_store::store(data_dir, credentials) {
-        Ok(()) => {
-            host::credentials_changed(data_dir);
-            SyncResult::Success
-        }
-        Err(_) => SyncResult::ErrorDatabase,
-    }
-}
-
-/// Exchanges an enrollment code for credentials and stores them in `data_dir` with `email`, as
-/// `replicant_store_credentials` does; the api key and secret never leave the library. Writes the
-/// user id into `out_user_id` (`user_id_cap` bytes, at least `REPLICANT_USER_ID_LEN + 1`).
+/// Exchanges an enrollment code for credentials and stores them in `data_dir` (encrypted at rest)
+/// with `email`; the api key and secret never leave the library. Writes the user id into
+/// `out_user_id` (`user_id_cap` bytes, at least `REPLICANT_USER_ID_LEN + 1`).
 /// Results:
 /// - `Success`: stored; this process's engines on `data_dir` sign in.
 /// - `ErrorInvalidInput`: a null or non-UTF-8 argument, an empty or over-long email, or a
@@ -1483,93 +1414,14 @@ pub unsafe extern "C" fn replicant_enroll_claim(
             Err(_) => return SyncResult::ErrorUnknown,
         };
         credentials.email = Some(email.to_string());
-        match store_credentials_in(Path::new(data_dir), &credentials) {
-            SyncResult::Success => {
+        match crate::secret_store::store(Path::new(data_dir), &credentials) {
+            Ok(()) => {
+                host::credentials_changed(Path::new(data_dir));
                 write_id(out_user_id, credentials.user_id);
                 SyncResult::Success
             }
-            failed => failed,
-        }
-    })
-}
-
-/// Loads the credentials stored in `data_dir` into the buffers (each `*_cap` is its buffer's
-/// size; see the `REPLICANT_*_LEN` limits). `ErrorNotFound`: none are stored.
-/// `ErrorDatabase`: they cannot be read. `ErrorBufferTooSmall`: a buffer is too small. Out
-/// buffers are only valid on `Success`.
-///
-/// # Safety
-/// `data_dir` must be a valid, non-null C string; each out pointer must
-/// reference a writable buffer of at least its stated capacity.
-#[no_mangle]
-pub unsafe extern "C" fn replicant_load_credentials(
-    data_dir: *const c_char,
-    out_api_key: *mut c_char,
-    api_key_cap: usize,
-    out_secret: *mut c_char,
-    secret_cap: usize,
-    out_user_id: *mut c_char,
-    user_id_cap: usize,
-) -> SyncResult {
-    guard(|| {
-        let (Some(data_dir), false, false, false) = (
-            str_arg(data_dir),
-            out_api_key.is_null(),
-            out_secret.is_null(),
-            out_user_id.is_null(),
-        ) else {
-            return SyncResult::ErrorInvalidInput;
-        };
-        match crate::secret_store::load(Path::new(data_dir)) {
-            Ok(Some(credentials)) => write_credentials(
-                &credentials,
-                out_api_key,
-                api_key_cap,
-                out_secret,
-                secret_cap,
-                out_user_id,
-                user_id_cap,
-            ),
-            Ok(None) => SyncResult::ErrorNotFound,
             Err(_) => SyncResult::ErrorDatabase,
         }
-    })
-}
-
-/// Stores credentials in `data_dir` (encrypted at rest) and tells this process's engines on
-/// that data dir. `email` (may be null; `""` counts as none) signs joins; `user_id` must be a
-/// real UUID. A value longer than its `REPLICANT_*_LEN` limit is `ErrorInvalidInput`.
-///
-/// # Safety
-/// Valid C strings; `email` may be null.
-#[no_mangle]
-pub unsafe extern "C" fn replicant_store_credentials(
-    data_dir: *const c_char,
-    email: *const c_char,
-    api_key: *const c_char,
-    secret: *const c_char,
-    user_id: *const c_char,
-) -> SyncResult {
-    guard(|| {
-        let (Some(data_dir), Some(api_key), Some(secret), Some(user_id), Ok(email)) = (
-            str_arg(data_dir),
-            str_arg(api_key),
-            str_arg(secret),
-            uuid_arg(user_id),
-            nullable_str_arg(email),
-        ) else {
-            return SyncResult::ErrorInvalidInput;
-        };
-        if user_id.is_nil() {
-            return SyncResult::ErrorInvalidInput;
-        }
-        let credentials = crate::secret_store::Credentials {
-            api_key: api_key.to_string(),
-            secret: secret.to_string(),
-            user_id,
-            email: email.filter(|email| !email.is_empty()).map(str::to_string),
-        };
-        store_credentials_in(Path::new(data_dir), &credentials)
     })
 }
 
@@ -1599,42 +1451,6 @@ pub unsafe extern "C" fn replicant_clear_credentials(data_dir: *const c_char) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn write_cstr_buf_refuses_oversized_strings() {
-        let mut small = [1i8; 8];
-        let fitted = unsafe {
-            write_cstr_buf(
-                small.as_mut_ptr() as *mut c_char,
-                small.len(),
-                "too-long-for-8",
-            )
-        };
-        assert!(!fitted);
-        assert_eq!(small[0], 0, "refused write must leave an empty C string");
-
-        let mut big = [1i8; 32];
-        let fitted = unsafe { write_cstr_buf(big.as_mut_ptr() as *mut c_char, big.len(), "fits") };
-        assert!(fitted);
-        assert_eq!(big[4], 0, "NUL terminator after the copied bytes");
-    }
-
-    #[test]
-    fn write_cstr_buf_exact_fit_boundary() {
-        // len + 1 == cap fits exactly; len == cap does not.
-        let mut buf = [1i8; 5];
-        assert!(unsafe { write_cstr_buf(buf.as_mut_ptr() as *mut c_char, buf.len(), "four") });
-        assert_eq!(buf[4], 0);
-        assert!(!unsafe { write_cstr_buf(buf.as_mut_ptr() as *mut c_char, buf.len(), "five!") });
-        assert_eq!(buf[0], 0, "refused write must leave an empty C string");
-    }
-
-    #[test]
-    fn write_cstr_buf_zero_capacity_is_refused() {
-        let mut buf = [1i8; 1];
-        assert!(!unsafe { write_cstr_buf(buf.as_mut_ptr() as *mut c_char, 0, "") });
-        assert_eq!(buf[0], 1, "zero-cap buffer must not be touched");
-    }
 
     #[tokio::test]
     async fn enroll_ffi_is_callable_from_within_a_runtime() {

@@ -7,6 +7,7 @@ use std::ptr;
 use std::time::{Duration, Instant};
 
 use replicant_client::ffi::*;
+use replicant_client::{host, secret_store};
 use serial_test::serial;
 
 /// Live thread count of this process; `None` (said loudly) where it cannot be probed.
@@ -138,19 +139,17 @@ fn open(dir: &Path, server_url: &str) -> *mut Replicant {
 }
 
 fn sign_in(dir: &Path) {
-    let user_id = c(&uuid::Uuid::new_v4().to_string());
-    assert_eq!(
-        unsafe {
-            replicant_store_credentials(
-                c(dir.to_str().unwrap()).as_ptr(),
-                c("a@b.c").as_ptr(),
-                c("rpa_k").as_ptr(),
-                c("rps_s").as_ptr(),
-                user_id.as_ptr(),
-            )
+    secret_store::store(
+        dir,
+        &secret_store::Credentials {
+            api_key: "rpa_k".into(),
+            secret: "rps_s".into(),
+            user_id: uuid::Uuid::new_v4(),
+            email: Some("a@b.c".into()),
         },
-        SyncResult::Success
-    );
+    )
+    .unwrap();
+    host::credentials_changed(dir);
 }
 
 #[test]

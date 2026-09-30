@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use replicant_client::events::{EventOrigin, EventType};
 use replicant_client::ffi::*;
+use replicant_client::secret_store;
 use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
 use uuid::Uuid;
@@ -521,32 +522,23 @@ fn count_pending_sync_counts_unsent_documents() {
 }
 
 #[test]
-fn storing_and_clearing_credentials_move_the_engine_in_and_out_of_halted() {
+fn a_claim_and_a_sign_out_move_the_engine_out_of_and_back_into_halted() {
+    let (runtime, server, _) = claim_server(200, 1);
     let dir = tempfile::tempdir().unwrap();
     let handle = open(dir.path());
     wait_until("halted as not enrolled", || halted_not_enrolled(handle));
-    let data_dir = c(dir.path().to_str().unwrap());
-    assert_eq!(
-        unsafe {
-            replicant_store_credentials(
-                data_dir.as_ptr(),
-                c("a@b.c").as_ptr(),
-                c("rpa_k").as_ptr(),
-                c("rps_s").as_ptr(),
-                c(&Uuid::new_v4().to_string()).as_ptr(),
-            )
-        },
-        SyncResult::Success
-    );
+    assert_eq!(claim(&server, dir.path()).0, SyncResult::Success);
     wait_until("dialling", || {
         state(handle).connection != ReplicantConnection::Halted
     });
+    let data_dir = c(dir.path().to_str().unwrap());
     assert_eq!(
         unsafe { replicant_clear_credentials(data_dir.as_ptr()) },
         SyncResult::Success
     );
     wait_until("halted again", || halted_not_enrolled(handle));
     close(handle);
+    runtime.block_on(server.verify());
 }
 
 #[test]
@@ -740,108 +732,6 @@ fn registering_off_the_bound_thread_is_refused() {
     close(handle);
 }
 
-fn credentials_out(
-    call: impl FnOnce(*mut c_char, *mut c_char, *mut c_char) -> SyncResult,
-) -> (SyncResult, [String; 3]) {
-    let mut key = [0 as c_char; REPLICANT_CREDENTIAL_MAX_LEN + 1];
-    let mut secret = [0 as c_char; REPLICANT_CREDENTIAL_MAX_LEN + 1];
-    let mut user_id = [0 as c_char; REPLICANT_USER_ID_LEN + 1];
-    let result = call(key.as_mut_ptr(), secret.as_mut_ptr(), user_id.as_mut_ptr());
-    (
-        result,
-        [
-            read(key.as_ptr()),
-            read(secret.as_ptr()),
-            read(user_id.as_ptr()),
-        ],
-    )
-}
-
-fn load_credentials(dir: &Path) -> (SyncResult, [String; 3]) {
-    credentials_out(|key, secret, user_id| unsafe {
-        replicant_load_credentials(
-            c(dir.to_str().unwrap()).as_ptr(),
-            key,
-            REPLICANT_CREDENTIAL_MAX_LEN + 1,
-            secret,
-            REPLICANT_CREDENTIAL_MAX_LEN + 1,
-            user_id,
-            REPLICANT_USER_ID_LEN + 1,
-        )
-    })
-}
-
-fn store_credentials(dir: &Path, email: &str, api_key: &str, user_id: &str) -> SyncResult {
-    unsafe {
-        replicant_store_credentials(
-            c(dir.to_str().unwrap()).as_ptr(),
-            c(email).as_ptr(),
-            c(api_key).as_ptr(),
-            c("rps_s").as_ptr(),
-            c(user_id).as_ptr(),
-        )
-    }
-}
-
-#[test]
-fn loading_credentials_tells_none_stored_from_unreadable() {
-    let dir = tempfile::tempdir().unwrap();
-    assert_eq!(load_credentials(dir.path()).0, SyncResult::ErrorNotFound);
-    let user_id = Uuid::new_v4().to_string();
-    assert_eq!(
-        store_credentials(dir.path(), "a@b.c", "rpa_k", &user_id),
-        SyncResult::Success
-    );
-    assert_eq!(
-        load_credentials(dir.path()),
-        (
-            SyncResult::Success,
-            ["rpa_k".to_string(), "rps_s".to_string(), user_id]
-        )
-    );
-    std::fs::write(dir.path().join("credentials.enc"), "torn").unwrap();
-    assert_eq!(load_credentials(dir.path()).0, SyncResult::ErrorDatabase);
-}
-
-#[test]
-fn credentials_longer_than_their_limits_are_refused_and_a_short_buffer_has_its_own_result() {
-    let dir = tempfile::tempdir().unwrap();
-    let user_id = Uuid::new_v4().to_string();
-    let too_long_key = "k".repeat(REPLICANT_CREDENTIAL_MAX_LEN + 1);
-    let too_long_email = "e".repeat(REPLICANT_EMAIL_MAX_LEN + 1);
-    assert_eq!(
-        store_credentials(dir.path(), "a@b.c", &too_long_key, &user_id),
-        SyncResult::ErrorInvalidInput
-    );
-    assert_eq!(
-        store_credentials(dir.path(), &too_long_email, "rpa_k", &user_id),
-        SyncResult::ErrorInvalidInput
-    );
-    let longest_key = "k".repeat(REPLICANT_CREDENTIAL_MAX_LEN);
-    assert_eq!(
-        store_credentials(dir.path(), "a@b.c", &longest_key, &user_id),
-        SyncResult::Success
-    );
-    assert_eq!(load_credentials(dir.path()).1[0], longest_key);
-    let mut small = [0 as c_char; 8];
-    let mut secret = [0 as c_char; REPLICANT_CREDENTIAL_MAX_LEN + 1];
-    let mut uid = [0 as c_char; REPLICANT_USER_ID_LEN + 1];
-    assert_eq!(
-        unsafe {
-            replicant_load_credentials(
-                c(dir.path().to_str().unwrap()).as_ptr(),
-                small.as_mut_ptr(),
-                small.len(),
-                secret.as_mut_ptr(),
-                secret.len(),
-                uid.as_mut_ptr(),
-                uid.len(),
-            )
-        },
-        SyncResult::ErrorBufferTooSmall
-    );
-}
-
 /// A claim server answering `status` (with credentials on 200) and expecting `hits` calls.
 fn claim_server(status: u16, hits: u64) -> (tokio::runtime::Runtime, wiremock::MockServer, Uuid) {
     use wiremock::matchers::{method, path};
@@ -887,15 +777,14 @@ fn a_claim_stores_the_credentials_and_returns_only_the_user_id() {
         claim(&server, dir.path()),
         (SyncResult::Success, user_id.to_string())
     );
+    let stored = secret_store::load(dir.path()).unwrap().unwrap();
     assert_eq!(
-        load_credentials(dir.path()),
+        (stored.api_key, stored.secret, stored.user_id, stored.email),
         (
-            SyncResult::Success,
-            [
-                "rpa_claimed".to_string(),
-                "rps_claimed".to_string(),
-                user_id.to_string()
-            ]
+            "rpa_claimed".to_string(),
+            "rps_claimed".to_string(),
+            user_id,
+            Some("a@b.c".to_string())
         )
     );
     runtime.block_on(server.verify());
@@ -919,7 +808,7 @@ fn a_rejected_code_has_its_own_result() {
     let (runtime, server, _) = claim_server(401, 1);
     let dir = tempfile::tempdir().unwrap();
     assert_eq!(claim(&server, dir.path()).0, SyncResult::ErrorTokenRejected);
-    assert_eq!(load_credentials(dir.path()).0, SyncResult::ErrorNotFound);
+    assert!(secret_store::load(dir.path()).unwrap().is_none());
     runtime.block_on(server.verify());
 }
 
