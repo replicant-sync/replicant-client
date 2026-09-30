@@ -1032,6 +1032,31 @@ async fn a_skewed_clock_joins_on_the_second_try_without_an_error() {
         "the second join is signed with the server's clock: {joins:?}"
     );
     assert_eq!(server.stats.upgrades(), 1, "on the same socket");
+
+    server.drop_connections();
+    let join_times = || {
+        server
+            .frames()
+            .into_iter()
+            .filter(|frame| frame.event == "phx_join")
+            .map(|frame| frame.payload["timestamp"].as_i64().unwrap())
+            .collect::<Vec<i64>>()
+    };
+    eventually("the reconnect joins", || async {
+        jump(Duration::from_millis(2100)).await;
+        join_times().len() >= 3
+    })
+    .await;
+    wait_for(&mut events, "SyncCompleted after the reconnect", |event| {
+        *event == EngineEvent::Lifecycle(Lifecycle::SyncCompleted)
+    })
+    .await;
+    let joins = join_times();
+    assert_eq!(joins.len(), 3, "the reconnect joins first time: {joins:?}");
+    assert!(
+        (joins[2] - joins[0] - 3600).abs() <= 5,
+        "the learnt offset signs the next join: {joins:?}"
+    );
     engine.stop().await;
 }
 

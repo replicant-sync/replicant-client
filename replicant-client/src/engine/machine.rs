@@ -683,7 +683,7 @@ impl Core {
                             self.close_socket(fx);
                             self.halt(reason, fx);
                         }
-                        // The driver signs this join with the server's clock.
+                        // The driver signs the re-sent join with the server's clock.
                         None if e.code == "clock_skew"
                             && e.server_time.is_some()
                             && !skew_retried =>
