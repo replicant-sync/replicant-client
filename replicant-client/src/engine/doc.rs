@@ -268,13 +268,14 @@ fn apply_upsert(
     if pending && doc.read_only {
         if delete_pending(snap) {
             // A publication cannot be deleted through sync: it stays visible and read-only,
-            // like every subscriber's copy, and the pending delete is dropped. Edits made
-            // before the delete are kept; with no shadow, any content that differs is kept.
+            // like every subscriber's copy, and the pending delete is dropped. Local content
+            // is kept only if the publication replaced it and the user had edited it.
             let local = content_hash(&snap.content);
-            let edited = match &snap.shadow {
-                Some(shadow) => content_hash(&shadow.content) != local,
-                None => content_hash(&doc.content) != local,
-            };
+            let edited = content_hash(&doc.content) != local
+                && snap
+                    .shadow
+                    .as_ref()
+                    .is_none_or(|shadow| content_hash(&shadow.content) != local);
             if edited {
                 ops.push(DocOp::Recover {
                     content: snap.content.clone(),
@@ -1470,6 +1471,93 @@ mod apply_change_tests {
         assert!(after.exists && !after.soft_deleted && after.read_only);
         assert!(after.rows.is_empty());
         assert_eq!(after.content, json!({"a": 2}));
+    }
+
+    fn published(content: serde_json::Value, seq: i64) -> Change {
+        let mut c = upsert("collection:curated", content, seq);
+        c.doc.as_mut().unwrap().read_only = true;
+        c
+    }
+
+    #[test]
+    fn a_publication_equal_to_the_local_edit_keeps_no_copy() {
+        let mut s = synced(json!({"a": 1}), 1);
+        s.content = json!({"a": 9});
+        s.soft_deleted = true;
+        s.rows = vec![row(4, RowKind::Update), row(5, RowKind::Delete)];
+        s.unacked_upload = Some(m(4));
+        let ops = apply_change(&s, &published(json!({"a": 9}), 3), ME, &APPEND);
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, DocOp::Recover { .. } | DocOp::Emit(_))),
+            "{ops:?}"
+        );
+        let after = s.project(&ops);
+        assert!(after.exists && !after.soft_deleted && after.read_only);
+        assert!(after.rows.is_empty());
+    }
+
+    #[test]
+    fn a_parked_delete_of_a_never_shadowed_document_is_undone_by_a_publication() {
+        let mut s = synced(json!({"a": 1}), 1);
+        s.shadow = None;
+        s.soft_deleted = true;
+        let mut create = row(4, RowKind::Create);
+        create.parked = true;
+        let mut delete = row(5, RowKind::Delete);
+        delete.parked = true;
+        s.rows = vec![create, delete];
+        let ops = apply_change(&s, &published(json!({"a": 1}), 3), ME, &APPEND);
+        let after = s.project(&ops);
+        assert!(after.exists && !after.soft_deleted && after.read_only && after.rows.is_empty());
+        assert!(!ops
+            .iter()
+            .any(|op| matches!(op, DocOp::Recover { .. } | DocOp::Emit(_))));
+        let ops = apply_change(&s, &published(json!({"a": 2}), 3), ME, &APPEND);
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"a": 1}),
+            reason: RecoverReason::DeletePublication
+        }));
+        assert_eq!(
+            ops.iter().filter(|op| matches!(op, DocOp::Emit(_))).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_echo_of_our_own_update_as_a_publication_unhides_a_document_deleted_after() {
+        let mut s = synced(json!({"a": 1}), 1);
+        s.content = json!({"a": 9});
+        s.soft_deleted = true;
+        s.rows = vec![row(4, RowKind::Update), row(5, RowKind::Delete)];
+        s.unacked_upload = Some(m(4));
+        let mut c = published(json!({"a": 9}), 3);
+        c.seq = 2;
+        c.scope = "own".into();
+        c.upload_id = Some(m(4));
+        let ops = apply_change(&s, &c, ME, &APPEND);
+        let after = s.project(&ops);
+        assert!(
+            after.exists && !after.soft_deleted && after.read_only && after.rows.is_empty(),
+            "{ops:?}"
+        );
+    }
+
+    #[test]
+    fn a_server_copy_that_is_a_publication_over_a_never_shadowed_delete_keeps_the_local_content() {
+        let mut s = synced(json!({"a": 1}), 1);
+        s.shadow = None;
+        s.soft_deleted = true;
+        s.rows = vec![row(5, RowKind::Delete)];
+        let mut e = env(json!({"a": 2}), 3);
+        e.read_only = true;
+        let ops = apply_server_copy(&s, &e, ME, &APPEND);
+        let after = s.project(&ops);
+        assert!(after.exists && !after.soft_deleted && after.read_only && after.rows.is_empty());
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"a": 1}),
+            reason: RecoverReason::DeletePublication
+        }));
     }
 
     #[test]
