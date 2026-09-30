@@ -60,7 +60,9 @@ private:
  * Never unload the library while the process runs (see replicant_destroy in replicant.h).
  *
  * Callbacks are raw C function pointers with a context pointer that must outlive the Client.
- * They must not throw. Registering a kind again replaces its callback; a null callback
+ * They must not throw; Client methods throw SyncException, so catch inside a callback. The
+ * context must not be the Client itself: a Client can be moved, which leaves the pointer stale.
+ * Registering a kind again replaces its callback; a null callback
  * removes it. The first register_*_callback call binds the calling thread; every later
  * register_*_callback and process_events must run on that thread, or they throw
  * SyncException with ReplicantSyncResult_ErrorWrongThread.
@@ -83,23 +85,25 @@ public:
     /** Opens the data dir (migrating it after an upgrade). Throws SyncException; its result()
         is ReplicantSyncResult_ErrorNewerSchema when a newer build migrated the database, and
         ReplicantSyncResult_ErrorInvalidInput for a list merge config the engine refuses
-        (ReplicantListMerge_Full, a malformed rule) or when the library's ABI major differs from
-        this header's or its minor is older. Call state() next. */
+        (ReplicantListMerge_Full, a malformed rule). It is also ErrorInvalidInput when the
+        library's ABI major differs from this header's or its minor is older: the library and
+        header were packaged from different versions. Call state() next. */
     explicit Client(const Config& config)
     {
         const uint32_t abi_version = replicant_abi_version();
-        const uint32_t abi_minor = abi_version & 0xFFFFu;
-        if ((abi_version >> 16) != REPLICANT_ABI_VERSION_MAJOR || abi_minor < static_cast<uint32_t>(REPLICANT_ABI_VERSION_MINOR))
+        if ((abi_version >> 16) != REPLICANT_ABI_VERSION_MAJOR
+            || abi_version < ((uint32_t {REPLICANT_ABI_VERSION_MAJOR} << 16) | REPLICANT_ABI_VERSION_MINOR))
             throw SyncException(ReplicantSyncResult_ErrorInvalidInput);
-        const ReplicantConfig c_config {static_cast<uint32_t>(sizeof(ReplicantConfig)),
-                                        config.data_dir.c_str(),
-                                        config.database_file.c_str(),
-                                        config.server_url.c_str(),
-                                        config.email.empty() ? nullptr : config.email.c_str(),
-                                        config.host_app.c_str(),
-                                        config.host_version.c_str(),
-                                        static_cast<int32_t>(config.list_merge),
-                                        config.list_merge_rules_json.empty() ? nullptr : config.list_merge_rules_json.c_str()};
+        ReplicantConfig c_config {};
+        c_config.struct_size = static_cast<uint32_t>(sizeof(ReplicantConfig));
+        c_config.data_dir = config.data_dir.c_str();
+        c_config.database_file = config.database_file.c_str();
+        c_config.server_url = config.server_url.c_str();
+        c_config.email = config.email.empty() ? nullptr : config.email.c_str();
+        c_config.host_app = config.host_app.c_str();
+        c_config.host_version = config.host_version.c_str();
+        c_config.list_merge = static_cast<int32_t>(config.list_merge);
+        c_config.list_merge_rules_json = config.list_merge_rules_json.empty() ? nullptr : config.list_merge_rules_json.c_str();
         Replicant* raw_handle = nullptr;
         check(replicant_create(&c_config, &raw_handle));
         m_handle.reset(raw_handle);
@@ -288,11 +292,10 @@ private:
 
     static std::string take_string(char* text)
     {
-        if (text == nullptr)
+        const std::unique_ptr<char, decltype(&replicant_string_free)> owned(text, &replicant_string_free);
+        if (owned == nullptr)
             return {};
-        std::string copy(text);
-        replicant_string_free(text);
-        return copy;
+        return std::string(owned.get());
     }
 
     Replicant* raw() const { return m_handle.get(); }
