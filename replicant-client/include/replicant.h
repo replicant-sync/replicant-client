@@ -187,7 +187,7 @@ enum ReplicantErrorCode
    */
   ReplicantErrorCode_DeleteRefused = 5008,
   /**
-   * The local database failed while checking a join.
+   * The local database failed while checking a join; not fatal, the engine retries.
    */
   ReplicantErrorCode_LocalDatabase = 6001,
 };
@@ -343,12 +343,12 @@ typedef struct ReplicantConfig {
    */
   const char *data_dir;
   /**
-   * File name inside `data_dir`, e.g. "tonaldb.sqlite3".
+   * File name inside `data_dir`, e.g. "tonaldb.sqlite3"; a path separator or `..` is refused.
    */
   const char *database_file;
   const char *server_url;
   /**
-   * May be null. Signs joins when the stored credentials carry no email.
+   * May be null (`""` counts as null). Signs joins when the stored credentials carry no email.
    */
   const char *email;
   /**
@@ -382,7 +382,8 @@ typedef struct ReplicantState {
 } ReplicantState;
 
 /**
- * `DocumentChanged` / `DocumentDeleted`. For a deletion only `document_id` is set.
+ * `DocumentChanged` / `DocumentDeleted`. For a deletion only `document_id` is set; for a change
+ * `title`, `owner_id` and `author_id` may be null.
  * `visibility` is `public` (curated or read-only) or `private`.
  * Strings are valid only during the call; copy what you keep.
  */
@@ -435,7 +436,8 @@ typedef void (*ReplicantConnectionEventCallback)(ReplicantEventType event_type,
 
 /**
  * `reason`: `conflict`, `field_conflict`, `delete_wins` or `delete_superseded` (a delete undone
- * because a newer version arrived). `recovered_id` is the Kept copies id, -1 if none.
+ * because a newer version arrived). `recovered_id` is the Kept copies id, or -1 when nothing
+ * was kept.
  * A kept copy's reason is one of `conflict`, `field_conflict`, `delete_wins`,
  * `delete_superseded`, `delete_refused`, `delete_publication`, `became_publication`,
  * `create_rejected` or `unmigratable` (set aside while upgrading the database, with no event).
@@ -459,6 +461,7 @@ extern "C" {
 
 /**
  * Whether `code` (a `ReplicantErrorCode`) means the credentials were refused or are missing.
+ * Never clear the stored credentials because of this: a sign-out is always explicit.
  */
 bool replicant_error_is_credential_rejection(int32_t code);
 
@@ -580,15 +583,17 @@ ReplicantSyncResult replicant_get_all_document_ids(struct Replicant *handle,
 ReplicantSyncResult replicant_count_documents(struct Replicant *handle, uint64_t *out_count);
 
 /**
- * Documents with changes the server has not acknowledged, except parked ones (`replicant_list_parked`).
+ * Documents with changes the server has not acknowledged, except parked ones
+ * (`replicant_list_parked`).
  *
  * # Safety
  * Valid handle and out pointer.
  */
-ReplicantSyncResult replicant_count_pending_sync(struct Replicant *handle,
-                                                 uint64_t *out_count);
+ReplicantSyncResult replicant_count_pending_sync(struct Replicant *handle, uint64_t *out_count);
 
 /**
+ * Whether the engine is connected now. `replicant_get_state` says more.
+ *
  * # Safety
  * `handle` must be valid or null.
  */
@@ -765,6 +770,9 @@ ReplicantSyncResult replicant_register_conflict_callback(struct Replicant *handl
  * the rest of the batch is not delivered. A call from inside a callback returns
  * `ErrorInvalidInput`. No rebind: if the registering thread ends, register again on a new
  * handle.
+ *
+ * Callbacks must not throw or unwind. Inside a callback every call is allowed except
+ * `replicant_process_events` on the same handle; a `replicant_destroy` of it is deferred.
  *
  * # Safety
  * Valid handle; `out_processed_count` may be null.

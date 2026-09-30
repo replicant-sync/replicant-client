@@ -35,7 +35,7 @@ pub enum ReplicantErrorCode {
     /// Reserved: a delete the server refused (the document is back). Not emitted before 0.8;
     /// until then a refused delete arrives as `Validation`, `Forbidden` or `TooLarge`.
     DeleteRefused = 5008,
-    /// The local database failed while checking a join.
+    /// The local database failed while checking a join; not fatal, the engine retries.
     LocalDatabase = 6001,
 }
 
@@ -68,6 +68,7 @@ pub fn is_credential_rejection(code: ReplicantErrorCode) -> bool {
 }
 
 /// Whether `code` (a `ReplicantErrorCode`) means the credentials were refused or are missing.
+/// Never clear the stored credentials because of this: a sign-out is always explicit.
 #[no_mangle]
 pub extern "C" fn replicant_error_is_credential_rejection(code: i32) -> bool {
     (1000..2000).contains(&code)

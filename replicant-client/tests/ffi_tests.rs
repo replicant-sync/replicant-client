@@ -794,6 +794,30 @@ fn the_version_string_is_static() {
 }
 
 #[test]
+fn a_failed_read_leaves_its_out_pointer_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = open(dir.path());
+    let mut out = ptr::dangling_mut::<c_char>();
+    assert_eq!(
+        unsafe {
+            replicant_get_document(handle, c(&Uuid::new_v4().to_string()).as_ptr(), &mut out)
+        },
+        SyncResult::ErrorNotFound
+    );
+    assert!(out.is_null());
+    close(handle);
+}
+
+#[test]
+fn a_config_email_that_is_not_utf8_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let bad = CString::new(vec![0xFF, 0xFE]).unwrap();
+    let (result, handle) = create_with(dir.path(), |config| config.email = bad.as_ptr());
+    assert_eq!(result, SyncResult::ErrorInvalidInput);
+    assert!(handle.is_null());
+}
+
+#[test]
 fn a_config_or_state_smaller_than_this_version_is_refused() {
     assert_eq!(
         replicant_abi_version(),

@@ -56,7 +56,8 @@ impl From<Origin> for EventOrigin {
     }
 }
 
-/// `DocumentChanged` / `DocumentDeleted`. For a deletion only `document_id` is set.
+/// `DocumentChanged` / `DocumentDeleted`. For a deletion only `document_id` is set; for a change
+/// `title`, `owner_id` and `author_id` may be null.
 /// `visibility` is `public` (curated or read-only) or `private`.
 /// Strings are valid only during the call; copy what you keep.
 pub type ReplicantDocumentEventCallback = Option<
@@ -151,7 +152,8 @@ type ConnectionFn = extern "C" fn(
 );
 
 /// `reason`: `conflict`, `field_conflict`, `delete_wins` or `delete_superseded` (a delete undone
-/// because a newer version arrived). `recovered_id` is the Kept copies id, -1 if none.
+/// because a newer version arrived). `recovered_id` is the Kept copies id, or -1 when nothing
+/// was kept.
 /// A kept copy's reason is one of `conflict`, `field_conflict`, `delete_wins`,
 /// `delete_superseded`, `delete_refused`, `delete_publication`, `became_publication`,
 /// `create_rejected` or `unmigratable` (set aside while upgrading the database, with no event).

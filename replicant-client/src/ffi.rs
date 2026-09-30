@@ -114,10 +114,10 @@ pub struct ReplicantConfig {
     pub struct_size: u32,
     /// Holds the database file and the stored credentials.
     pub data_dir: *const c_char,
-    /// File name inside `data_dir`, e.g. "tonaldb.sqlite3".
+    /// File name inside `data_dir`, e.g. "tonaldb.sqlite3"; a path separator or `..` is refused.
     pub database_file: *const c_char,
     pub server_url: *const c_char,
-    /// May be null. Signs joins when the stored credentials carry no email.
+    /// May be null (`""` counts as null). Signs joins when the stored credentials carry no email.
     pub email: *const c_char,
     /// Named in the User-Agent, e.g. "Entonal Studio" and "2.0.1 CLAP".
     pub host_app: *const c_char,
@@ -338,6 +338,13 @@ unsafe fn write_id(out: *mut c_char, id: Uuid) {
     out.add(text.len()).write(0);
 }
 
+/// Nulls a caller's out pointer first, so it is null after any failure.
+unsafe fn clear_out(out: *mut *mut c_char) {
+    if !out.is_null() {
+        *out = ptr::null_mut();
+    }
+}
+
 /// Hands `value` to the caller as JSON; free it with `replicant_string_free`.
 unsafe fn write_json(out: *mut *mut c_char, value: &impl Serialize) -> SyncResult {
     match serde_json::to_string(value)
@@ -389,14 +396,18 @@ pub unsafe extern "C" fn replicant_create(
         else {
             return SyncResult::ErrorInvalidInput;
         };
-        let Some(list_merge) = list_merge_arg(config) else {
+        let (Some(list_merge), Ok(fallback_email)) =
+            (list_merge_arg(config), nullable_str_arg(config.email))
+        else {
             return SyncResult::ErrorInvalidInput;
         };
         let host_config = HostConfig {
             data_dir: PathBuf::from(data_dir),
             database_file: database_file.to_string(),
             server_url: server_url.to_string(),
-            fallback_email: str_arg(config.email).map(str::to_string),
+            fallback_email: fallback_email
+                .filter(|email| !email.is_empty())
+                .map(str::to_string),
             host_app: host_app.to_string(),
             host_version: host_version.to_string(),
             list_merge,
@@ -640,6 +651,7 @@ pub unsafe extern "C" fn replicant_get_document(
     out_json: *mut *mut c_char,
 ) -> SyncResult {
     guard(|| {
+        clear_out(out_json);
         let (false, false, Some(doc_id)) =
             (handle.is_null(), out_json.is_null(), uuid_arg(document_id))
         else {
@@ -665,6 +677,7 @@ pub unsafe extern "C" fn replicant_get_all_documents(
     out_json: *mut *mut c_char,
 ) -> SyncResult {
     guard(|| {
+        clear_out(out_json);
         if handle.is_null() || out_json.is_null() {
             return SyncResult::ErrorInvalidInput;
         }
@@ -688,6 +701,7 @@ pub unsafe extern "C" fn replicant_get_all_document_ids(
     out_json: *mut *mut c_char,
 ) -> SyncResult {
     guard(|| {
+        clear_out(out_json);
         if handle.is_null() || out_json.is_null() {
             return SyncResult::ErrorInvalidInput;
         }
@@ -726,7 +740,8 @@ pub unsafe extern "C" fn replicant_count_documents(
     })
 }
 
-/// Documents with changes the server has not acknowledged, except parked ones (`replicant_list_parked`).
+/// Documents with changes the server has not acknowledged, except parked ones
+/// (`replicant_list_parked`).
 ///
 /// # Safety
 /// Valid handle and out pointer.
@@ -751,6 +766,8 @@ pub unsafe extern "C" fn replicant_count_pending_sync(
     })
 }
 
+/// Whether the engine is connected now. `replicant_get_state` says more.
+///
 /// # Safety
 /// `handle` must be valid or null.
 #[no_mangle]
@@ -814,6 +831,7 @@ pub unsafe extern "C" fn replicant_get_user_id(
     out_user_id: *mut *mut c_char,
 ) -> SyncResult {
     guard(|| {
+        clear_out(out_user_id);
         if handle.is_null() || out_user_id.is_null() {
             return SyncResult::ErrorInvalidInput;
         }
@@ -870,6 +888,7 @@ pub unsafe extern "C" fn replicant_search_documents(
     out_json: *mut *mut c_char,
 ) -> SyncResult {
     guard(|| {
+        clear_out(out_json);
         let (false, false, Some(query)) = (handle.is_null(), out_json.is_null(), str_arg(query))
         else {
             return SyncResult::ErrorInvalidInput;
@@ -931,6 +950,7 @@ pub unsafe extern "C" fn replicant_list_recovered(
     out_json: *mut *mut c_char,
 ) -> SyncResult {
     guard(|| {
+        clear_out(out_json);
         if handle.is_null() || out_json.is_null() {
             return SyncResult::ErrorInvalidInput;
         }
@@ -1062,6 +1082,7 @@ pub unsafe extern "C" fn replicant_list_parked(
     out_json: *mut *mut c_char,
 ) -> SyncResult {
     guard(|| {
+        clear_out(out_json);
         if handle.is_null() || out_json.is_null() {
             return SyncResult::ErrorInvalidInput;
         }
@@ -1189,6 +1210,9 @@ pub unsafe extern "C" fn replicant_register_conflict_callback(
 /// the rest of the batch is not delivered. A call from inside a callback returns
 /// `ErrorInvalidInput`. No rebind: if the registering thread ends, register again on a new
 /// handle.
+///
+/// Callbacks must not throw or unwind. Inside a callback every call is allowed except
+/// `replicant_process_events` on the same handle; a `replicant_destroy` of it is deferred.
 ///
 /// # Safety
 /// Valid handle; `out_processed_count` may be null.
