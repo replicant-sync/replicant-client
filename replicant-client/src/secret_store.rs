@@ -116,6 +116,14 @@ fn sync_dir(dir: &Path) {
     let _ = dir;
 }
 
+/// Checks that `store` can write in `dir`: creates it and the key, then writes and removes a
+/// probe file.
+pub fn prepare(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    load_or_create_key(dir)?;
+    std::fs::remove_file(write_temp(&dir.join(CRED_FILE), &[])?)
+}
+
 pub fn store(dir: &Path, creds: &Credentials) -> io::Result<()> {
     let key = load_or_create_key(dir)?;
     let cipher = ChaCha20Poly1305::new((&key).into());
@@ -140,10 +148,7 @@ pub fn load(dir: &Path) -> io::Result<Option<Credentials>> {
     }
     // Never mint a key on the read path: an existing credentials file
     // without a key is a broken/tampered state, not a "first run".
-    let key = match read_key(dir)? {
-        Some(key) => key,
-        None => return Ok(None),
-    };
+    let key = read_key(dir)?.ok_or_else(|| Error::new(ErrorKind::NotFound, "key missing"))?;
     let cipher = ChaCha20Poly1305::new((&key).into());
 
     let bytes = std::fs::read(&path)?;
@@ -230,6 +235,27 @@ mod tests {
             "load() must never mint a key"
         );
         assert!(!dir.path().join(CRED_FILE).exists());
+    }
+
+    #[test]
+    fn credentials_without_their_key_are_unreadable_not_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        store(
+            dir.path(),
+            &Credentials {
+                api_key: "a".into(),
+                secret: "b".into(),
+                user_id: uuid::Uuid::new_v4(),
+                email: None,
+            },
+        )
+        .unwrap();
+        std::fs::remove_file(dir.path().join(KEY_FILE)).unwrap();
+        assert!(load(dir.path()).is_err());
+        assert!(
+            !dir.path().join(KEY_FILE).exists(),
+            "load() must never mint a key"
+        );
     }
 
     #[test]

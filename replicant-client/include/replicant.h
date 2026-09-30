@@ -48,6 +48,11 @@ namespace replicant {
  */
 #define REPLICANT_USER_ID_LEN 36
 
+/**
+ * A document id's length; its buffer needs one more for the NUL.
+ */
+#define REPLICANT_DOCUMENT_ID_LEN 36
+
 enum ReplicantEventOrigin
 #ifdef __cplusplus
   : int32_t
@@ -317,6 +322,10 @@ enum ReplicantSyncResult
    * An output buffer is smaller than the value plus its NUL; see the `REPLICANT_*_LEN` limits.
    */
   ReplicantSyncResult_ErrorBufferTooSmall = -15,
+  /**
+   * The server refused the enrollment code (wrong or expired): ask for a new one.
+   */
+  ReplicantSyncResult_ErrorTokenRejected = -16,
   ReplicantSyncResult_ErrorUnknown = -99,
 };
 #ifndef __cplusplus
@@ -512,10 +521,10 @@ bool replicant_destroy_and_wait(struct Replicant *handle, uint32_t timeout_ms);
 
 /**
  * Creates a document owned by the signed-in (or provisional) user; writes its id into
- * `out_document_id` (37 bytes).
+ * `out_document_id` (`REPLICANT_DOCUMENT_ID_LEN + 1` bytes).
  *
  * # Safety
- * Valid handle, C string, and a 37-byte buffer.
+ * Valid handle, C string, and a `REPLICANT_DOCUMENT_ID_LEN + 1`-byte buffer.
  */
 ReplicantSyncResult replicant_create_document(struct Replicant *handle,
                                               const char *content_json,
@@ -672,12 +681,12 @@ ReplicantSyncResult replicant_dismiss_recovered(struct Replicant *handle, int64_
 
 /**
  * Re-creates a kept copy's full content as a new document, with a new id written to
- * `out_document_id` (37 bytes), and removes the copy. Works for any copy, a field copy too
- * (the way out when its document is gone). `ErrorNotFound` when the copy is gone (another
- * process may have dismissed or restored it).
+ * `out_document_id` (`REPLICANT_DOCUMENT_ID_LEN + 1` bytes), and removes the copy. Works for
+ * any copy, a field copy too (the way out when its document is gone). `ErrorNotFound` when the
+ * copy is gone (another process may have dismissed or restored it).
  *
  * # Safety
- * Valid handle and a 37-byte buffer.
+ * Valid handle and a `REPLICANT_DOCUMENT_ID_LEN + 1`-byte buffer.
  */
 ReplicantSyncResult replicant_restore_document(struct Replicant *handle,
                                                int64_t recovered_id,
@@ -710,8 +719,11 @@ ReplicantSyncResult replicant_list_parked(struct Replicant *handle, char **out_j
 /**
  * `event_filter`: -1 every document event, 1 `DocumentChanged` only, 2 `DocumentDeleted` only.
  * One callback per kind: registering again replaces the previous callback, filter and context;
- * a null callback removes it (its events are then dropped when pumped). The first registration
- * on a handle, of any kind, fixes the thread that must call `replicant_process_events`.
+ * a null callback removes it (its events are then dropped when pumped). Once this returns, the
+ * old context is never called again, even for the rest of a batch being pumped. The first
+ * registration on a handle, of any kind and even a null one, binds its thread: later
+ * registrations and `replicant_process_events` must come from that thread
+ * (`ErrorWrongThread` otherwise).
  *
  * # Safety
  * Valid handle; `context` must outlive the handle.
@@ -763,9 +775,9 @@ ReplicantSyncResult replicant_register_conflict_callback(struct Replicant *handl
                                                          void *context);
 
 /**
- * Runs the callbacks for every queued event. Must be called on the thread that registered
- * the callbacks: refused with `ErrorWrongThread` elsewhere and `ErrorNoCallbacks` before any
- * registration; nothing is lost either way. The thread cannot be changed later. A
+ * Runs the callbacks for every queued event. Must be called on the thread of the handle's first
+ * registration (a null one binds too): refused with `ErrorWrongThread` elsewhere and
+ * `ErrorNoCallbacks` before any registration; nothing is lost either way. The thread cannot be changed later. A
  * `replicant_destroy` of this handle from inside a callback frees it when this call returns;
  * the rest of the batch is not delivered. A call from inside a callback returns
  * `ErrorInvalidInput`. No rebind: if the registering thread ends, register again on a new
@@ -802,28 +814,32 @@ const char *replicant_get_version(void);
 ReplicantSyncResult replicant_enroll_request(const char *base_url, const char *email);
 
 /**
- * Exchanges an enrollment token for credentials and stores them in `data_dir` with `email`,
- * as `replicant_store_credentials` does, before writing the api key, secret and user id into
- * the buffers (each `*_cap` is its buffer's size). A buffer too small for its value is
- * `ErrorBufferTooSmall`, and the credentials are stored all the same: the token is spent.
- * `ErrorInvalidInput`: the token was refused. `ErrorSerialization`: the server's reply was bad.
- * `ErrorConnection`: the server could not be reached. Out buffers are only valid on `Success`.
+ * Exchanges an enrollment code for credentials and stores them in `data_dir` with `email`, as
+ * `replicant_store_credentials` does; the api key and secret never leave the library. Writes the
+ * user id into `out_user_id` (`user_id_cap` bytes, at least `REPLICANT_USER_ID_LEN + 1`).
+ * Results:
+ * - `Success`: stored; this process's engines on `data_dir` sign in.
+ * - `ErrorInvalidInput`: a null or non-UTF-8 argument, an empty or over-long email, or a
+ *   `base_url` that is not https (localhost excepted). The server is not contacted.
+ * - `ErrorBufferTooSmall`: `user_id_cap` is too small. The server is not contacted.
+ * - `ErrorDatabase`: `data_dir` cannot hold credentials. This is checked before the server is
+ *   contacted, so the code stays valid; if storing still fails after the claim, the code was
+ *   used: request a new one.
+ * - `ErrorTokenRejected`: the server refused the code (wrong or expired).
+ * - `ErrorConnection`: the server could not be reached or failed.
+ * - `ErrorSerialization`: the server's reply was not valid credentials.
  *
  * Blocks the calling thread for the HTTP round trip (up to about 10 s to connect and 30 s for
  * the request); never call it from an audio or UI thread.
  *
  * # Safety
- * All string pointers must be valid, non-null C strings; each out pointer
- * must reference a writable buffer of at least its stated capacity.
+ * All string pointers must be valid, non-null C strings; `out_user_id` must reference a
+ * writable buffer of at least `user_id_cap` bytes.
  */
 ReplicantSyncResult replicant_enroll_claim(const char *base_url,
                                            const char *data_dir,
                                            const char *email,
                                            const char *token,
-                                           char *out_api_key,
-                                           size_t api_key_cap,
-                                           char *out_secret,
-                                           size_t secret_cap,
                                            char *out_user_id,
                                            size_t user_id_cap);
 

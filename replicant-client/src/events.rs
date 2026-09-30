@@ -212,7 +212,9 @@ unsafe impl Send for Callbacks {}
 #[derive(Default)]
 pub struct Dispatcher(Mutex<Callbacks>);
 
-/// Each `register_*` replaces the kind's previous callback and context; `None` removes it.
+/// Each `register_*` replaces the kind's previous callback and context; `None` removes it. The
+/// first registration binds the calling thread; later ones from another thread are refused, so a
+/// change never races a pump and applies from the next event on.
 impl Dispatcher {
     /// `filter`: one of `DocumentChanged` / `DocumentDeleted`, or every document event.
     pub fn register_document(
@@ -220,44 +222,66 @@ impl Dispatcher {
         callback: Option<DocumentFn>,
         context: *mut c_void,
         filter: Option<EventType>,
-    ) {
-        self.bind().document = callback.map(|callback| (Registered { callback, context }, filter));
+    ) -> Result<(), DispatchError> {
+        self.bind()?.document = callback.map(|callback| (Registered { callback, context }, filter));
+        Ok(())
     }
 
-    pub fn register_sync(&self, callback: Option<SyncFn>, context: *mut c_void) {
-        self.bind().sync = callback.map(|callback| Registered { callback, context });
+    pub fn register_sync(
+        &self,
+        callback: Option<SyncFn>,
+        context: *mut c_void,
+    ) -> Result<(), DispatchError> {
+        self.bind()?.sync = callback.map(|callback| Registered { callback, context });
+        Ok(())
     }
 
-    pub fn register_error(&self, callback: Option<ErrorFn>, context: *mut c_void) {
-        self.bind().error = callback.map(|callback| Registered { callback, context });
+    pub fn register_error(
+        &self,
+        callback: Option<ErrorFn>,
+        context: *mut c_void,
+    ) -> Result<(), DispatchError> {
+        self.bind()?.error = callback.map(|callback| Registered { callback, context });
+        Ok(())
     }
 
-    pub fn register_connection(&self, callback: Option<ConnectionFn>, context: *mut c_void) {
-        self.bind().connection = callback.map(|callback| Registered { callback, context });
+    pub fn register_connection(
+        &self,
+        callback: Option<ConnectionFn>,
+        context: *mut c_void,
+    ) -> Result<(), DispatchError> {
+        self.bind()?.connection = callback.map(|callback| Registered { callback, context });
+        Ok(())
     }
 
-    pub fn register_conflict(&self, callback: Option<ConflictFn>, context: *mut c_void) {
-        self.bind().conflict = callback.map(|callback| Registered { callback, context });
+    pub fn register_conflict(
+        &self,
+        callback: Option<ConflictFn>,
+        context: *mut c_void,
+    ) -> Result<(), DispatchError> {
+        self.bind()?.conflict = callback.map(|callback| Registered { callback, context });
+        Ok(())
     }
 
-    fn bind(&self) -> std::sync::MutexGuard<'_, Callbacks> {
+    fn bind(&self) -> Result<std::sync::MutexGuard<'_, Callbacks>, DispatchError> {
         let mut callbacks = lock(&self.0);
-        callbacks
-            .thread
-            .get_or_insert_with(|| thread::current().id());
-        callbacks
+        let current = thread::current().id();
+        if *callbacks.thread.get_or_insert(current) != current {
+            return Err(DispatchError::WrongThread);
+        }
+        Ok(callbacks)
     }
 
     /// Runs the callbacks for the events `take` hands over, stopping early once `stop()` is
     /// true; returns the number delivered. Refused, and nothing taken, before any registration
-    /// or off the registering thread.
+    /// or off the registering thread. Each event reads the callbacks afresh, so a registration
+    /// made by a callback applies to the rest of the batch.
     pub fn process(
         &self,
         take: impl FnOnce() -> Vec<HostEvent>,
         stop: impl Fn() -> bool,
     ) -> Result<usize, DispatchError> {
-        let callbacks = lock(&self.0).clone();
-        match callbacks.thread {
+        match lock(&self.0).thread {
             None => return Err(DispatchError::NoCallbacks),
             Some(registered) if registered != thread::current().id() => {
                 return Err(DispatchError::WrongThread)
@@ -269,6 +293,7 @@ impl Dispatcher {
             if stop() {
                 break;
             }
+            let callbacks = lock(&self.0).clone();
             callbacks.dispatch(&event);
             delivered += 1;
         }
@@ -504,11 +529,17 @@ mod tests {
         let seen: Log = Mutex::new(Vec::new());
         let context = &seen as *const Log as *mut c_void;
         let dispatcher = Dispatcher::default();
-        dispatcher.register_document(Some(on_document), context, None);
-        dispatcher.register_sync(Some(on_sync), context);
-        dispatcher.register_error(Some(on_error), context);
-        dispatcher.register_connection(Some(on_connection), context);
-        dispatcher.register_conflict(Some(on_conflict), context);
+        dispatcher
+            .register_document(Some(on_document), context, None)
+            .unwrap();
+        dispatcher.register_sync(Some(on_sync), context).unwrap();
+        dispatcher.register_error(Some(on_error), context).unwrap();
+        dispatcher
+            .register_connection(Some(on_connection), context)
+            .unwrap();
+        dispatcher
+            .register_conflict(Some(on_conflict), context)
+            .unwrap();
         let doc_id = Uuid::from_u128(1);
         let owner = Uuid::from_u128(0xA);
         let document = StoredDocument {
@@ -601,7 +632,9 @@ mod tests {
             Err(DispatchError::NoCallbacks)
         );
         let seen: Log = Mutex::new(Vec::new());
-        dispatcher.register_sync(Some(on_sync), &seen as *const Log as *mut c_void);
+        dispatcher
+            .register_sync(Some(on_sync), &seen as *const Log as *mut c_void)
+            .unwrap();
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 assert_eq!(

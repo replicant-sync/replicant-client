@@ -634,6 +634,112 @@ fn registering_again_replaces_the_callback_and_null_removes_it() {
     close(handle);
 }
 
+/// What a mid-batch callback change needs: the handle, its own calls, and where to switch.
+struct Switcher {
+    handle: *mut Replicant,
+    calls: AtomicUsize,
+    next: Option<*const Log>,
+}
+
+/// On its first event, replaces itself with `on_document` into `next`, or removes itself.
+extern "C" fn switch_on_first(
+    _: EventType,
+    _: *const c_char,
+    _: *const c_char,
+    _: *const c_char,
+    _: *const c_char,
+    _: *const c_char,
+    _: *const c_char,
+    _: bool,
+    _: EventOrigin,
+    context: *mut c_void,
+) {
+    let switcher = unsafe { &*(context as *const Switcher) };
+    switcher.calls.fetch_add(1, Ordering::SeqCst);
+    let (callback, next_context) = match switcher.next {
+        Some(log) => (Some(on_document as _), log as *mut c_void),
+        None => (None, ptr::null_mut()),
+    };
+    assert_eq!(
+        unsafe {
+            replicant_register_document_callback(switcher.handle, callback, next_context, -1)
+        },
+        SyncResult::Success
+    );
+}
+
+/// Queues four document events, then pumps them in one batch.
+fn pump_four_documents_in_one_batch(handle: *mut Replicant) {
+    for n in 0..4 {
+        create_doc(handle, &format!(r#"{{"n":{n}}}"#));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let mut processed = 0;
+    assert_eq!(
+        unsafe { replicant_process_events(handle, &mut processed) },
+        SyncResult::Success
+    );
+    assert!(processed >= 4, "{processed}");
+}
+
+#[test]
+fn a_callback_that_removes_itself_is_not_called_again_in_the_same_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = open(dir.path());
+    let switcher = Switcher {
+        handle,
+        calls: AtomicUsize::new(0),
+        next: None,
+    };
+    let context = &switcher as *const Switcher as *mut c_void;
+    assert_eq!(
+        unsafe { replicant_register_document_callback(handle, Some(switch_on_first), context, -1) },
+        SyncResult::Success
+    );
+    pump_four_documents_in_one_batch(handle);
+    assert_eq!(switcher.calls.load(Ordering::SeqCst), 1);
+    close(handle);
+}
+
+#[test]
+fn a_callback_replaced_mid_batch_hands_the_rest_of_the_batch_to_the_new_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = open(dir.path());
+    let rest: Log = Mutex::new(Vec::new());
+    let switcher = Switcher {
+        handle,
+        calls: AtomicUsize::new(0),
+        next: Some(&rest),
+    };
+    let context = &switcher as *const Switcher as *mut c_void;
+    assert_eq!(
+        unsafe { replicant_register_document_callback(handle, Some(switch_on_first), context, -1) },
+        SyncResult::Success
+    );
+    pump_four_documents_in_one_batch(handle);
+    assert_eq!(switcher.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(rest.lock().unwrap().len(), 3);
+    close(handle);
+}
+
+#[test]
+fn registering_off_the_bound_thread_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = open(dir.path());
+    assert_eq!(
+        unsafe { replicant_register_document_callback(handle, None, ptr::null_mut(), -1) },
+        SyncResult::Success
+    );
+    let handle_address = handle as usize;
+    let result = std::thread::spawn(move || unsafe {
+        replicant_register_error_callback(handle_address as *mut Replicant, None, ptr::null_mut())
+    })
+    .join()
+    .unwrap();
+    assert_eq!(result, SyncResult::ErrorWrongThread);
+    close(handle);
+}
+
 fn credentials_out(
     call: impl FnOnce(*mut c_char, *mut c_char, *mut c_char) -> SyncResult,
 ) -> (SyncResult, [String; 3]) {
@@ -736,8 +842,8 @@ fn credentials_longer_than_their_limits_are_refused_and_a_short_buffer_has_its_o
     );
 }
 
-#[test]
-fn a_claim_into_a_short_buffer_still_stores_the_credentials() {
+/// A claim server answering `status` (with credentials on 200) and expecting `hits` calls.
+fn claim_server(status: u16, hits: u64) -> (tokio::runtime::Runtime, wiremock::MockServer, Uuid) {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -747,31 +853,40 @@ fn a_claim_into_a_short_buffer_still_stores_the_credentials() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/enroll/claim"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            .respond_with(ResponseTemplate::new(status).set_body_json(json!({
                 "api_key": "rpa_claimed", "secret": "rps_claimed", "user_id": user_id
             })))
-            .expect(1)
+            .expect(hits)
             .mount(&server)
             .await;
         server
     });
-    let dir = tempfile::tempdir().unwrap();
-    let mut small = [0 as c_char; 4];
-    let (result, _) = credentials_out(|_, secret, user_id_out| unsafe {
+    (runtime, server, user_id)
+}
+
+fn claim(server: &wiremock::MockServer, data_dir: &Path) -> (SyncResult, String) {
+    let mut user_id = [0 as c_char; REPLICANT_USER_ID_LEN + 1];
+    let result = unsafe {
         replicant_enroll_claim(
             c(&server.uri()).as_ptr(),
-            c(dir.path().to_str().unwrap()).as_ptr(),
+            c(data_dir.to_str().unwrap()).as_ptr(),
             c("a@b.c").as_ptr(),
             c("TOKEN").as_ptr(),
-            small.as_mut_ptr(),
-            small.len(),
-            secret,
-            REPLICANT_CREDENTIAL_MAX_LEN + 1,
-            user_id_out,
-            REPLICANT_USER_ID_LEN + 1,
+            user_id.as_mut_ptr(),
+            user_id.len(),
         )
-    });
-    assert_eq!(result, SyncResult::ErrorBufferTooSmall);
+    };
+    (result, read(user_id.as_ptr()))
+}
+
+#[test]
+fn a_claim_stores_the_credentials_and_returns_only_the_user_id() {
+    let (runtime, server, user_id) = claim_server(200, 1);
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(
+        claim(&server, dir.path()),
+        (SyncResult::Success, user_id.to_string())
+    );
     assert_eq!(
         load_credentials(dir.path()),
         (
@@ -783,6 +898,28 @@ fn a_claim_into_a_short_buffer_still_stores_the_credentials() {
             ]
         )
     );
+    runtime.block_on(server.verify());
+}
+
+#[test]
+fn a_claim_into_an_unwritable_data_dir_fails_without_spending_the_code() {
+    let (runtime, server, _) = claim_server(200, 0);
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("a-file");
+    std::fs::write(&file, "").unwrap();
+    assert_eq!(
+        claim(&server, &file.join("data")).0,
+        SyncResult::ErrorDatabase
+    );
+    runtime.block_on(server.verify());
+}
+
+#[test]
+fn a_rejected_code_has_its_own_result() {
+    let (runtime, server, _) = claim_server(401, 1);
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(claim(&server, dir.path()).0, SyncResult::ErrorTokenRejected);
+    assert_eq!(load_credentials(dir.path()).0, SyncResult::ErrorNotFound);
     runtime.block_on(server.verify());
 }
 
