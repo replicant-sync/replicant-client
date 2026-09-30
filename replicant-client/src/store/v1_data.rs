@@ -185,11 +185,12 @@ async fn migrate(conn: &mut SqliteConnection) -> StoreResult<Counts> {
         let pending = mine && status == "pending";
         let rejected_create = mine && status == "conflict" && has_create;
         // Only the owner's pending work becomes uploads. Anything else queued, and content only
-        // this device holds on a document that is not ours, is kept aside unless it was deleted.
+        // this device holds on a document that is not ours, is kept aside. Only a local delete
+        // (always `pending` in v1) is the user's own choice; a delete from elsewhere is `synced`.
         if !pending && !rejected_create {
             counts.dropped_queue_rows += rows.len();
             let local_only = !mine && (status == "pending" || (status == "conflict" && has_create));
-            if !deleted && (local_only || !rows.is_empty()) {
+            if !(deleted && status == "pending") && (local_only || !rows.is_empty()) {
                 keep_aside(&mut *conn, &id, &content, "unmigratable").await?;
                 counts.kept_aside += 1;
             }
@@ -554,7 +555,6 @@ mod tests {
             Some(&deleted_at),
         )
         .await;
-        v1_queue_row(&pool, &id(1), "update", None).await;
         let store = migrated(pool, &path).await;
         let snap = snapshot(&store, doc(1)).await;
         assert!(!snap.exists, "a v2 soft delete would mean an unsent delete");
@@ -1661,6 +1661,27 @@ mod tests {
         let (store, logged) = migrated_with_warnings(pool, &path).await;
         assert!(!snapshot(&store, doc(1)).await.exists);
         assert!(kept_copies(&store).await.is_empty());
+        assert_dropped(&logged, 1);
+        store.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_document_deleted_elsewhere_keeps_its_unsent_edit_aside() {
+        let (_dir, path, pool) = v012_db().await;
+        v1_user(&pool, ME, true).await;
+        v1_doc(
+            &pool,
+            &id(1),
+            Some(ME),
+            json!({"n": 2}),
+            "synced",
+            Some("2026-01-03T00:00:00+00:00"),
+        )
+        .await;
+        v1_queue_row(&pool, &id(1), "update", Some(json!({"n": 1}))).await;
+        let (store, logged) = migrated_with_warnings(pool, &path).await;
+        assert!(!snapshot(&store, doc(1)).await.exists);
+        assert_eq!(kept_copies(&store).await, kept(1, json!({"n": 2})));
         assert_dropped(&logged, 1);
         store.close().await;
     }
