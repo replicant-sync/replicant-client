@@ -31,12 +31,13 @@ pub enum BuildResult {
 }
 
 pub fn build_upload(snap: &DocSnapshot, me: Uuid) -> BuildResult {
-    if snap.rows.is_empty() || snap.rows.iter().any(|r| r.parked) {
+    let ends_in_delete = snap.rows.last().is_some_and(|r| r.kind == RowKind::Delete);
+    // A pending delete goes out even behind parked rows: nothing else can unpark a deleted document.
+    if snap.rows.is_empty() || (!ends_in_delete && snap.rows.iter().any(|r| r.parked)) {
         return BuildResult::Nothing;
     }
     let covered: Vec<Uuid> = snap.rows.iter().map(|r| r.mutation_id).collect();
     let upload_id = *covered.last().expect("rows not empty");
-    let ends_in_delete = snap.rows.last().is_some_and(|r| r.kind == RowKind::Delete);
     let has_create = snap.rows.iter().any(|r| r.kind == RowKind::Create);
 
     let send = |kind: UploadKind,
@@ -138,7 +139,8 @@ pub fn settle(
         Ok(doc) => {
             let advances = doc.seq > snap.server_seq();
             let diverged = reply_diverged(snap, inflight, reply);
-            let park = diverged && divergent_replies >= MAX_DIVERGENT_REPLIES;
+            let park =
+                diverged && divergent_replies >= MAX_DIVERGENT_REPLIES && !delete_pending(snap);
             let mut ops = if park {
                 // A push of this upload may have replaced the covered rows with a marker.
                 vec![DocOp::Park {
@@ -470,6 +472,41 @@ mod upload_tests {
             "the reply's copy is still adopted"
         );
         assert!(after.rows.iter().all(|r| r.parked));
+    }
+
+    #[test]
+    fn a_pending_delete_is_built_behind_parked_rows() {
+        let mut s = synced(json!({"n": 1}), 1);
+        s.soft_deleted = true;
+        let mut parked = row(1, RowKind::Update);
+        parked.parked = true;
+        s.rows = vec![parked, row(2, RowKind::Delete)];
+        let (upload, inflight) = sent(build_upload(&s, ME));
+        assert_eq!(upload.kind, UploadKind::Delete);
+        assert_eq!(
+            upload.base_hash,
+            s.shadow.as_ref().map(|sh| sh.hash.clone())
+        );
+        assert_eq!(inflight.covered, vec![m(1), m(2)]);
+    }
+
+    #[test]
+    fn a_delete_made_during_the_last_divergent_upload_is_not_parked() {
+        let mut s = synced(json!({"n": 1}), 1);
+        s.content = json!({"n": 2});
+        s.soft_deleted = true;
+        s.rows = vec![row(1, RowKind::Update), row(2, RowKind::Delete)];
+        let f = inflight_update(vec![m(1)], json!({"n": 2}));
+        let reply = env(json!({"n": 2, "added": true}), 2);
+        let SettleResult::Ops(ops) = settle(&s, &f, &Ok(reply), ME, 0, MAX_DIVERGENT_REPLIES)
+        else {
+            panic!()
+        };
+        assert!(!ops.iter().any(|o| matches!(o, DocOp::Park { .. })));
+        let after = s.project(&ops);
+        assert!(after.rows.iter().all(|r| !r.parked));
+        let (upload, _) = sent(build_upload(&after, ME));
+        assert_eq!(upload.kind, UploadKind::Delete);
     }
 
     #[test]

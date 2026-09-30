@@ -10,11 +10,14 @@ use crate::engine::machine::{BuildOutcome, SettleOutcome};
 use crate::engine::types::{DocEnvelope, Seq, ServerError};
 
 impl Store {
-    /// `Effect::LoadPending`: documents with outbox rows and none parked, oldest row first.
+    /// `Effect::LoadPending`: documents with outbox rows and none parked (or a delete as the last
+    /// row), oldest row first.
     pub async fn load_pending(&self) -> StoreResult<Vec<Uuid>> {
         let ids: Vec<String> = sqlx::query_scalar(
             "SELECT doc_id FROM outbox GROUP BY doc_id \
-             HAVING SUM(parked_error IS NOT NULL) = 0 ORDER BY MIN(mutation_id)",
+             HAVING SUM(parked_error IS NOT NULL) = 0 OR (SELECT kind FROM outbox last \
+                 WHERE last.doc_id = outbox.doc_id ORDER BY mutation_id DESC LIMIT 1) = 'delete' \
+             ORDER BY MIN(mutation_id)",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -225,6 +228,30 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(t.store.load_pending().await.unwrap(), vec![first, last]);
+    }
+
+    #[tokio::test]
+    async fn load_pending_lists_a_parked_doc_whose_last_row_is_a_delete() {
+        let t = temp_store().await;
+        let doc_id = t
+            .store
+            .create_document(ME, None, json!({"a": 1}))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE outbox SET parked_error = 'validation'")
+            .execute(&t.store.pool)
+            .await
+            .unwrap();
+        assert!(t.store.load_pending().await.unwrap().is_empty());
+        sqlx::query(
+            "INSERT INTO outbox (mutation_id, doc_id, kind, created_at) \
+             VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', ?, 'delete', 0)",
+        )
+        .bind(doc_id.to_string())
+        .execute(&t.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(t.store.load_pending().await.unwrap(), vec![doc_id]);
     }
 
     #[tokio::test]

@@ -1149,3 +1149,39 @@ async fn a_persistent_divergent_reply_parks_the_document_after_a_bounded_number_
     );
     engine.stop().await;
 }
+
+#[tokio::test]
+async fn a_delete_made_while_an_upload_is_refused_still_reaches_the_server() {
+    let server = ScriptedServer::start(ME).await;
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, _events) = live_engine(&server, &path).await;
+    let store = engine.store();
+    let doc_id = store
+        .create_document(ME, None, json!({"n": 1}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    eventually("the create settles", || async {
+        in_sync(&store, &server, doc_id).await
+    })
+    .await;
+
+    server.hold_uploads();
+    server.reject_next_upload("validation");
+    store
+        .update_document(ME, doc_id, json!({"n": 2}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    eventually("the edit is held", || async {
+        server.uploads_for(doc_id).len() == 2
+    })
+    .await;
+    store.delete_document(ME, doc_id).await.unwrap();
+    server.release_held();
+    eventually("the delete reaches the server", || async {
+        server.doc(doc_id).is_some_and(|(_, _, deleted)| deleted) && outbox_rows(&store).await == 0
+    })
+    .await;
+    engine.stop().await;
+}

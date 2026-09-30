@@ -2353,6 +2353,7 @@ mod property_tests {
     use super::fixtures::*;
     use super::*;
     use crate::engine::backoff::Jitter;
+    use crate::engine::doc_upload::reply_diverged;
     use crate::engine::types::{ServerError, Upload, UploadKind};
     use serde_json::json;
 
@@ -3054,6 +3055,10 @@ mod property_tests {
             let Some((inflight, reply)) = self.in_flight.take() else {
                 return;
             };
+            assert!(
+                !reply_diverged(&self.snap, &inflight, &reply),
+                "the model server never transforms content, so a divergent reply is false"
+            );
             match settle(&self.snap, &inflight, &reply, ME, self.mismatches, 0) {
                 SettleResult::Ops(ops) => {
                     if inflight.kind == UploadKind::Delete {

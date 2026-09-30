@@ -72,6 +72,14 @@ mod tests {
         assert_eq!(content_hash(&a), content_hash(&b));
     }
 
+    #[test]
+    fn parsed_objects_are_key_sorted_so_preserve_order_must_stay_off() {
+        let a: Value = serde_json::from_str(r#"{"a":1,"b":2}"#).unwrap();
+        let b: Value = serde_json::from_str(r#"{"b":2,"a":1}"#).unwrap();
+        assert_eq!(content_hash(&a), content_hash(&b));
+        assert_eq!(b.to_string(), r#"{"a":1,"b":2}"#);
+    }
+
     fn canonical(mut value: Value) -> Value {
         canonicalise_numbers(&mut value);
         value
