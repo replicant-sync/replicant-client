@@ -1227,10 +1227,18 @@ pub unsafe extern "C" fn replicant_string_free(s: *mut c_char) {
     }
 }
 
+/// Found by `scripts/check_replicant_versions.py` in every binary that links this library.
+#[used]
+static VERSION_MARKER: &str = concat!("replicant-client-version=", env!("CARGO_PKG_VERSION"), "\0");
+
+/// This library's version; free the result with `replicant_string_free`.
 #[no_mangle]
 pub extern "C" fn replicant_get_version() -> *mut c_char {
     std::panic::catch_unwind(|| {
-        CString::new(env!("CARGO_PKG_VERSION")).map_or(ptr::null_mut(), CString::into_raw)
+        let version = VERSION_MARKER
+            .trim_start_matches("replicant-client-version=")
+            .trim_end_matches('\0');
+        CString::new(version).map_or(ptr::null_mut(), CString::into_raw)
     })
     .unwrap_or(ptr::null_mut())
 }
@@ -1617,6 +1625,20 @@ mod tests {
     #[test]
     fn a_panic_inside_an_entry_point_becomes_error_unknown() {
         assert_eq!(guard(|| panic!("boom")), SyncResult::ErrorUnknown);
+    }
+
+    #[test]
+    fn the_version_marker_names_this_crate_version() {
+        assert_eq!(
+            VERSION_MARKER,
+            concat!("replicant-client-version=", env!("CARGO_PKG_VERSION"), "\0")
+        );
+        let version = replicant_get_version();
+        assert_eq!(
+            unsafe { CStr::from_ptr(version) }.to_str().unwrap(),
+            env!("CARGO_PKG_VERSION")
+        );
+        unsafe { replicant_string_free(version) };
     }
 
     #[test]

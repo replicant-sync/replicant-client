@@ -590,3 +590,11 @@ MIT
 5. Submit a pull request
 
 See [TESTING.md](TESTING.md) for detailed testing guidelines and [EXAMPLES.md](EXAMPLES.md) for usage examples.
+
+## Release gate
+
+Every binary that links replicant-client carries `replicant-client-version=<version>`. Before a release, check that all of them link the same version:
+
+    python3 scripts/check_replicant_versions.py <app bundle> <plugin bundles…>
+
+It exits 1 when a binary has no marker, carries two versions, or the binaries disagree.

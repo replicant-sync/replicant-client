@@ -706,6 +706,9 @@ enum ReplicantSyncResult replicant_process_events(struct Replicant *handle,
  */
 void replicant_string_free(char *s);
 
+/**
+ * This library's version; free the result with `replicant_string_free`.
+ */
 char *replicant_get_version(void);
 
 /**
