@@ -1790,4 +1790,28 @@ mod tests {
         assert_eq!(counts.dropped_queue_rows, 1);
         store.close().await;
     }
+
+    #[tokio::test]
+    async fn a_second_opener_before_013_adds_no_backup_copy() {
+        let (_dir, path, pool) = v012_db().await;
+        v1_user(&pool, ME, true).await;
+        v1_doc(&pool, &id(1), Some(ME), json!({"n": 1}), "synced", None).await;
+        pool.close().await;
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(SqliteConnectOptions::new().filename(&path))
+            .await
+            .unwrap();
+        back_up_v1_database(&pool, &path).await.unwrap();
+        // A second opener that got the lock before the first applied 013.
+        back_up_v1_database(&pool, &path).await.unwrap();
+        pool.close().await;
+        assert_eq!(backups_of(&path), vec![backup_of(&path)]);
+        let copy = raw_pool(&backup_of(&path)).await;
+        let user_version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&copy)
+            .await
+            .unwrap();
+        assert_eq!(user_version, 0, "backup is unmarked");
+    }
 }
