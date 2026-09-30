@@ -10,7 +10,7 @@ use crate::error_code::error_code_for;
 use crate::host::{lock, HostEvent, Origin};
 
 /// cbindgen:prefix-with-name
-#[repr(C)]
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventType {
     /// A document was created or changed; `EventOrigin` says by whom.
@@ -34,7 +34,7 @@ pub enum EventType {
 }
 
 /// cbindgen:prefix-with-name
-#[repr(C)]
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventOrigin {
     /// A handle of this engine wrote it (this process, this copy of the library): another

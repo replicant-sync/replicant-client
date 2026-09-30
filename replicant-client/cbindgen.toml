@@ -30,6 +30,13 @@ include = [
     "ReplicantConnectionEventCallback",
     "ReplicantConflictEventCallback",
 ]
+# Engine tuning constants are not API.
+exclude = [
+    "MAX_MISMATCH_ATTEMPTS",
+    "MAX_DIVERGENT_REPLIES",
+    "MAX_IN_FLIGHT",
+    "PAGE_LIMIT",
+]
 
 # Prefix types to avoid polluting global namespace in C++
 [export.rename]

@@ -38,15 +38,19 @@ const PUMP_IDLE: u8 = 0;
 const PUMP_DISPATCHING: u8 = 1;
 const PUMP_DESTROY_REQUESTED: u8 = 2;
 
-/// The version of this C ABI. A host compares it with `REPLICANT_ABI_VERSION` from the header it
-/// compiled. Only a breaking change increments it; new struct fields (at the end) and new enum
-/// values do not. `struct_size` must be at least this version's size; the library reads and
-/// writes only the fields that size covers, and later versions accept every earlier size.
-pub const REPLICANT_ABI_VERSION: i32 = 1;
+/// The C ABI version is MAJOR.MINOR. A breaking change bumps the major; an addition (a function,
+/// a struct field at the end, an enum value) bumps the minor. A host needs the library's major
+/// equal to the header's, and its minor at least the minor that added what the host uses.
+/// Hosts treat unknown enum values as unknown: an unknown `ReplicantEventType` is ignored, an
+/// unknown `ReplicantHaltReason` is `Other`, an unknown error code is 0 (`Unknown`).
+pub const REPLICANT_ABI_VERSION_MAJOR: u32 = 1;
+/// See `REPLICANT_ABI_VERSION_MAJOR`.
+pub const REPLICANT_ABI_VERSION_MINOR: u32 = 0;
 
+/// The library's ABI version, packed: `(major << 16) | minor`.
 #[no_mangle]
-pub extern "C" fn replicant_abi_version() -> i32 {
-    REPLICANT_ABI_VERSION
+pub extern "C" fn replicant_abi_version() -> u32 {
+    (REPLICANT_ABI_VERSION_MAJOR << 16) | REPLICANT_ABI_VERSION_MINOR
 }
 
 /// Every entry point's body runs in here: a panic becomes `ErrorUnknown` instead of unwinding
@@ -59,7 +63,7 @@ fn guard(body: impl FnOnce() -> SyncResult) -> SyncResult {
 }
 
 /// cbindgen:prefix-with-name
-#[repr(C)]
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncResult {
     Success = 0,
@@ -96,8 +100,8 @@ pub enum SyncResult {
 /// Every string is UTF-8 and copied by `replicant_create`.
 #[repr(C)]
 pub struct ReplicantConfig {
-    /// `sizeof(ReplicantConfig)`; smaller than this version's size is refused
-    /// (`ErrorInvalidInput`). The library reads only the fields it knows.
+    /// `sizeof(ReplicantConfig)`. Smaller than the ABI 1.0 struct is refused
+    /// (`ErrorInvalidInput`); the library reads only the fields it knows.
     pub struct_size: u32,
     /// Holds the database file and the stored credentials.
     pub data_dir: *const c_char,
@@ -118,16 +122,17 @@ pub struct ReplicantConfig {
     pub list_merge_rules_json: *const c_char,
 }
 
-/// Merge policy for a list changed on both sides. `ListMergeFull` is refused for now.
-#[repr(C)]
+/// Merge policy for a list changed on both sides. `ReplicantListMerge_Full` is refused for now.
+/// cbindgen:prefix-with-name
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicantListMerge {
     /// Element by element while positions line up on both sides; otherwise the server's list is
     /// kept and the local one set aside.
-    ListMergeAppend = 0,
+    Append = 0,
     /// Any change on both sides keeps the server's list and sets the local one aside.
-    ListMergeAtomic = 1,
-    ListMergeFull = 2,
+    Atomic = 1,
+    Full = 2,
 }
 
 #[derive(serde::Deserialize)]
@@ -176,94 +181,95 @@ unsafe fn list_merge_arg(config: &ReplicantConfig) -> Option<ListMergeConfig> {
     Some(ListMergeConfig { default, rules })
 }
 
-#[repr(C)]
+/// cbindgen:prefix-with-name
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicantConnection {
-    ConnectionIdle = 0,
-    ConnectionDisconnected = 1,
-    ConnectionConnecting = 2,
-    ConnectionConnected = 3,
+    Idle = 0,
+    Disconnected = 1,
+    Connecting = 2,
+    Connected = 3,
     /// Not retrying on its own; see `halt_reason`.
-    ConnectionHalted = 4,
-    ConnectionStopped = 5,
+    Halted = 4,
+    Stopped = 5,
 }
 
-#[repr(C)]
+/// cbindgen:prefix-with-name
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicantSync {
-    SyncIdle = 0,
-    SyncCatchingUp = 1,
-    SyncLive = 2,
+    Idle = 0,
+    CatchingUp = 1,
+    Live = 2,
 }
 
-#[repr(C)]
+/// cbindgen:prefix-with-name
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicantHaltReason {
-    HaltNone = 0,
+    None = 0,
     /// No stored credentials: sign in.
-    HaltNotEnrolled = 1,
+    NotEnrolled = 1,
     /// The server refused the credentials: sign in again.
-    HaltAuthInvalid = 2,
+    AuthInvalid = 2,
     /// The server needs a newer client.
-    HaltUpdateRequired = 3,
-    HaltAccountDisabled = 4,
+    UpdateRequired = 3,
+    AccountDisabled = 4,
     /// This data dir belongs to another account.
-    HaltIdentityDrift = 5,
-    HaltOther = 6,
+    IdentityDrift = 5,
+    Other = 6,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplicantState {
-    /// Set to `sizeof(ReplicantState)` before `replicant_get_state`; smaller than this version's
-    /// size is refused. The library writes only the fields it knows and leaves this one as set.
+    /// Set to `sizeof(ReplicantState)` before `replicant_get_state`; smaller than the ABI 1.0
+    /// struct is refused. The library writes only the fields it knows and sets this to their
+    /// size, so a host from a later version can tell which of its fields were filled.
     pub struct_size: u32,
     pub connection: ReplicantConnection,
     pub sync: ReplicantSync,
     pub halt_reason: ReplicantHaltReason,
 }
 
+/// The ABI 1.0 struct sizes: later versions append fields and keep accepting these.
+const CONFIG_SIZE_V1_0: usize = std::mem::offset_of!(ReplicantConfig, list_merge_rules_json)
+    + std::mem::size_of::<*const c_char>();
+const STATE_SIZE_V1_0: usize =
+    std::mem::offset_of!(ReplicantState, halt_reason) + std::mem::size_of::<ReplicantHaltReason>();
+
 impl From<&EngineState> for ReplicantState {
     fn from(state: &EngineState) -> Self {
         let (connection, halt_reason) = match &state.connection {
-            ConnectionView::Idle => (
-                ReplicantConnection::ConnectionIdle,
-                ReplicantHaltReason::HaltNone,
-            ),
-            ConnectionView::Disconnected => (
-                ReplicantConnection::ConnectionDisconnected,
-                ReplicantHaltReason::HaltNone,
-            ),
-            ConnectionView::Connecting => (
-                ReplicantConnection::ConnectionConnecting,
-                ReplicantHaltReason::HaltNone,
-            ),
-            ConnectionView::Connected => (
-                ReplicantConnection::ConnectionConnected,
-                ReplicantHaltReason::HaltNone,
-            ),
-            ConnectionView::Stopped => (
-                ReplicantConnection::ConnectionStopped,
-                ReplicantHaltReason::HaltNone,
-            ),
+            ConnectionView::Idle => (ReplicantConnection::Idle, ReplicantHaltReason::None),
+            ConnectionView::Disconnected => {
+                (ReplicantConnection::Disconnected, ReplicantHaltReason::None)
+            }
+            ConnectionView::Connecting => {
+                (ReplicantConnection::Connecting, ReplicantHaltReason::None)
+            }
+            ConnectionView::Connected => {
+                (ReplicantConnection::Connected, ReplicantHaltReason::None)
+            }
+            ConnectionView::Stopped => (ReplicantConnection::Stopped, ReplicantHaltReason::None),
             ConnectionView::Halted(reason) => (
-                ReplicantConnection::ConnectionHalted,
+                ReplicantConnection::Halted,
                 match reason {
-                    HaltReason::NotEnrolled => ReplicantHaltReason::HaltNotEnrolled,
-                    HaltReason::AuthInvalid => ReplicantHaltReason::HaltAuthInvalid,
-                    HaltReason::UpdateRequired => ReplicantHaltReason::HaltUpdateRequired,
-                    HaltReason::AccountDisabled => ReplicantHaltReason::HaltAccountDisabled,
+                    HaltReason::NotEnrolled => ReplicantHaltReason::NotEnrolled,
+                    HaltReason::AuthInvalid => ReplicantHaltReason::AuthInvalid,
+                    HaltReason::UpdateRequired => ReplicantHaltReason::UpdateRequired,
+                    HaltReason::AccountDisabled => ReplicantHaltReason::AccountDisabled,
                     HaltReason::Other(code) if code == "identity_drift" => {
-                        ReplicantHaltReason::HaltIdentityDrift
+                        ReplicantHaltReason::IdentityDrift
                     }
-                    HaltReason::Other(_) => ReplicantHaltReason::HaltOther,
+                    HaltReason::Other(_) => ReplicantHaltReason::Other,
                 },
             ),
         };
         let sync = match state.sync {
-            SyncView::Idle => ReplicantSync::SyncIdle,
-            SyncView::CatchingUp => ReplicantSync::SyncCatchingUp,
-            SyncView::Live => ReplicantSync::SyncLive,
+            SyncView::Idle => ReplicantSync::Idle,
+            SyncView::CatchingUp => ReplicantSync::CatchingUp,
+            SyncView::Live => ReplicantSync::Live,
         };
         ReplicantState {
             struct_size: std::mem::size_of::<ReplicantState>() as u32,
@@ -355,7 +361,7 @@ pub unsafe extern "C" fn replicant_create(
         }
         *out_handle = ptr::null_mut();
         let config = &*config;
-        if (config.struct_size as usize) < std::mem::size_of::<ReplicantConfig>() {
+        if (config.struct_size as usize) < CONFIG_SIZE_V1_0 {
             return SyncResult::ErrorInvalidInput;
         }
         let (
@@ -760,14 +766,16 @@ pub unsafe extern "C" fn replicant_get_state(
         if handle.is_null() || out_state.is_null() {
             return SyncResult::ErrorInvalidInput;
         }
-        let out = &mut *out_state;
-        if (out.struct_size as usize) < std::mem::size_of::<ReplicantState>() {
+        // Raw field writes: the host's struct may hold values that are not valid Rust enums.
+        let host_size = ptr::addr_of!((*out_state).struct_size).read() as usize;
+        if host_size < STATE_SIZE_V1_0 {
             return SyncResult::ErrorInvalidInput;
         }
         let state = ReplicantState::from(&(*handle).handle.state());
-        out.connection = state.connection;
-        out.sync = state.sync;
-        out.halt_reason = state.halt_reason;
+        ptr::addr_of_mut!((*out_state).connection).write(state.connection);
+        ptr::addr_of_mut!((*out_state).sync).write(state.sync);
+        ptr::addr_of_mut!((*out_state).halt_reason).write(state.halt_reason);
+        ptr::addr_of_mut!((*out_state).struct_size).write(STATE_SIZE_V1_0 as u32);
         SyncResult::Success
     })
 }
@@ -1586,27 +1594,27 @@ mod tests {
         };
         assert_eq!(
             halted(HaltReason::NotEnrolled),
-            ReplicantHaltReason::HaltNotEnrolled
+            ReplicantHaltReason::NotEnrolled
         );
         assert_eq!(
             halted(HaltReason::AuthInvalid),
-            ReplicantHaltReason::HaltAuthInvalid
+            ReplicantHaltReason::AuthInvalid
         );
         assert_eq!(
             halted(HaltReason::UpdateRequired),
-            ReplicantHaltReason::HaltUpdateRequired
+            ReplicantHaltReason::UpdateRequired
         );
         assert_eq!(
             halted(HaltReason::AccountDisabled),
-            ReplicantHaltReason::HaltAccountDisabled
+            ReplicantHaltReason::AccountDisabled
         );
         assert_eq!(
             halted(HaltReason::Other("identity_drift".into())),
-            ReplicantHaltReason::HaltIdentityDrift
+            ReplicantHaltReason::IdentityDrift
         );
         assert_eq!(
             halted(HaltReason::Other("store_error".into())),
-            ReplicantHaltReason::HaltOther
+            ReplicantHaltReason::Other
         );
         assert_eq!(
             ReplicantState::from(&EngineState {
@@ -1615,11 +1623,17 @@ mod tests {
             }),
             ReplicantState {
                 struct_size: std::mem::size_of::<ReplicantState>() as u32,
-                connection: ReplicantConnection::ConnectionConnected,
-                sync: ReplicantSync::SyncLive,
-                halt_reason: ReplicantHaltReason::HaltNone,
+                connection: ReplicantConnection::Connected,
+                sync: ReplicantSync::Live,
+                halt_reason: ReplicantHaltReason::None,
             }
         );
+    }
+
+    #[test]
+    fn this_version_s_structs_are_the_abi_1_0_sizes() {
+        assert_eq!(std::mem::size_of::<ReplicantConfig>(), CONFIG_SIZE_V1_0);
+        assert_eq!(std::mem::size_of::<ReplicantState>(), STATE_SIZE_V1_0);
     }
 
     #[test]

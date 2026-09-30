@@ -180,9 +180,9 @@ fn json_out(call: impl FnOnce(*mut *mut c_char) -> SyncResult) -> Value {
 fn state(handle: *mut Replicant) -> ReplicantState {
     let mut state = ReplicantState {
         struct_size: std::mem::size_of::<ReplicantState>() as u32,
-        connection: ReplicantConnection::ConnectionIdle,
-        sync: ReplicantSync::SyncIdle,
-        halt_reason: ReplicantHaltReason::HaltNone,
+        connection: ReplicantConnection::Idle,
+        sync: ReplicantSync::Idle,
+        halt_reason: ReplicantHaltReason::None,
     };
     assert_eq!(
         unsafe { replicant_get_state(handle, &mut state) },
@@ -193,8 +193,8 @@ fn state(handle: *mut Replicant) -> ReplicantState {
 
 fn halted_not_enrolled(handle: *mut Replicant) -> bool {
     let state = state(handle);
-    state.connection == ReplicantConnection::ConnectionHalted
-        && state.halt_reason == ReplicantHaltReason::HaltNotEnrolled
+    state.connection == ReplicantConnection::Halted
+        && state.halt_reason == ReplicantHaltReason::NotEnrolled
 }
 
 /// Runs one statement against the data dir's database from outside the library.
@@ -539,7 +539,7 @@ fn storing_and_clearing_credentials_move_the_engine_in_and_out_of_halted() {
         SyncResult::Success
     );
     wait_until("dialling", || {
-        state(handle).connection != ReplicantConnection::ConnectionHalted
+        state(handle).connection != ReplicantConnection::Halted
     });
     assert_eq!(
         unsafe { replicant_clear_credentials(data_dir.as_ptr()) },
@@ -595,7 +595,10 @@ fn null_arguments_are_refused_without_crashing() {
 
 #[test]
 fn a_config_or_state_smaller_than_this_version_is_refused() {
-    assert_eq!(replicant_abi_version(), REPLICANT_ABI_VERSION);
+    assert_eq!(
+        replicant_abi_version(),
+        (REPLICANT_ABI_VERSION_MAJOR << 16) | REPLICANT_ABI_VERSION_MINOR
+    );
     let dir = tempfile::tempdir().unwrap();
     let (result, handle) = create_with(dir.path(), |config| config.struct_size -= 4);
     assert_eq!(result, SyncResult::ErrorInvalidInput);
@@ -621,6 +624,7 @@ struct Later<T> {
 
 #[test]
 fn a_config_or_state_from_a_later_version_is_accepted_and_its_new_fields_left_alone() {
+    // The state's size comes back as the part this library filled.
     let dir = tempfile::tempdir().unwrap();
     let (result, handle) = create_with(dir.path(), |config| {
         config.struct_size = std::mem::size_of::<Later<ReplicantConfig>>() as u32
@@ -629,9 +633,9 @@ fn a_config_or_state_from_a_later_version_is_accepted_and_its_new_fields_left_al
     let mut later = Later {
         known: ReplicantState {
             struct_size: std::mem::size_of::<Later<ReplicantState>>() as u32,
-            connection: ReplicantConnection::ConnectionStopped,
-            sync: ReplicantSync::SyncLive,
-            halt_reason: ReplicantHaltReason::HaltOther,
+            connection: ReplicantConnection::Stopped,
+            sync: ReplicantSync::Live,
+            halt_reason: ReplicantHaltReason::Other,
         },
         added: 0xDEAD_BEEF,
     };
@@ -640,14 +644,38 @@ fn a_config_or_state_from_a_later_version_is_accepted_and_its_new_fields_left_al
             unsafe { replicant_get_state(handle, &mut later.known) },
             SyncResult::Success
         );
-        later.known.halt_reason == ReplicantHaltReason::HaltNotEnrolled
+        later.known.halt_reason == ReplicantHaltReason::NotEnrolled
     });
     assert_eq!(
         later.known.struct_size as usize,
-        std::mem::size_of::<Later<ReplicantState>>()
+        std::mem::size_of::<ReplicantState>()
     );
     assert_eq!(later.added, 0xDEAD_BEEF);
     close(handle);
+}
+
+fn committed_header() -> String {
+    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("include/replicant.h"))
+        .unwrap()
+}
+
+#[test]
+fn the_committed_header_is_the_generated_one() {
+    let generated = std::fs::read_to_string(env!("REPLICANT_GENERATED_HEADER")).unwrap();
+    assert!(
+        committed_header() == generated,
+        "include/replicant.h is stale: copy {} over it",
+        env!("REPLICANT_GENERATED_HEADER")
+    );
+}
+
+#[test]
+fn the_header_defines_only_replicant_macros() {
+    for line in committed_header().lines() {
+        if let Some(name) = line.strip_prefix("#define ") {
+            assert!(name.starts_with("REPLICANT_"), "{line}");
+        }
+    }
 }
 
 #[test]
