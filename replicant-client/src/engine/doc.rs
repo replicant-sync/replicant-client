@@ -2394,6 +2394,10 @@ mod property_tests {
         append_merges: u32,
         /// Rebases that kept the server's `pitches` and set the local list aside.
         list_conflicts: u32,
+        /// Pending deletes a newer other-device version superseded.
+        deletes_superseded: u32,
+        /// Superseded deletes that kept the user's earlier edits as a copy.
+        deletes_superseded_kept: u32,
     }
 
     impl Hits {
@@ -2411,6 +2415,8 @@ mod property_tests {
             self.list_merges += other.list_merges;
             self.append_merges += other.append_merges;
             self.list_conflicts += other.list_conflicts;
+            self.deletes_superseded += other.deletes_superseded;
+            self.deletes_superseded_kept += other.deletes_superseded_kept;
         }
     }
 
@@ -2509,6 +2515,13 @@ mod property_tests {
             self.commit(self.current().clone(), None, true);
         }
 
+        fn mismatch(&self, current_hash: String) -> ServerError {
+            let mut error = ServerError::new("hash_mismatch");
+            error.current_hash = Some(current_hash);
+            error.current_seq = Some(self.seq());
+            error
+        }
+
         fn upload(&mut self, upload: &Upload) -> Result<DocEnvelope, ServerError> {
             let key = (upload.upload_id, upload.base_hash.clone());
             if let Some(seq) = self.stored.get(&key) {
@@ -2519,16 +2532,21 @@ mod property_tests {
             }
             let seq = match upload.kind {
                 UploadKind::Delete => {
+                    let current_hash = content_hash(self.current());
+                    if upload
+                        .base_hash
+                        .as_ref()
+                        .is_some_and(|base| *base != current_hash)
+                    {
+                        return Err(self.mismatch(current_hash));
+                    }
                     self.deleted = true;
                     self.commit(self.current().clone(), Some(upload.upload_id), true)
                 }
                 UploadKind::Update => {
                     let current_hash = content_hash(self.current());
                     if upload.base_hash.as_deref() != Some(current_hash.as_str()) {
-                        let mut error = ServerError::new("hash_mismatch");
-                        error.current_hash = Some(current_hash);
-                        error.current_seq = Some(self.seq());
-                        return Err(error);
+                        return Err(self.mismatch(current_hash));
                     }
                     let patch: json_patch::Patch =
                         serde_json::from_value(upload.payload.clone()).unwrap();
@@ -2641,6 +2659,32 @@ mod property_tests {
         /// Applies ops the way the store does: markers get fresh increasing ids.
         fn apply(&mut self, ops: &[DocOp]) {
             let seq_before = self.snap.server_seq();
+            let superseded = ops.contains(&DocOp::Emit(DocEvent::DeleteSuperseded));
+            let edited_before_delete = superseded
+                && self.snap.shadow.as_ref().map(|s| content_hash(&s.content))
+                    != Some(content_hash(&self.snap.content));
+            if superseded {
+                let kept: Vec<&Value> = ops
+                    .iter()
+                    .filter_map(|op| match op {
+                        DocOp::Recover {
+                            content,
+                            reason: RecoverReason::DeleteSuperseded,
+                        } => Some(content),
+                        _ => None,
+                    })
+                    .collect();
+                if edited_before_delete {
+                    assert_eq!(
+                        kept,
+                        vec![&self.snap.content],
+                        "a superseded delete keeps the edits made before it"
+                    );
+                    self.hits.deletes_superseded_kept += 1;
+                } else {
+                    assert!(kept.is_empty(), "an unedited superseded delete kept a copy");
+                }
+            }
             for op in ops {
                 match op {
                     DocOp::InsertMarker(kind) => self.push_row(*kind),
@@ -2653,6 +2697,7 @@ mod property_tests {
                     DocOp::RecoverFields { fields, .. } => {
                         self.field_recovered.extend(fields.iter().cloned());
                     }
+                    DocOp::Emit(DocEvent::DeleteSuperseded) => self.hits.deletes_superseded += 1,
                     other => self.snap = self.snap.project(std::slice::from_ref(other)),
                 }
             }
@@ -2969,6 +3014,13 @@ mod property_tests {
             }
             match build_upload(&self.snap, ME) {
                 BuildResult::Send { upload, inflight } => {
+                    if upload.kind == UploadKind::Delete {
+                        assert_eq!(
+                            upload.base_hash,
+                            self.snap.shadow.as_ref().map(|s| s.hash.clone()),
+                            "a delete names the shadow's version whenever there is one"
+                        );
+                    }
                     self.snap.unacked_upload = self.snap.unacked_upload.max(Some(upload.upload_id));
                     // Captured now, not from `snap.content` on the reply: content can move on
                     // (a later local edit) before the reply for this exact upload comes back.
@@ -2984,8 +3036,12 @@ mod property_tests {
                     }
                     self.in_flight = Some((inflight, reply));
                 }
-                BuildResult::SettleLocally(ops) => self.apply(&ops),
-                BuildResult::Nothing => {}
+                // Like the machine's `forget_failures`: a document with nothing to send starts over.
+                BuildResult::SettleLocally(ops) => {
+                    self.mismatches = 0;
+                    self.apply(&ops);
+                }
+                BuildResult::Nothing => self.mismatches = 0,
                 BuildResult::NeedsServerCopy => panic!("the model document always has a shadow"),
             }
         }
@@ -3557,6 +3613,7 @@ mod property_tests {
         assert!(totals.never_sent_rebases > 0, "{totals:?}");
         assert!(totals.field_conflicts > 0, "{totals:?}");
         assert!(totals.list_conflicts > 0, "{totals:?}");
+        assert!(totals.deletes_superseded > 0, "{totals:?}");
         totals
     }
 
