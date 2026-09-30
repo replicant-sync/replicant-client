@@ -94,6 +94,7 @@ mod tests {
             ("became_publication", 5005),
             ("create_rejected", 5006),
             ("diverged", 5007),
+            ("delete_refused", 5008),
             ("store_error", 6001),
         ] {
             assert_eq!(error_code_for(code) as i32, expected, "{code}");

@@ -307,6 +307,7 @@ fn store_result(error: &StoreError) -> SyncResult {
         StoreError::DocumentGone(_) => SyncResult::ErrorDocumentGone,
         StoreError::AlreadyExists(_) => SyncResult::ErrorAlreadyExists,
         StoreError::Json(_) => SyncResult::ErrorSerialization,
+        StoreError::BadSearchQuery(_) => SyncResult::ErrorInvalidInput,
         _ => SyncResult::ErrorDatabase,
     }
 }
@@ -436,9 +437,15 @@ unsafe fn free(handle: *mut Replicant) {
 }
 
 /// Detaches and frees the handle. Returns at once: when this was the engine's last handle, the
-/// engine stops on a Replicant thread afterwards (never waiting on the network), so a plugin
-/// must keep its module pinned. Called from inside one of this handle's callbacks, the free
-/// happens when `replicant_process_events` returns.
+/// engine stops on a Replicant thread afterwards (never waiting on the network). Called from
+/// inside one of this handle's callbacks, the free happens when `replicant_process_events`
+/// returns.
+///
+/// Unloading: library code can still run after this returns, and even after
+/// `replicant_destroy_and_wait` returns true, because a DNS lookup the engine started finishes
+/// on its own thread, bounded only by the OS resolver. Never unload this library while the
+/// process runs: a plugin pins its module (`RTLD_NODELETE`, or
+/// `GET_MODULE_HANDLE_EX_FLAG_PIN` on Windows).
 ///
 /// # Safety
 /// `handle` must come from `replicant_create` and not be used again.
@@ -450,8 +457,9 @@ pub unsafe extern "C" fn replicant_destroy(handle: *mut Replicant) {
     free(handle);
 }
 
-/// `replicant_destroy`, then waits up to `timeout_ms` for the engine to stop and its threads to
-/// end. True when they have, or when other handles keep the engine running. From inside a
+/// `replicant_destroy`, then waits up to `timeout_ms` for the engine to stop and its runtime to
+/// shut down. True when it has, or when other handles keep the engine running. It does not make
+/// unloading safe (see `replicant_destroy`). From inside a
 /// callback it cannot wait: it returns false and the handle is freed when the pump returns.
 ///
 /// # Safety
@@ -821,7 +829,8 @@ pub unsafe extern "C" fn replicant_configure_search(
     })
 }
 
-/// FTS5 query (`music`, `tun*`, `"a phrase"`, `a AND b`, `title:word`); `limit` 0 means 100.
+/// FTS5 query (`music`, `tun*`, `"a phrase"`, `a AND b`, `title:word`); `limit` 0 means 100. A
+/// query FTS5 cannot parse is `ErrorInvalidInput`.
 ///
 /// # Safety
 /// Valid handle, C string and out pointer; free the result with `replicant_string_free`.
@@ -970,8 +979,9 @@ pub unsafe extern "C" fn replicant_register_conflict_callback(
 /// the callbacks: refused with `ErrorWrongThread` elsewhere and `ErrorNoCallbacks` before any
 /// registration; nothing is lost either way. The thread cannot be changed later. A
 /// `replicant_destroy` of this handle from inside a callback frees it when this call returns;
-/// the rest of the batch is not delivered. No rebind: if the registering thread ends, register
-/// again on a new handle.
+/// the rest of the batch is not delivered. A call from inside a callback returns
+/// `ErrorInvalidInput`. No rebind: if the registering thread ends, register again on a new
+/// handle.
 ///
 /// # Safety
 /// Valid handle; `out_processed_count` may be null.

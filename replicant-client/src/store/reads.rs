@@ -8,7 +8,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use super::uploads::PENDING_DOC_IDS;
-use super::{Store, StoreResult};
+use super::{Store, StoreError, StoreResult};
 use crate::engine::types::SCOPE_CURATED;
 
 pub(crate) const HAS_SEARCH_CONFIG: &str = "SELECT EXISTS(SELECT 1 FROM search_config LIMIT 1)";
@@ -178,7 +178,8 @@ impl Store {
         Ok(())
     }
 
-    /// FTS5 query syntax: terms, `prefix*`, `"a phrase"`, `AND`/`OR`, `title:word`.
+    /// FTS5 query syntax: terms, `prefix*`, `"a phrase"`, `AND`/`OR`, `title:word`. A query
+    /// FTS5 cannot parse is `BadSearchQuery`.
     pub async fn search_documents(
         &self,
         query: &str,
@@ -191,7 +192,14 @@ impl Store {
         .bind(query)
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
-        .await?;
+        .await
+        .map_err(|error| match &error {
+            // Plain SQLITE_ERROR: the statement is fixed, so only the MATCH text can cause it.
+            sqlx::Error::Database(db) if db.code().as_deref() == Some("1") => {
+                StoreError::BadSearchQuery(db.message().to_string())
+            }
+            _ => StoreError::Db(error),
+        })?;
         rows.iter().map(parse_document).collect()
     }
 }
@@ -204,7 +212,7 @@ mod tests {
     use crate::engine::machine::BuildOutcome;
     use crate::engine::types::{ServerError, SCOPE_CURATED, SCOPE_OWN};
     use crate::store::test_support::*;
-    use crate::store::{ParkedDocument, Store};
+    use crate::store::{ParkedDocument, Store, StoreError};
 
     fn doc(n: u128) -> Uuid {
         Uuid::from_u128(0xD000 + n)
@@ -550,5 +558,24 @@ mod tests {
         let found = t.store.search_documents("tuning", 1).await.unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, strong);
+    }
+
+    #[tokio::test]
+    async fn a_query_fts5_cannot_parse_is_a_bad_search_query() {
+        let t = temp_store().await;
+        t.store
+            .configure_search(&["$.body".to_string()])
+            .await
+            .unwrap();
+        for query in ["\"open", "a AND", "nosuch:word", "*", ""] {
+            assert!(
+                matches!(
+                    t.store.search_documents(query, 10).await,
+                    Err(StoreError::BadSearchQuery(_))
+                ),
+                "{query:?}"
+            );
+        }
+        assert!(t.store.search_documents("tun*", 10).await.is_ok());
     }
 }

@@ -339,10 +339,12 @@ typedef void (*SyncEventCallback)(enum ReplicantEventType event_type, void *cont
 /**
  * `error_code` is a `ReplicantErrorCode`; `error` is the protocol code, e.g. "clock_skew";
  * `document_id` is null unless the error is about one document; `fatal` means halted;
- * `recovered_id` names local content kept aside with the error, -1 if none.
- * Raised only by the engine (process) that applied the rule; another process sees just
- * `DocumentChanged`. `replicant_list_recovered` is the durable record. `recovered_id` may
- * already be dismissed or restored by another process: `restore_*` then returns `ErrorNotFound`.
+ * `recovered_id` names local content kept aside with the error (a Kept copies id, reasons as
+ * in `ConflictEventCallback`), -1 if none.
+ * Per engine: only the handles of the engine that applied the rule get this event; another
+ * process, or another copy of the library, sees just `DocumentChanged`.
+ * `replicant_list_recovered` is the durable record. `recovered_id` may already be dismissed or
+ * restored by another process: `restore_*` then returns `ErrorNotFound`.
  * Strings are valid only during the call; copy what you keep.
  */
 typedef void (*ErrorEventCallback)(enum ReplicantEventType event_type,
@@ -365,10 +367,14 @@ typedef void (*ConnectionEventCallback)(enum ReplicantEventType event_type,
 /**
  * `reason`: `conflict`, `field_conflict`, `delete_wins` or `delete_superseded` (a delete undone
  * because a newer version arrived). `recovered_id` is the Kept copies id, -1 if none.
+ * A kept copy's reason is one of `conflict`, `field_conflict`, `delete_wins`,
+ * `delete_superseded`, `delete_refused`, `delete_publication`, `became_publication`,
+ * `create_rejected` or `unmigratable` (set aside while upgrading the database, with no event).
  * `paths_json` is a JSON array of JSON Pointers for `field_conflict`, else null.
- * Raised only by the engine (process) that applied the rule; another process sees just
- * `DocumentChanged`. `replicant_list_recovered` is the durable record. `recovered_id` may
- * already be dismissed or restored by another process: `restore_*` then returns `ErrorNotFound`.
+ * Per engine: only the handles of the engine that applied the rule get this event; another
+ * process, or another copy of the library, sees just `DocumentChanged`.
+ * `replicant_list_recovered` is the durable record. `recovered_id` may already be dismissed or
+ * restored by another process: `restore_*` then returns `ErrorNotFound`.
  * Strings are valid only during the call; copy what you keep.
  */
 typedef void (*ConflictEventCallback)(enum ReplicantEventType event_type,
@@ -403,9 +409,15 @@ enum ReplicantSyncResult replicant_create(const struct ReplicantConfig *config,
 
 /**
  * Detaches and frees the handle. Returns at once: when this was the engine's last handle, the
- * engine stops on a Replicant thread afterwards (never waiting on the network), so a plugin
- * must keep its module pinned. Called from inside one of this handle's callbacks, the free
- * happens when `replicant_process_events` returns.
+ * engine stops on a Replicant thread afterwards (never waiting on the network). Called from
+ * inside one of this handle's callbacks, the free happens when `replicant_process_events`
+ * returns.
+ *
+ * Unloading: library code can still run after this returns, and even after
+ * `replicant_destroy_and_wait` returns true, because a DNS lookup the engine started finishes
+ * on its own thread, bounded only by the OS resolver. Never unload this library while the
+ * process runs: a plugin pins its module (`RTLD_NODELETE`, or
+ * `GET_MODULE_HANDLE_EX_FLAG_PIN` on Windows).
  *
  * # Safety
  * `handle` must come from `replicant_create` and not be used again.
@@ -413,8 +425,9 @@ enum ReplicantSyncResult replicant_create(const struct ReplicantConfig *config,
 void replicant_destroy(struct Replicant *handle);
 
 /**
- * `replicant_destroy`, then waits up to `timeout_ms` for the engine to stop and its threads to
- * end. True when they have, or when other handles keep the engine running. From inside a
+ * `replicant_destroy`, then waits up to `timeout_ms` for the engine to stop and its runtime to
+ * shut down. True when it has, or when other handles keep the engine running. It does not make
+ * unloading safe (see `replicant_destroy`). From inside a
  * callback it cannot wait: it returns false and the handle is freed when the pump returns.
  *
  * # Safety
@@ -544,7 +557,8 @@ enum ReplicantSyncResult replicant_configure_search(struct Replicant *handle,
                                                     const char *paths_json);
 
 /**
- * FTS5 query (`music`, `tun*`, `"a phrase"`, `a AND b`, `title:word`); `limit` 0 means 100.
+ * FTS5 query (`music`, `tun*`, `"a phrase"`, `a AND b`, `title:word`); `limit` 0 means 100. A
+ * query FTS5 cannot parse is `ErrorInvalidInput`.
  *
  * # Safety
  * Valid handle, C string and out pointer; free the result with `replicant_string_free`.
@@ -611,8 +625,9 @@ enum ReplicantSyncResult replicant_register_conflict_callback(struct Replicant *
  * the callbacks: refused with `ErrorWrongThread` elsewhere and `ErrorNoCallbacks` before any
  * registration; nothing is lost either way. The thread cannot be changed later. A
  * `replicant_destroy` of this handle from inside a callback frees it when this call returns;
- * the rest of the batch is not delivered. No rebind: if the registering thread ends, register
- * again on a new handle.
+ * the rest of the batch is not delivered. A call from inside a callback returns
+ * `ErrorInvalidInput`. No rebind: if the registering thread ends, register again on a new
+ * handle.
  *
  * # Safety
  * Valid handle; `out_processed_count` may be null.

@@ -467,6 +467,43 @@ fn search_finds_configured_paths() {
 }
 
 #[test]
+fn a_malformed_search_query_is_invalid_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = open(dir.path());
+    let mut out = ptr::null_mut();
+    assert_eq!(
+        unsafe { replicant_search_documents(handle, c("a AND").as_ptr(), 0, &mut out) },
+        SyncResult::ErrorInvalidInput
+    );
+    assert!(out.is_null());
+    close(handle);
+}
+
+#[test]
+fn a_search_limit_of_zero_returns_up_to_100() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = open(dir.path());
+    assert_eq!(
+        unsafe { replicant_configure_search(handle, c(r#"["$.body"]"#).as_ptr()) },
+        SyncResult::Success
+    );
+    for _ in 0..101 {
+        create_doc(handle, r#"{"body":"music"}"#);
+    }
+    let search = |limit| {
+        json_out(|out| unsafe {
+            replicant_search_documents(handle, c("music").as_ptr(), limit, out)
+        })
+        .as_array()
+        .unwrap()
+        .len()
+    };
+    assert_eq!(search(0), 100);
+    assert_eq!(search(3), 3);
+    close(handle);
+}
+
+#[test]
 fn count_pending_sync_counts_unsent_documents() {
     let dir = tempfile::tempdir().unwrap();
     let handle = open(dir.path());

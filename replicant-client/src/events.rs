@@ -97,10 +97,12 @@ type SyncFn = extern "C" fn(event_type: EventType, context: *mut c_void);
 
 /// `error_code` is a `ReplicantErrorCode`; `error` is the protocol code, e.g. "clock_skew";
 /// `document_id` is null unless the error is about one document; `fatal` means halted;
-/// `recovered_id` names local content kept aside with the error, -1 if none.
-/// Raised only by the engine (process) that applied the rule; another process sees just
-/// `DocumentChanged`. `replicant_list_recovered` is the durable record. `recovered_id` may
-/// already be dismissed or restored by another process: `restore_*` then returns `ErrorNotFound`.
+/// `recovered_id` names local content kept aside with the error (a Kept copies id, reasons as
+/// in `ConflictEventCallback`), -1 if none.
+/// Per engine: only the handles of the engine that applied the rule get this event; another
+/// process, or another copy of the library, sees just `DocumentChanged`.
+/// `replicant_list_recovered` is the durable record. `recovered_id` may already be dismissed or
+/// restored by another process: `restore_*` then returns `ErrorNotFound`.
 /// Strings are valid only during the call; copy what you keep.
 pub type ErrorEventCallback = Option<
     extern "C" fn(
@@ -146,10 +148,14 @@ type ConnectionFn = extern "C" fn(
 
 /// `reason`: `conflict`, `field_conflict`, `delete_wins` or `delete_superseded` (a delete undone
 /// because a newer version arrived). `recovered_id` is the Kept copies id, -1 if none.
+/// A kept copy's reason is one of `conflict`, `field_conflict`, `delete_wins`,
+/// `delete_superseded`, `delete_refused`, `delete_publication`, `became_publication`,
+/// `create_rejected` or `unmigratable` (set aside while upgrading the database, with no event).
 /// `paths_json` is a JSON array of JSON Pointers for `field_conflict`, else null.
-/// Raised only by the engine (process) that applied the rule; another process sees just
-/// `DocumentChanged`. `replicant_list_recovered` is the durable record. `recovered_id` may
-/// already be dismissed or restored by another process: `restore_*` then returns `ErrorNotFound`.
+/// Per engine: only the handles of the engine that applied the rule get this event; another
+/// process, or another copy of the library, sees just `DocumentChanged`.
+/// `replicant_list_recovered` is the durable record. `recovered_id` may already be dismissed or
+/// restored by another process: `restore_*` then returns `ErrorNotFound`.
 /// Strings are valid only during the call; copy what you keep.
 pub type ConflictEventCallback = Option<
     extern "C" fn(

@@ -48,6 +48,8 @@ pub enum StoreError {
     NoKeptCopy(i64),
     #[error("document {0} is gone; restore its kept copy as a new document")]
     DocumentGone(Uuid),
+    #[error("malformed search query: {0}")]
+    BadSearchQuery(String),
     /// Migrating v1 sync data failed; the v1 tables are untouched and a backup sits next to
     /// the database.
     #[error("v1 data migration failed: {0}")]
