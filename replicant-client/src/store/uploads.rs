@@ -5,8 +5,9 @@ use uuid::Uuid;
 use super::docs::{apply_ops, load_snapshot, LogOrigin};
 use super::{DocNotice, Store, StoreError, StoreResult};
 use crate::engine::doc::{self as rules, DocOp, DocSnapshot, InFlight};
+use crate::engine::hash::content_hash;
 use crate::engine::machine::{BuildOutcome, SettleOutcome};
-use crate::engine::types::{DocEnvelope, Seq, ServerError};
+use crate::engine::types::{DocEnvelope, Seq, ServerError, UploadKind};
 
 impl Store {
     /// `Effect::LoadPending`: documents with outbox rows and none parked, oldest row first.
@@ -68,6 +69,13 @@ impl Store {
     ) -> StoreResult<(SettleOutcome, Vec<DocNotice>)> {
         let mut tx = self.begin().await?;
         let snap = load_snapshot(&mut tx, doc_id).await?;
+        if let Ok(doc) = reply {
+            if inflight.kind != UploadKind::Delete
+                && content_hash(&doc.content) != content_hash(&inflight.sent_content)
+            {
+                tracing::warn!(%doc_id, seq = doc.seq, "the server's copy differs from what was uploaded; uploading the difference");
+            }
+        }
         let settled = match rules::settle(&snap, inflight, reply, me, mismatch_attempts) {
             rules::SettleResult::Ops(ops) => {
                 let writer = self.writer(LogOrigin::Server);

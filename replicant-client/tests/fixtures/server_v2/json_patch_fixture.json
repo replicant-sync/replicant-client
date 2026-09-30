@@ -1,0 +1,3214 @@
+[
+  {
+    "name": "replace a scalar",
+    "doc": {
+      "a": 1
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/a",
+        "value": 2
+      }
+    ],
+    "result": {
+      "a": 2
+    }
+  },
+  {
+    "name": "add a key",
+    "doc": {
+      "a": 1
+    },
+    "patch": [
+      {
+        "op": "add",
+        "path": "/b",
+        "value": [
+          1,
+          2
+        ]
+      }
+    ],
+    "result": {
+      "a": 1,
+      "b": [
+        1,
+        2
+      ]
+    }
+  },
+  {
+    "name": "remove a key",
+    "doc": {
+      "a": 1,
+      "b": 2
+    },
+    "patch": [
+      {
+        "op": "remove",
+        "path": "/b"
+      }
+    ],
+    "result": {
+      "a": 1
+    }
+  },
+  {
+    "name": "nested object",
+    "doc": {
+      "a": {
+        "b": {
+          "c": 1
+        }
+      }
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/a/b/c",
+        "value": 2
+      },
+      {
+        "op": "add",
+        "path": "/a/b/d",
+        "value": null
+      }
+    ],
+    "result": {
+      "a": {
+        "b": {
+          "c": 2,
+          "d": null
+        }
+      }
+    }
+  },
+  {
+    "name": "type change",
+    "doc": {
+      "a": [
+        1
+      ]
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/a",
+        "value": {
+          "k": true
+        }
+      }
+    ],
+    "result": {
+      "a": {
+        "k": true
+      }
+    }
+  },
+  {
+    "name": "retune one degree",
+    "doc": {
+      "name": "12-TET",
+      "pitches": [
+        0,
+        200,
+        400,
+        500,
+        700,
+        900
+      ]
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/pitches/2",
+        "value": 386
+      }
+    ],
+    "result": {
+      "name": "12-TET",
+      "pitches": [
+        0,
+        200,
+        386,
+        500,
+        700,
+        900
+      ]
+    }
+  },
+  {
+    "name": "append",
+    "doc": {
+      "name": "12-TET",
+      "pitches": [
+        0,
+        200,
+        400,
+        500,
+        700,
+        900
+      ]
+    },
+    "patch": [
+      {
+        "op": "add",
+        "path": "/pitches/6",
+        "value": 1000
+      }
+    ],
+    "result": {
+      "name": "12-TET",
+      "pitches": [
+        0,
+        200,
+        400,
+        500,
+        700,
+        900,
+        1000
+      ]
+    }
+  },
+  {
+    "name": "insert in the middle",
+    "doc": {
+      "name": "12-TET",
+      "pitches": [
+        0,
+        200,
+        400,
+        500,
+        700,
+        900
+      ]
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/pitches/3",
+        "value": 450
+      },
+      {
+        "op": "replace",
+        "path": "/pitches/4",
+        "value": 500
+      },
+      {
+        "op": "replace",
+        "path": "/pitches/5",
+        "value": 700
+      },
+      {
+        "op": "add",
+        "path": "/pitches/6",
+        "value": 900
+      }
+    ],
+    "result": {
+      "name": "12-TET",
+      "pitches": [
+        0,
+        200,
+        400,
+        450,
+        500,
+        700,
+        900
+      ]
+    }
+  },
+  {
+    "name": "remove from the middle",
+    "doc": {
+      "name": "12-TET",
+      "pitches": [
+        0,
+        200,
+        400,
+        500,
+        700,
+        900
+      ]
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/pitches/2",
+        "value": 500
+      },
+      {
+        "op": "replace",
+        "path": "/pitches/3",
+        "value": 700
+      },
+      {
+        "op": "replace",
+        "path": "/pitches/4",
+        "value": 900
+      },
+      {
+        "op": "remove",
+        "path": "/pitches/5"
+      }
+    ],
+    "result": {
+      "name": "12-TET",
+      "pitches": [
+        0,
+        200,
+        500,
+        700,
+        900
+      ]
+    }
+  },
+  {
+    "name": "remove several from the end",
+    "doc": {
+      "name": "12-TET",
+      "pitches": [
+        0,
+        200,
+        400,
+        500,
+        700,
+        900
+      ]
+    },
+    "patch": [
+      {
+        "op": "remove",
+        "path": "/pitches/2"
+      },
+      {
+        "op": "remove",
+        "path": "/pitches/2"
+      },
+      {
+        "op": "remove",
+        "path": "/pitches/2"
+      },
+      {
+        "op": "remove",
+        "path": "/pitches/2"
+      }
+    ],
+    "result": {
+      "name": "12-TET",
+      "pitches": [
+        0,
+        200
+      ]
+    }
+  },
+  {
+    "name": "empty the list",
+    "doc": {
+      "name": "12-TET",
+      "pitches": [
+        0,
+        200,
+        400,
+        500,
+        700,
+        900
+      ]
+    },
+    "patch": [
+      {
+        "op": "remove",
+        "path": "/pitches/0"
+      },
+      {
+        "op": "remove",
+        "path": "/pitches/0"
+      },
+      {
+        "op": "remove",
+        "path": "/pitches/0"
+      },
+      {
+        "op": "remove",
+        "path": "/pitches/0"
+      },
+      {
+        "op": "remove",
+        "path": "/pitches/0"
+      },
+      {
+        "op": "remove",
+        "path": "/pitches/0"
+      }
+    ],
+    "result": {
+      "name": "12-TET",
+      "pitches": []
+    }
+  },
+  {
+    "name": "list of objects",
+    "doc": {
+      "tunings": [
+        {
+          "n": "A",
+          "p": [
+            1,
+            2
+          ]
+        },
+        {
+          "n": "B",
+          "p": [
+            3
+          ]
+        }
+      ]
+    },
+    "patch": [
+      {
+        "op": "add",
+        "path": "/tunings/0/p/2",
+        "value": 5
+      },
+      {
+        "op": "replace",
+        "path": "/tunings/1/n",
+        "value": "B2"
+      },
+      {
+        "op": "remove",
+        "path": "/tunings/1/p/0"
+      }
+    ],
+    "result": {
+      "tunings": [
+        {
+          "n": "A",
+          "p": [
+            1,
+            2,
+            5
+          ]
+        },
+        {
+          "n": "B2",
+          "p": []
+        }
+      ]
+    }
+  },
+  {
+    "name": "keys needing escapes",
+    "doc": {
+      "a/b": 1,
+      "m~n": 2
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/a~1b",
+        "value": 3
+      },
+      {
+        "op": "replace",
+        "path": "/m~0n",
+        "value": 4
+      },
+      {
+        "op": "add",
+        "path": "/x~1~0y",
+        "value": 5
+      }
+    ],
+    "result": {
+      "a/b": 3,
+      "m~n": 4,
+      "x/~y": 5
+    }
+  },
+  {
+    "name": "empty key",
+    "doc": {
+      "": 1
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/",
+        "value": 2
+      }
+    ],
+    "result": {
+      "": 2
+    }
+  },
+  {
+    "name": "unicode",
+    "doc": {
+      "name": "Bohlen–Pierce"
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/name",
+        "value": "Bohlen–Pierce ✓"
+      },
+      {
+        "op": "add",
+        "path": "/ñ",
+        "value": "é"
+      }
+    ],
+    "result": {
+      "name": "Bohlen–Pierce ✓",
+      "ñ": "é"
+    }
+  },
+  {
+    "name": "numbers",
+    "doc": {
+      "big": 9007199254740993,
+      "cents": 1.5,
+      "neg": -3
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/big",
+        "value": 9007199254740994
+      },
+      {
+        "op": "replace",
+        "path": "/cents",
+        "value": 386.3137
+      },
+      {
+        "op": "replace",
+        "path": "/neg",
+        "value": -0.5
+      }
+    ],
+    "result": {
+      "big": 9007199254740994,
+      "cents": 386.3137,
+      "neg": -0.5
+    }
+  },
+  {
+    "name": "random 0",
+    "doc": {
+      "k1": 258
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k1",
+        "value": {
+          "k0": {
+            "k3": false,
+            "k4": -16
+          },
+          "k1": [],
+          "k3": 947.5
+        }
+      },
+      {
+        "op": "add",
+        "path": "/new4",
+        "value": {
+          "k3": {
+            "k3": true
+          }
+        }
+      }
+    ],
+    "result": {
+      "k1": {
+        "k0": {
+          "k3": false,
+          "k4": -16
+        },
+        "k1": [],
+        "k3": 947.5
+      },
+      "new4": {
+        "k3": {
+          "k3": true
+        }
+      }
+    }
+  },
+  {
+    "name": "random 1",
+    "doc": {
+      "k1": null
+    },
+    "patch": [],
+    "result": {
+      "k1": null
+    }
+  },
+  {
+    "name": "random 2",
+    "doc": {
+      "k0": "s89",
+      "k4": "s3"
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k4",
+        "value": 720.5
+      }
+    ],
+    "result": {
+      "k0": "s89",
+      "k4": 720.5
+    }
+  },
+  {
+    "name": "random 3",
+    "doc": {
+      "k0": 227.5,
+      "k1": "s58",
+      "k4": 925
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k4",
+        "value": "s17"
+      },
+      {
+        "op": "add",
+        "path": "/new1",
+        "value": []
+      },
+      {
+        "op": "remove",
+        "path": "/k0"
+      }
+    ],
+    "result": {
+      "k1": "s58",
+      "k4": "s17",
+      "new1": []
+    }
+  },
+  {
+    "name": "random 4",
+    "doc": {
+      "k0": 649.5,
+      "k2": {
+        "k0": {
+          "k1": [
+            true
+          ],
+          "k2": true
+        },
+        "k2": {
+          "k3": [
+            468
+          ],
+          "k5": {
+            "k4": "s67"
+          }
+        },
+        "k4": -19
+      },
+      "k4": {
+        "k0": [
+          {
+            "k2": "s65",
+            "k4": 855.5
+          },
+          342.5
+        ],
+        "k1": {
+          "k1": 484.5,
+          "k2": -507,
+          "k4": {
+            "k1": null,
+            "k4": 663
+          }
+        }
+      }
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k0",
+        "value": []
+      },
+      {
+        "op": "replace",
+        "path": "/k2/k0",
+        "value": 52
+      },
+      {
+        "op": "replace",
+        "path": "/k2/k2",
+        "value": [
+          -907,
+          -582
+        ]
+      },
+      {
+        "op": "replace",
+        "path": "/k2/k4",
+        "value": []
+      },
+      {
+        "op": "replace",
+        "path": "/k4/k0/0/k2",
+        "value": null
+      },
+      {
+        "op": "remove",
+        "path": "/k4/k0/0/k4"
+      },
+      {
+        "op": "replace",
+        "path": "/k4/k0/1",
+        "value": -111
+      },
+      {
+        "op": "remove",
+        "path": "/k4/k1"
+      }
+    ],
+    "result": {
+      "k0": [],
+      "k2": {
+        "k0": 52,
+        "k2": [
+          -907,
+          -582
+        ],
+        "k4": []
+      },
+      "k4": {
+        "k0": [
+          {
+            "k2": null
+          },
+          -111
+        ]
+      }
+    }
+  },
+  {
+    "name": "random 5",
+    "doc": {
+      "k5": [
+        {
+          "k5": [
+            null,
+            153.5,
+            false
+          ]
+        },
+        {
+          "k1": -477
+        },
+        {
+          "k1": false,
+          "k4": "s62"
+        },
+        [
+          [
+            true,
+            425.5,
+            551.5
+          ],
+          {
+            "k1": 350.5,
+            "k2": 587.5,
+            "k3": 992
+          },
+          503.5,
+          true
+        ]
+      ]
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k5/0/k5/1",
+        "value": false
+      },
+      {
+        "op": "add",
+        "path": "/k5/0/new1",
+        "value": {
+          "k3": {
+            "k0": "s29",
+            "k3": null,
+            "k4": 400.5
+          }
+        }
+      },
+      {
+        "op": "remove",
+        "path": "/k5/2/k1"
+      },
+      {
+        "op": "replace",
+        "path": "/k5/3/0/1",
+        "value": 405.5
+      },
+      {
+        "op": "replace",
+        "path": "/k5/3/1/k2",
+        "value": {
+          "k1": {
+            "k0": null
+          },
+          "k5": {
+            "k2": "s80"
+          }
+        }
+      },
+      {
+        "op": "replace",
+        "path": "/k5/3/1/k3",
+        "value": {
+          "k1": true,
+          "k2": [
+            896.5,
+            -575,
+            "s10"
+          ],
+          "k3": false
+        }
+      },
+      {
+        "op": "remove",
+        "path": "/k5/3/1/k1"
+      },
+      {
+        "op": "replace",
+        "path": "/k5/3/2",
+        "value": "s16"
+      },
+      {
+        "op": "replace",
+        "path": "/k5/3/3",
+        "value": null
+      },
+      {
+        "op": "add",
+        "path": "/k5/3/4",
+        "value": {
+          "k0": false,
+          "k1": "s37",
+          "k3": 491.5
+        }
+      }
+    ],
+    "result": {
+      "k5": [
+        {
+          "k5": [
+            null,
+            false,
+            false
+          ],
+          "new1": {
+            "k3": {
+              "k0": "s29",
+              "k3": null,
+              "k4": 400.5
+            }
+          }
+        },
+        {
+          "k1": -477
+        },
+        {
+          "k4": "s62"
+        },
+        [
+          [
+            true,
+            405.5,
+            551.5
+          ],
+          {
+            "k2": {
+              "k1": {
+                "k0": null
+              },
+              "k5": {
+                "k2": "s80"
+              }
+            },
+            "k3": {
+              "k1": true,
+              "k2": [
+                896.5,
+                -575,
+                "s10"
+              ],
+              "k3": false
+            }
+          },
+          "s16",
+          null,
+          {
+            "k0": false,
+            "k1": "s37",
+            "k3": 491.5
+          }
+        ]
+      ]
+    }
+  },
+  {
+    "name": "random 6",
+    "doc": {
+      "k0": [
+        [
+          "s31"
+        ]
+      ],
+      "k2": []
+    },
+    "patch": [
+      {
+        "op": "remove",
+        "path": "/k0/0"
+      },
+      {
+        "op": "add",
+        "path": "/k2/0",
+        "value": -861
+      }
+    ],
+    "result": {
+      "k0": [],
+      "k2": [
+        -861
+      ]
+    }
+  },
+  {
+    "name": "random 7",
+    "doc": {
+      "k0": -149,
+      "k4": true,
+      "k5": [
+        492,
+        {
+          "k0": [
+            -438
+          ],
+          "k1": [],
+          "k4": [
+            null
+          ],
+          "k5": 854.5
+        },
+        {
+          "k4": []
+        },
+        [
+          {
+            "k3": 14.5,
+            "k4": null
+          },
+          {
+            "k1": true,
+            "k3": null,
+            "k5": null
+          }
+        ]
+      ]
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k5/0",
+        "value": 56.5
+      },
+      {
+        "op": "remove",
+        "path": "/k5/1/k0/0"
+      },
+      {
+        "op": "remove",
+        "path": "/k5/1/k4/0"
+      },
+      {
+        "op": "replace",
+        "path": "/k5/1/k5",
+        "value": [
+          [
+            464.5
+          ],
+          null,
+          "s38",
+          [
+            944.5
+          ]
+        ]
+      },
+      {
+        "op": "add",
+        "path": "/k5/1/new2",
+        "value": [
+          [
+            "s22",
+            92
+          ],
+          {
+            "k4": null,
+            "k5": "s86"
+          },
+          [
+            700.5,
+            "s69",
+            true
+          ],
+          false
+        ]
+      },
+      {
+        "op": "remove",
+        "path": "/k5/1/k1"
+      },
+      {
+        "op": "add",
+        "path": "/k5/2/new5",
+        "value": []
+      },
+      {
+        "op": "add",
+        "path": "/k5/3/0/k1",
+        "value": true
+      },
+      {
+        "op": "replace",
+        "path": "/k5/3/0/k3",
+        "value": null
+      },
+      {
+        "op": "add",
+        "path": "/k5/3/0/k5",
+        "value": null
+      },
+      {
+        "op": "remove",
+        "path": "/k5/3/0/k4"
+      },
+      {
+        "op": "remove",
+        "path": "/k5/3/1"
+      },
+      {
+        "op": "add",
+        "path": "/new1",
+        "value": {
+          "k0": false,
+          "k4": {
+            "k0": null,
+            "k5": null
+          },
+          "k5": {
+            "k0": null,
+            "k2": -535,
+            "k4": true,
+            "k5": 524
+          }
+        }
+      }
+    ],
+    "result": {
+      "k0": -149,
+      "k4": true,
+      "k5": [
+        56.5,
+        {
+          "k0": [],
+          "k4": [],
+          "k5": [
+            [
+              464.5
+            ],
+            null,
+            "s38",
+            [
+              944.5
+            ]
+          ],
+          "new2": [
+            [
+              "s22",
+              92
+            ],
+            {
+              "k4": null,
+              "k5": "s86"
+            },
+            [
+              700.5,
+              "s69",
+              true
+            ],
+            false
+          ]
+        },
+        {
+          "k4": [],
+          "new5": []
+        },
+        [
+          {
+            "k1": true,
+            "k3": null,
+            "k5": null
+          }
+        ]
+      ],
+      "new1": {
+        "k0": false,
+        "k4": {
+          "k0": null,
+          "k5": null
+        },
+        "k5": {
+          "k0": null,
+          "k2": -535,
+          "k4": true,
+          "k5": 524
+        }
+      }
+    }
+  },
+  {
+    "name": "random 8",
+    "doc": {
+      "k1": [
+        {
+          "k0": [
+            -633
+          ],
+          "k1": {
+            "k2": null,
+            "k4": 715
+          },
+          "k2": "s70"
+        },
+        [
+          "s18",
+          true,
+          "s67"
+        ],
+        [
+          96.5
+        ],
+        {
+          "k2": {
+            "k0": false
+          },
+          "k3": true
+        }
+      ]
+    },
+    "patch": [
+      {
+        "op": "remove",
+        "path": "/k1"
+      }
+    ],
+    "result": {}
+  },
+  {
+    "name": "random 9",
+    "doc": {
+      "k0": {
+        "k0": {
+          "k3": null,
+          "k4": {
+            "k1": "s7",
+            "k5": null
+          }
+        },
+        "k2": 388.5,
+        "k4": {
+          "k3": {
+            "k5": null
+          },
+          "k4": -395
+        }
+      },
+      "k2": [
+        [
+          false
+        ]
+      ],
+      "k4": {
+        "k4": [
+          [
+            true
+          ]
+        ],
+        "k5": 128
+      }
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k0",
+        "value": true
+      },
+      {
+        "op": "replace",
+        "path": "/k2",
+        "value": {
+          "k1": [],
+          "k2": [],
+          "k5": 615.5
+        }
+      },
+      {
+        "op": "remove",
+        "path": "/k4/k4/0"
+      }
+    ],
+    "result": {
+      "k0": true,
+      "k2": {
+        "k1": [],
+        "k2": [],
+        "k5": 615.5
+      },
+      "k4": {
+        "k4": [],
+        "k5": 128
+      }
+    }
+  },
+  {
+    "name": "random 10",
+    "doc": {
+      "k3": {
+        "k4": [
+          -773,
+          162.5,
+          null,
+          "s71"
+        ],
+        "k5": {
+          "k1": 891
+        }
+      }
+    },
+    "patch": [
+      {
+        "op": "remove",
+        "path": "/k3"
+      }
+    ],
+    "result": {}
+  },
+  {
+    "name": "random 11",
+    "doc": {
+      "k0": [
+        {
+          "k1": {
+            "k1": 188.5,
+            "k4": 152.5,
+            "k5": "s7"
+          }
+        },
+        null,
+        457.5,
+        false
+      ],
+      "k2": {
+        "k0": null,
+        "k5": 772
+      },
+      "k5": [
+        {
+          "k5": {
+            "k2": -800,
+            "k3": false,
+            "k5": null
+          }
+        }
+      ]
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k0/0/k1/k5",
+        "value": true
+      },
+      {
+        "op": "remove",
+        "path": "/k0/0/k1/k1"
+      },
+      {
+        "op": "add",
+        "path": "/k0/0/new4",
+        "value": 76.5
+      },
+      {
+        "op": "replace",
+        "path": "/k0/1",
+        "value": 457.5
+      },
+      {
+        "op": "replace",
+        "path": "/k0/2",
+        "value": false
+      },
+      {
+        "op": "remove",
+        "path": "/k0/3"
+      },
+      {
+        "op": "remove",
+        "path": "/k2/k5"
+      },
+      {
+        "op": "replace",
+        "path": "/k5/0",
+        "value": -289
+      }
+    ],
+    "result": {
+      "k0": [
+        {
+          "k1": {
+            "k4": 152.5,
+            "k5": true
+          },
+          "new4": 76.5
+        },
+        457.5,
+        false
+      ],
+      "k2": {
+        "k0": null
+      },
+      "k5": [
+        -289
+      ]
+    }
+  },
+  {
+    "name": "random 12",
+    "doc": {
+      "k2": null,
+      "k4": {
+        "k0": [],
+        "k1": true,
+        "k4": [
+          false
+        ]
+      }
+    },
+    "patch": [
+      {
+        "op": "add",
+        "path": "/k4/k0/0",
+        "value": {
+          "k0": true,
+          "k2": true
+        }
+      },
+      {
+        "op": "replace",
+        "path": "/k4/k1",
+        "value": null
+      },
+      {
+        "op": "add",
+        "path": "/new0",
+        "value": {
+          "k3": {
+            "k3": null,
+            "k4": 800.5
+          },
+          "k4": {
+            "k0": 59.5,
+            "k3": null
+          }
+        }
+      }
+    ],
+    "result": {
+      "k2": null,
+      "k4": {
+        "k0": [
+          {
+            "k0": true,
+            "k2": true
+          }
+        ],
+        "k1": null,
+        "k4": [
+          false
+        ]
+      },
+      "new0": {
+        "k3": {
+          "k3": null,
+          "k4": 800.5
+        },
+        "k4": {
+          "k0": 59.5,
+          "k3": null
+        }
+      }
+    }
+  },
+  {
+    "name": "random 13",
+    "doc": {
+      "k0": {
+        "k3": {
+          "k4": [
+            327,
+            null,
+            352.5
+          ]
+        },
+        "k5": 646.5
+      },
+      "k1": [],
+      "k2": {
+        "k1": null
+      },
+      "k3": "s4"
+    },
+    "patch": [
+      {
+        "op": "remove",
+        "path": "/k0/k3"
+      },
+      {
+        "op": "add",
+        "path": "/k1/0",
+        "value": [
+          597.5
+        ]
+      },
+      {
+        "op": "remove",
+        "path": "/k2"
+      }
+    ],
+    "result": {
+      "k0": {
+        "k5": 646.5
+      },
+      "k1": [
+        [
+          597.5
+        ]
+      ],
+      "k3": "s4"
+    }
+  },
+  {
+    "name": "random 14",
+    "doc": {
+      "k0": []
+    },
+    "patch": [
+      {
+        "op": "add",
+        "path": "/new5",
+        "value": {
+          "k0": {
+            "k2": "s8"
+          },
+          "k3": []
+        }
+      }
+    ],
+    "result": {
+      "k0": [],
+      "new5": {
+        "k0": {
+          "k2": "s8"
+        },
+        "k3": []
+      }
+    }
+  },
+  {
+    "name": "random 15",
+    "doc": {
+      "k0": 896.5,
+      "k4": 100.5,
+      "k5": [
+        null,
+        [
+          [
+            641.5,
+            "s44",
+            false,
+            427.5
+          ],
+          [
+            "s19",
+            true,
+            "s19"
+          ],
+          {
+            "k0": -868,
+            "k4": "s36"
+          }
+        ]
+      ]
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k5/1",
+        "value": {
+          "k1": "s80",
+          "k4": false,
+          "k5": 322.5
+        }
+      },
+      {
+        "op": "add",
+        "path": "/k5/2",
+        "value": [
+          [
+            641.5,
+            323.5,
+            427.5
+          ],
+          true,
+          [
+            "s19",
+            true,
+            "s19"
+          ],
+          {
+            "k4": "s36"
+          }
+        ]
+      },
+      {
+        "op": "add",
+        "path": "/new5",
+        "value": [
+          [
+            943,
+            875.5,
+            -220,
+            false
+          ],
+          [
+            null,
+            true,
+            null
+          ],
+          "s26",
+          {
+            "k1": false,
+            "k2": true
+          }
+        ]
+      }
+    ],
+    "result": {
+      "k0": 896.5,
+      "k4": 100.5,
+      "k5": [
+        null,
+        {
+          "k1": "s80",
+          "k4": false,
+          "k5": 322.5
+        },
+        [
+          [
+            641.5,
+            323.5,
+            427.5
+          ],
+          true,
+          [
+            "s19",
+            true,
+            "s19"
+          ],
+          {
+            "k4": "s36"
+          }
+        ]
+      ],
+      "new5": [
+        [
+          943,
+          875.5,
+          -220,
+          false
+        ],
+        [
+          null,
+          true,
+          null
+        ],
+        "s26",
+        {
+          "k1": false,
+          "k2": true
+        }
+      ]
+    }
+  },
+  {
+    "name": "random 16",
+    "doc": {
+      "k1": {
+        "k0": {
+          "k0": {
+            "k1": "s43",
+            "k2": null,
+            "k3": 629.5,
+            "k4": 147.5
+          },
+          "k1": 656.5
+        },
+        "k5": null
+      }
+    },
+    "patch": [
+      {
+        "op": "remove",
+        "path": "/k1"
+      }
+    ],
+    "result": {}
+  },
+  {
+    "name": "random 17",
+    "doc": {
+      "k4": -288
+    },
+    "patch": [
+      {
+        "op": "add",
+        "path": "/new1",
+        "value": [
+          837.5
+        ]
+      },
+      {
+        "op": "remove",
+        "path": "/k4"
+      }
+    ],
+    "result": {
+      "new1": [
+        837.5
+      ]
+    }
+  },
+  {
+    "name": "random 18",
+    "doc": {
+      "k0": 259.5,
+      "k3": {
+        "k2": [
+          [],
+          [
+            474.5
+          ]
+        ],
+        "k3": [
+          [
+            true,
+            650.5
+          ],
+          [
+            "s45",
+            "s65",
+            753,
+            130.5
+          ]
+        ],
+        "k4": [
+          {
+            "k1": null
+          },
+          false,
+          976.5
+        ]
+      },
+      "k4": [
+        {
+          "k2": "s77",
+          "k5": 644.5
+        }
+      ]
+    },
+    "patch": [
+      {
+        "op": "add",
+        "path": "/k3/k2/0/0",
+        "value": null
+      },
+      {
+        "op": "remove",
+        "path": "/k3/k2/1"
+      },
+      {
+        "op": "replace",
+        "path": "/k3/k3",
+        "value": {
+          "k0": [],
+          "k2": [
+            523.5
+          ]
+        }
+      },
+      {
+        "op": "remove",
+        "path": "/k3/k4"
+      },
+      {
+        "op": "remove",
+        "path": "/k4/0/k5"
+      },
+      {
+        "op": "add",
+        "path": "/new4",
+        "value": 708
+      }
+    ],
+    "result": {
+      "k0": 259.5,
+      "k3": {
+        "k2": [
+          [
+            null
+          ]
+        ],
+        "k3": {
+          "k0": [],
+          "k2": [
+            523.5
+          ]
+        }
+      },
+      "k4": [
+        {
+          "k2": "s77"
+        }
+      ],
+      "new4": 708
+    }
+  },
+  {
+    "name": "random 19",
+    "doc": {
+      "k5": [
+        [
+          false,
+          [],
+          {
+            "k2": -867,
+            "k5": -749
+          },
+          320.5
+        ],
+        null,
+        540,
+        {
+          "k2": {
+            "k0": 973.5
+          }
+        }
+      ]
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k5/0/0",
+        "value": [
+          303
+        ]
+      },
+      {
+        "op": "replace",
+        "path": "/k5/0/1",
+        "value": {
+          "k2": -867,
+          "k5": -749
+        }
+      },
+      {
+        "op": "replace",
+        "path": "/k5/0/2",
+        "value": 320.5
+      },
+      {
+        "op": "remove",
+        "path": "/k5/0/3"
+      },
+      {
+        "op": "replace",
+        "path": "/k5/3/k2/k0",
+        "value": {
+          "k3": {
+            "k3": 257.5,
+            "k4": "s43"
+          }
+        }
+      },
+      {
+        "op": "add",
+        "path": "/k5/4",
+        "value": []
+      }
+    ],
+    "result": {
+      "k5": [
+        [
+          [
+            303
+          ],
+          {
+            "k2": -867,
+            "k5": -749
+          },
+          320.5
+        ],
+        null,
+        540,
+        {
+          "k2": {
+            "k0": {
+              "k3": {
+                "k3": 257.5,
+                "k4": "s43"
+              }
+            }
+          }
+        },
+        []
+      ]
+    }
+  },
+  {
+    "name": "random 20",
+    "doc": {
+      "k0": [
+        {
+          "k1": [
+            true
+          ],
+          "k3": {
+            "k0": false,
+            "k2": 419,
+            "k3": null
+          },
+          "k5": {
+            "k4": "s36"
+          }
+        }
+      ]
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k0/0",
+        "value": [
+          true,
+          true,
+          "s50"
+        ]
+      },
+      {
+        "op": "add",
+        "path": "/k0/1",
+        "value": null
+      },
+      {
+        "op": "add",
+        "path": "/k0/2",
+        "value": []
+      },
+      {
+        "op": "add",
+        "path": "/k0/3",
+        "value": [
+          null
+        ]
+      }
+    ],
+    "result": {
+      "k0": [
+        [
+          true,
+          true,
+          "s50"
+        ],
+        null,
+        [],
+        [
+          null
+        ]
+      ]
+    }
+  },
+  {
+    "name": "random 21",
+    "doc": {
+      "k4": false,
+      "k5": {
+        "k0": [
+          [
+            true,
+            307,
+            "s36"
+          ],
+          806.5,
+          {
+            "k0": null,
+            "k2": null
+          }
+        ],
+        "k3": [
+          {
+            "k0": 553.5,
+            "k1": 232.5,
+            "k5": 371.5
+          }
+        ],
+        "k5": []
+      }
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k5",
+        "value": 536
+      }
+    ],
+    "result": {
+      "k4": false,
+      "k5": 536
+    }
+  },
+  {
+    "name": "random 22",
+    "doc": {
+      "k2": null
+    },
+    "patch": [
+      {
+        "op": "remove",
+        "path": "/k2"
+      }
+    ],
+    "result": {}
+  },
+  {
+    "name": "random 23",
+    "doc": {
+      "k0": [
+        true,
+        null,
+        {
+          "k1": false
+        }
+      ],
+      "k3": [
+        [],
+        70.5,
+        [
+          [
+            true
+          ]
+        ],
+        {
+          "k1": null,
+          "k4": -318
+        }
+      ]
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k0/0",
+        "value": -338
+      },
+      {
+        "op": "replace",
+        "path": "/k0/1",
+        "value": -79
+      },
+      {
+        "op": "replace",
+        "path": "/k0/2/k1",
+        "value": [
+          false
+        ]
+      },
+      {
+        "op": "add",
+        "path": "/k3/0/0",
+        "value": "s36"
+      },
+      {
+        "op": "replace",
+        "path": "/k3/1",
+        "value": 291.5
+      },
+      {
+        "op": "add",
+        "path": "/k3/2/0/1",
+        "value": [
+          "s79",
+          776.5,
+          "s88",
+          -690
+        ]
+      },
+      {
+        "op": "replace",
+        "path": "/k3/3/k1",
+        "value": -633
+      }
+    ],
+    "result": {
+      "k0": [
+        -338,
+        -79,
+        {
+          "k1": [
+            false
+          ]
+        }
+      ],
+      "k3": [
+        [
+          "s36"
+        ],
+        291.5,
+        [
+          [
+            true,
+            [
+              "s79",
+              776.5,
+              "s88",
+              -690
+            ]
+          ]
+        ],
+        {
+          "k1": -633,
+          "k4": -318
+        }
+      ]
+    }
+  },
+  {
+    "name": "random 24",
+    "doc": {
+      "k1": [
+        {
+          "k2": [
+            true
+          ],
+          "k5": [
+            970.5,
+            false,
+            null,
+            "s35"
+          ]
+        },
+        {
+          "k3": {
+            "k1": null,
+            "k5": null
+          }
+        }
+      ],
+      "k2": -386,
+      "k3": {
+        "k0": [
+          {
+            "k2": "s91"
+          },
+          [
+            true,
+            -423
+          ]
+        ],
+        "k2": [],
+        "k4": -854
+      }
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k1/0/k2/0",
+        "value": [
+          false,
+          true,
+          "s10"
+        ]
+      },
+      {
+        "op": "add",
+        "path": "/k1/0/k2/1",
+        "value": null
+      },
+      {
+        "op": "remove",
+        "path": "/k1/0/k5"
+      },
+      {
+        "op": "add",
+        "path": "/k1/1/new3",
+        "value": {
+          "k2": {
+            "k0": -816,
+            "k1": 738.5,
+            "k4": "s71"
+          },
+          "k4": [
+            275.5,
+            true,
+            372
+          ]
+        }
+      },
+      {
+        "op": "remove",
+        "path": "/k1/1/k3"
+      },
+      {
+        "op": "add",
+        "path": "/new1",
+        "value": [
+          -850,
+          522.5,
+          [
+            "s11"
+          ]
+        ]
+      },
+      {
+        "op": "remove",
+        "path": "/k3"
+      }
+    ],
+    "result": {
+      "k1": [
+        {
+          "k2": [
+            [
+              false,
+              true,
+              "s10"
+            ],
+            null
+          ]
+        },
+        {
+          "new3": {
+            "k2": {
+              "k0": -816,
+              "k1": 738.5,
+              "k4": "s71"
+            },
+            "k4": [
+              275.5,
+              true,
+              372
+            ]
+          }
+        }
+      ],
+      "k2": -386,
+      "new1": [
+        -850,
+        522.5,
+        [
+          "s11"
+        ]
+      ]
+    }
+  },
+  {
+    "name": "random 25",
+    "doc": {
+      "k2": {
+        "k1": {
+          "k0": [
+            752.5,
+            661,
+            963.5
+          ],
+          "k2": [
+            "s8",
+            null
+          ],
+          "k3": [
+            false
+          ],
+          "k5": {
+            "k2": -173
+          }
+        }
+      },
+      "k5": {
+        "k3": true
+      }
+    },
+    "patch": [
+      {
+        "op": "add",
+        "path": "/k2/k0",
+        "value": [
+          "s63",
+          null,
+          "s32",
+          185.5
+        ]
+      },
+      {
+        "op": "add",
+        "path": "/k2/k5",
+        "value": 152.5
+      },
+      {
+        "op": "remove",
+        "path": "/k2/k1"
+      },
+      {
+        "op": "remove",
+        "path": "/k5/k3"
+      }
+    ],
+    "result": {
+      "k2": {
+        "k0": [
+          "s63",
+          null,
+          "s32",
+          185.5
+        ],
+        "k5": 152.5
+      },
+      "k5": {}
+    }
+  },
+  {
+    "name": "random 26",
+    "doc": {
+      "k1": {
+        "k2": {
+          "k2": {
+            "k3": 451.5,
+            "k5": null
+          },
+          "k4": {
+            "k2": null
+          },
+          "k5": true
+        },
+        "k3": "s92"
+      },
+      "k2": [
+        false,
+        null,
+        {
+          "k0": [],
+          "k2": [
+            "s73",
+            false,
+            -426
+          ]
+        },
+        {
+          "k1": "s66",
+          "k4": null
+        }
+      ],
+      "k3": [
+        [
+          false,
+          [
+            -445,
+            731.5,
+            "s98",
+            46
+          ],
+          [
+            393,
+            null,
+            true
+          ]
+        ],
+        null,
+        {
+          "k2": false
+        }
+      ],
+      "k4": {
+        "k5": [
+          "s24",
+          {
+            "k5": null
+          },
+          [
+            false,
+            null,
+            "s45"
+          ]
+        ]
+      }
+    },
+    "patch": [
+      {
+        "op": "remove",
+        "path": "/k1/k2/k4"
+      },
+      {
+        "op": "replace",
+        "path": "/k3/0",
+        "value": null
+      },
+      {
+        "op": "replace",
+        "path": "/k3/1",
+        "value": {
+          "k2": false,
+          "new1": -624
+        }
+      },
+      {
+        "op": "remove",
+        "path": "/k3/2"
+      },
+      {
+        "op": "replace",
+        "path": "/k4/k5/1",
+        "value": [
+          "s93",
+          907.5
+        ]
+      },
+      {
+        "op": "replace",
+        "path": "/k4/k5/2",
+        "value": {
+          "k5": 430.5,
+          "new1": null
+        }
+      },
+      {
+        "op": "add",
+        "path": "/k4/k5/3",
+        "value": [
+          false,
+          null,
+          "s45"
+        ]
+      },
+      {
+        "op": "add",
+        "path": "/new4",
+        "value": [
+          {
+            "k5": "s55"
+          }
+        ]
+      },
+      {
+        "op": "remove",
+        "path": "/k2"
+      }
+    ],
+    "result": {
+      "k1": {
+        "k2": {
+          "k2": {
+            "k3": 451.5,
+            "k5": null
+          },
+          "k5": true
+        },
+        "k3": "s92"
+      },
+      "k3": [
+        null,
+        {
+          "k2": false,
+          "new1": -624
+        }
+      ],
+      "k4": {
+        "k5": [
+          "s24",
+          [
+            "s93",
+            907.5
+          ],
+          {
+            "k5": 430.5,
+            "new1": null
+          },
+          [
+            false,
+            null,
+            "s45"
+          ]
+        ]
+      },
+      "new4": [
+        {
+          "k5": "s55"
+        }
+      ]
+    }
+  },
+  {
+    "name": "random 27",
+    "doc": {
+      "k1": [
+        -417,
+        [
+          null
+        ]
+      ],
+      "k5": {
+        "k1": -11,
+        "k3": {
+          "k0": {
+            "k0": "s87",
+            "k2": 200,
+            "k4": 372.5,
+            "k5": "s65"
+          },
+          "k5": [
+            true,
+            "s15",
+            "s75",
+            "s40"
+          ]
+        },
+        "k4": true,
+        "k5": 35.5
+      }
+    },
+    "patch": [
+      {
+        "op": "add",
+        "path": "/k1/2",
+        "value": [
+          null,
+          {
+            "k4": "s12"
+          }
+        ]
+      },
+      {
+        "op": "replace",
+        "path": "/k5/k3/k0",
+        "value": [
+          null
+        ]
+      },
+      {
+        "op": "add",
+        "path": "/k5/k3/new5",
+        "value": false
+      },
+      {
+        "op": "replace",
+        "path": "/k5/k5",
+        "value": "s42"
+      }
+    ],
+    "result": {
+      "k1": [
+        -417,
+        [
+          null
+        ],
+        [
+          null,
+          {
+            "k4": "s12"
+          }
+        ]
+      ],
+      "k5": {
+        "k1": -11,
+        "k3": {
+          "k0": [
+            null
+          ],
+          "k5": [
+            true,
+            "s15",
+            "s75",
+            "s40"
+          ],
+          "new5": false
+        },
+        "k4": true,
+        "k5": "s42"
+      }
+    }
+  },
+  {
+    "name": "random 28",
+    "doc": {
+      "k3": {
+        "k3": {
+          "k4": []
+        },
+        "k4": "s92",
+        "k5": 138.5
+      }
+    },
+    "patch": [
+      {
+        "op": "add",
+        "path": "/new1",
+        "value": [
+          [
+            "s3"
+          ],
+          {
+            "k3": -482,
+            "k4": null
+          },
+          [],
+          {
+            "k2": 792.5,
+            "k3": true
+          }
+        ]
+      },
+      {
+        "op": "remove",
+        "path": "/k3"
+      }
+    ],
+    "result": {
+      "new1": [
+        [
+          "s3"
+        ],
+        {
+          "k3": -482,
+          "k4": null
+        },
+        [],
+        {
+          "k2": 792.5,
+          "k3": true
+        }
+      ]
+    }
+  },
+  {
+    "name": "random 29",
+    "doc": {
+      "k2": {
+        "k2": {
+          "k3": true
+        },
+        "k3": 93.5
+      },
+      "k4": [
+        {
+          "k3": [
+            false
+          ],
+          "k4": true
+        }
+      ]
+    },
+    "patch": [
+      {
+        "op": "add",
+        "path": "/k2/k2/new4",
+        "value": {
+          "k3": {
+            "k1": "s17"
+          }
+        }
+      },
+      {
+        "op": "remove",
+        "path": "/k4/0"
+      }
+    ],
+    "result": {
+      "k2": {
+        "k2": {
+          "k3": true,
+          "new4": {
+            "k3": {
+              "k1": "s17"
+            }
+          }
+        },
+        "k3": 93.5
+      },
+      "k4": []
+    }
+  },
+  {
+    "name": "random 30",
+    "doc": {
+      "k0": true,
+      "k3": []
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k0",
+        "value": {
+          "k3": []
+        }
+      },
+      {
+        "op": "add",
+        "path": "/new5",
+        "value": 891.5
+      },
+      {
+        "op": "remove",
+        "path": "/k3"
+      }
+    ],
+    "result": {
+      "k0": {
+        "k3": []
+      },
+      "new5": 891.5
+    }
+  },
+  {
+    "name": "random 31",
+    "doc": {
+      "k2": [
+        {
+          "k1": [
+            201.5,
+            "s80",
+            -616
+          ]
+        },
+        [
+          [
+            "s59",
+            null
+          ],
+          {
+            "k3": null
+          },
+          [
+            449,
+            true,
+            null,
+            -756
+          ],
+          {
+            "k4": "s69"
+          }
+        ],
+        863
+      ],
+      "k4": true
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k2",
+        "value": null
+      }
+    ],
+    "result": {
+      "k2": null,
+      "k4": true
+    }
+  },
+  {
+    "name": "random 32",
+    "doc": {
+      "k0": {
+        "k5": 517
+      },
+      "k1": [],
+      "k4": "s55",
+      "k5": []
+    },
+    "patch": [
+      {
+        "op": "add",
+        "path": "/k0/k3",
+        "value": -602
+      },
+      {
+        "op": "remove",
+        "path": "/k0/k5"
+      },
+      {
+        "op": "add",
+        "path": "/k1/0",
+        "value": [
+          "s49",
+          -544,
+          343.5
+        ]
+      }
+    ],
+    "result": {
+      "k0": {
+        "k3": -602
+      },
+      "k1": [
+        [
+          "s49",
+          -544,
+          343.5
+        ]
+      ],
+      "k4": "s55",
+      "k5": []
+    }
+  },
+  {
+    "name": "random 33",
+    "doc": {
+      "k1": {
+        "k0": 179.5
+      },
+      "k2": null
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k2",
+        "value": false
+      },
+      {
+        "op": "add",
+        "path": "/new5",
+        "value": []
+      },
+      {
+        "op": "remove",
+        "path": "/k1"
+      }
+    ],
+    "result": {
+      "k2": false,
+      "new5": []
+    }
+  },
+  {
+    "name": "random 34",
+    "doc": {
+      "k0": {
+        "k1": [
+          {
+            "k1": null,
+            "k3": null
+          },
+          "s88"
+        ],
+        "k5": [
+          [],
+          false,
+          null,
+          {
+            "k0": null,
+            "k4": "s97",
+            "k5": 795
+          }
+        ]
+      },
+      "k1": [
+        true,
+        "s4"
+      ],
+      "k3": {
+        "k0": "s21",
+        "k3": null,
+        "k5": null
+      }
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k0",
+        "value": []
+      },
+      {
+        "op": "replace",
+        "path": "/k1/0",
+        "value": null
+      },
+      {
+        "op": "remove",
+        "path": "/k1/1"
+      },
+      {
+        "op": "replace",
+        "path": "/k3/k3",
+        "value": 280
+      },
+      {
+        "op": "replace",
+        "path": "/k3/k5",
+        "value": "s47"
+      },
+      {
+        "op": "remove",
+        "path": "/k3/k0"
+      }
+    ],
+    "result": {
+      "k0": [],
+      "k1": [
+        null
+      ],
+      "k3": {
+        "k3": 280,
+        "k5": "s47"
+      }
+    }
+  },
+  {
+    "name": "random 35",
+    "doc": {
+      "k1": [
+        29,
+        239.5,
+        []
+      ]
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k1/0",
+        "value": "s54"
+      },
+      {
+        "op": "replace",
+        "path": "/k1/1",
+        "value": {
+          "k5": false
+        }
+      },
+      {
+        "op": "replace",
+        "path": "/k1/2",
+        "value": "s58"
+      },
+      {
+        "op": "add",
+        "path": "/k1/3",
+        "value": []
+      }
+    ],
+    "result": {
+      "k1": [
+        "s54",
+        {
+          "k5": false
+        },
+        "s58",
+        []
+      ]
+    }
+  },
+  {
+    "name": "random 36",
+    "doc": {
+      "k0": {
+        "k0": {
+          "k5": 99.5
+        }
+      },
+      "k2": true,
+      "k5": {
+        "k4": {
+          "k1": {
+            "k1": 418,
+            "k3": false,
+            "k4": 78.5
+          }
+        },
+        "k5": [
+          "s75",
+          [
+            -191,
+            "s33",
+            -382
+          ],
+          761,
+          {
+            "k1": "s66",
+            "k3": 301.5,
+            "k4": 454
+          }
+        ]
+      }
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k0",
+        "value": 524.5
+      },
+      {
+        "op": "add",
+        "path": "/k5/k1",
+        "value": []
+      },
+      {
+        "op": "remove",
+        "path": "/k5/k4"
+      },
+      {
+        "op": "remove",
+        "path": "/k5/k5"
+      }
+    ],
+    "result": {
+      "k0": 524.5,
+      "k2": true,
+      "k5": {
+        "k1": []
+      }
+    }
+  },
+  {
+    "name": "random 37",
+    "doc": {
+      "k0": [
+        [
+          {
+            "k0": null,
+            "k2": true,
+            "k4": 56
+          }
+        ],
+        [
+          {
+            "k5": null
+          },
+          [
+            true
+          ],
+          {
+            "k1": null,
+            "k2": "s98"
+          }
+        ],
+        "s30",
+        false
+      ],
+      "k3": 724,
+      "k4": [
+        {
+          "k3": []
+        }
+      ],
+      "k5": [
+        {
+          "k0": "s96"
+        },
+        -653
+      ]
+    },
+    "patch": [
+      {
+        "op": "add",
+        "path": "/k0/0/1",
+        "value": {
+          "k0": "s23",
+          "k1": 199.5
+        }
+      },
+      {
+        "op": "replace",
+        "path": "/k0/1/0/k5",
+        "value": 698
+      },
+      {
+        "op": "add",
+        "path": "/k0/1/0/new2",
+        "value": []
+      },
+      {
+        "op": "replace",
+        "path": "/k0/1/1",
+        "value": {
+          "k1": [
+            [
+              "s15"
+            ],
+            {
+              "k3": true,
+              "k5": null
+            }
+          ],
+          "k2": "s98"
+        }
+      },
+      {
+        "op": "remove",
+        "path": "/k0/1/2"
+      },
+      {
+        "op": "add",
+        "path": "/k0/4",
+        "value": -354
+      },
+      {
+        "op": "replace",
+        "path": "/k5/0/k0",
+        "value": [
+          {
+            "k1": false
+          },
+          {
+            "k0": true,
+            "k2": null
+          },
+          {
+            "k0": 952.5,
+            "k1": "s69",
+            "k5": "s13"
+          },
+          {
+            "k4": true,
+            "k5": null
+          }
+        ]
+      },
+      {
+        "op": "remove",
+        "path": "/k5/1"
+      },
+      {
+        "op": "remove",
+        "path": "/k3"
+      },
+      {
+        "op": "remove",
+        "path": "/k4"
+      }
+    ],
+    "result": {
+      "k0": [
+        [
+          {
+            "k0": null,
+            "k2": true,
+            "k4": 56
+          },
+          {
+            "k0": "s23",
+            "k1": 199.5
+          }
+        ],
+        [
+          {
+            "k5": 698,
+            "new2": []
+          },
+          {
+            "k1": [
+              [
+                "s15"
+              ],
+              {
+                "k3": true,
+                "k5": null
+              }
+            ],
+            "k2": "s98"
+          }
+        ],
+        "s30",
+        false,
+        -354
+      ],
+      "k5": [
+        {
+          "k0": [
+            {
+              "k1": false
+            },
+            {
+              "k0": true,
+              "k2": null
+            },
+            {
+              "k0": 952.5,
+              "k1": "s69",
+              "k5": "s13"
+            },
+            {
+              "k4": true,
+              "k5": null
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "name": "random 38",
+    "doc": {
+      "k1": {
+        "k0": []
+      },
+      "k4": 604,
+      "k5": []
+    },
+    "patch": [
+      {
+        "op": "add",
+        "path": "/k1/new3",
+        "value": {
+          "k1": [],
+          "k5": {
+            "k1": true,
+            "k4": -421
+          }
+        }
+      },
+      {
+        "op": "remove",
+        "path": "/k1/k0"
+      },
+      {
+        "op": "remove",
+        "path": "/k5"
+      }
+    ],
+    "result": {
+      "k1": {
+        "new3": {
+          "k1": [],
+          "k5": {
+            "k1": true,
+            "k4": -421
+          }
+        }
+      },
+      "k4": 604
+    }
+  },
+  {
+    "name": "random 39",
+    "doc": {
+      "k0": {
+        "k0": [
+          {
+            "k0": 297.5,
+            "k3": -187,
+            "k5": 774
+          },
+          -586
+        ],
+        "k1": false,
+        "k3": [
+          {
+            "k1": -468,
+            "k2": "s75"
+          }
+        ],
+        "k5": true
+      }
+    },
+    "patch": [
+      {
+        "op": "replace",
+        "path": "/k0/k0/0/k0",
+        "value": 568.5
+      },
+      {
+        "op": "replace",
+        "path": "/k0/k0/0/k3",
+        "value": 442
+      },
+      {
+        "op": "remove",
+        "path": "/k0/k0/0/k5"
+      },
+      {
+        "op": "add",
+        "path": "/k0/k0/2",
+        "value": [
+          false,
+          851,
+          false
+        ]
+      },
+      {
+        "op": "replace",
+        "path": "/k0/k3/0/k1",
+        "value": 544.5
+      },
+      {
+        "op": "replace",
+        "path": "/k0/k3/0/k2",
+        "value": null
+      },
+      {
+        "op": "add",
+        "path": "/k0/k3/0/new1",
+        "value": "s98"
+      },
+      {
+        "op": "remove",
+        "path": "/k0/k1"
+      }
+    ],
+    "result": {
+      "k0": {
+        "k0": [
+          {
+            "k0": 568.5,
+            "k3": 442
+          },
+          -586,
+          [
+            false,
+            851,
+            false
+          ]
+        ],
+        "k3": [
+          {
+            "k1": 544.5,
+            "k2": null,
+            "new1": "s98"
+          }
+        ],
+        "k5": true
+      }
+    }
+  }
+]

@@ -15,7 +15,7 @@ pub struct InFlight {
     pub covered: Vec<Uuid>,
     pub kind: UploadKind,
     pub base_hash: Option<String>,
-    /// In memory only; becomes the shadow on success.
+    /// In memory only; compared with the reply's content to log a divergence.
     pub sent_content: Value,
 }
 
@@ -126,8 +126,10 @@ pub fn settle(
                     owner_id: doc.owner_id,
                     read_only: doc.read_only,
                 });
+                // The server's copy, never our prediction of it: if they differ, the settle
+                // invariant queues an upload of the difference.
                 ops.push(DocOp::SetShadow(Shadow {
-                    content: inflight.sent_content.clone(),
+                    content: doc.content.clone(),
                     hash: doc.hash.clone(),
                     seq: doc.seq,
                 }));
@@ -355,21 +357,47 @@ mod upload_tests {
     }
 
     #[test]
-    fn success_shadow_uses_sent_content() {
+    fn success_shadow_takes_the_replys_content() {
         let mut s = synced(json!({"n": 1}), 1);
         s.content = json!({"n": 100});
         s.rows = vec![row(1, RowKind::Update)];
         let f = inflight_update(vec![m(1)], json!({"n": 100}));
-        // The reply's content and hash differ from what was sent; the shadow keeps the sent content.
-        let mut reply = env(json!({"n": 100.0}), 2);
+        let mut reply = env(json!({"n": 100}), 2);
         reply.hash = "server-hash".into();
         let SettleResult::Ops(ops) = settle(&s, &f, &Ok(reply), ME, 0) else {
             panic!()
         };
         let after = s.project(&ops);
         assert_eq!(after.shadow.as_ref().unwrap().content, json!({"n": 100}));
-        assert_eq!(after.shadow.unwrap().hash, "server-hash");
+        assert_eq!(
+            after.shadow.unwrap().hash,
+            "server-hash",
+            "the server's hash, verbatim"
+        );
         assert!(!ops.iter().any(|o| matches!(o, DocOp::InsertMarker(_))));
+    }
+
+    #[test]
+    fn a_reply_that_differs_from_what_was_sent_queues_a_corrective_upload() {
+        let mut s = synced(json!({"n": 1}), 1);
+        s.content = json!({"n": 2});
+        s.rows = vec![row(1, RowKind::Update)];
+        let f = inflight_update(vec![m(1)], json!({"n": 2}));
+        let reply = env(json!({"n": 2, "added": true}), 2);
+        let SettleResult::Ops(ops) = settle(&s, &f, &Ok(reply), ME, 0) else {
+            panic!()
+        };
+        let after = s.project(&ops);
+        assert_eq!(
+            after.shadow.unwrap().content,
+            json!({"n": 2, "added": true})
+        );
+        assert_eq!(
+            after.content,
+            json!({"n": 2}),
+            "a reply never overwrites local content"
+        );
+        assert_eq!(after.rows.len(), 1, "a marker uploads the difference");
     }
 
     #[test]
