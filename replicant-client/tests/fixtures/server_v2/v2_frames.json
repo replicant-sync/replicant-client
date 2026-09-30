@@ -534,6 +534,7 @@
     "sync:v2",
     "upload",
     {
+      "base_hash": "8064ca1f4788d8c96d8e65d48b6a91e6ba8c594c6b6394fdd48752b3eea1ce11",
       "doc_id": "00000000-0000-0000-0000-000000000000",
       "kind": "delete",
       "payload": null,

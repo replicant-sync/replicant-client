@@ -213,7 +213,8 @@ pub(crate) async fn apply_ops(
             DocOp::SetShadow(_)
             | DocOp::SetContent(_)
             | DocOp::SetMeta { .. }
-            | DocOp::HardDelete => {}
+            | DocOp::HardDelete
+            | DocOp::Undelete => {}
         }
     }
     let after = snap.project(ops);
@@ -277,6 +278,13 @@ async fn write_document(
             refresh_search(&mut *conn, before.doc_id).await?;
         }
     }
+    if before.soft_deleted && !after.soft_deleted {
+        sqlx::query("UPDATE documents SET deleted_at = NULL WHERE id = ?")
+            .bind(&id)
+            .execute(&mut *conn)
+            .await?;
+        refresh_search(&mut *conn, before.doc_id).await?;
+    }
     // The envelope's version became the shadow: keep its provenance metadata.
     let applied = envelope.filter(|env| {
         before.shadow != after.shadow && after.shadow.as_ref().is_some_and(|s| s.seq == env.seq)
@@ -300,7 +308,8 @@ fn visible_change(before: &DocSnapshot, after: &DocSnapshot) -> bool {
         || (after.exists
             && (before.content != after.content
                 || before.owner_id != after.owner_id
-                || before.read_only != after.read_only))
+                || before.read_only != after.read_only
+                || before.soft_deleted != after.soft_deleted))
 }
 
 pub(crate) async fn insert_marker(
@@ -402,6 +411,7 @@ fn reason_str(reason: RecoverReason) -> &'static str {
         RecoverReason::Conflict => "conflict",
         RecoverReason::BecamePublication => "became_publication",
         RecoverReason::CreateRejected => "create_rejected",
+        RecoverReason::DeleteSuperseded => "delete_superseded",
     }
 }
 
@@ -595,6 +605,23 @@ mod tests {
                 .map(|(k, o)| (k.to_string(), o.to_string()))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn undelete_clears_the_soft_delete_and_logs_an_upsert() {
+        let t = temp_store().await;
+        seed_synced(&t.store, DOC, SCOPE_OWN, Some(ME), json!({"a": 1}), 1).await;
+        t.store.delete_document(ME, DOC).await.unwrap();
+        apply(&t.store, DOC, |_| vec![DocOp::DropAllRows, DocOp::Undelete]).await;
+        let after = snapshot(&t.store, DOC).await;
+        assert!(after.exists && !after.soft_deleted);
+        assert!(after.rows.is_empty());
+        let last_kind: String =
+            sqlx::query_scalar("SELECT kind FROM change_log ORDER BY local_seq DESC LIMIT 1")
+                .fetch_one(&t.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(last_kind, "upsert", "the host is told the document is back");
     }
 
     #[tokio::test]

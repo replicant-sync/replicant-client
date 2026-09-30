@@ -65,6 +65,7 @@ pub enum RecoverReason {
     Conflict,
     BecamePublication,
     CreateRejected,
+    DeleteSuperseded,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -77,6 +78,10 @@ pub enum DocEvent {
     SyncError {
         code: String,
     },
+    /// Another device changed the document after this data dir deleted it: the delete was
+    /// dropped and the newer version kept; local edits made before the delete are set aside as
+    /// a kept copy.
+    DeleteSuperseded,
 }
 
 /// A write the driver performs inside the same transaction that loaded the snapshot.
@@ -98,6 +103,8 @@ pub enum DocOp {
         error: String,
     },
     HardDelete,
+    /// Clears a local soft delete: the document is visible again.
+    Undelete,
     RecordTombstone(Seq),
     SetMembership(Membership),
     Recover {
@@ -166,6 +173,7 @@ impl DocSnapshot {
                     s.shadow = None;
                     s.soft_deleted = false;
                 }
+                DocOp::Undelete => s.soft_deleted = false,
                 DocOp::RecordTombstone(seq) => s.tombstone_seq = Some(*seq),
                 DocOp::SetMembership(mm) => {
                     match s.memberships.iter_mut().find(|x| x.scope == mm.scope) {
@@ -273,8 +281,27 @@ fn apply_upsert(
         ops.push(DocOp::SetContent(doc.content.clone()));
         return ops;
     }
-    // The pending delete is unconditional and will win; leave content and rows untouched.
+    // A delete made on an older version must not destroy another device's newer edit. An
+    // envelope holding the version it was made on (the shadow's, or our own last upload's)
+    // leaves it pending, to go out on the new base.
     if delete_pending(snap) {
+        if let Some(old) = &snap.shadow {
+            let incoming = content_hash(&doc.content);
+            if incoming != content_hash(&old.content) && incoming != content_hash(&snap.content) {
+                if content_hash(&snap.content) != content_hash(&old.content) {
+                    ops.push(DocOp::Recover {
+                        content: snap.content.clone(),
+                        reason: RecoverReason::DeleteSuperseded,
+                    });
+                }
+                ops.push(DocOp::DropAllRows);
+                ops.push(DocOp::Undelete);
+                ops.push(DocOp::SetShadow(new_shadow));
+                ops.push(DocOp::SetContent(doc.content.clone()));
+                ops.push(DocOp::Emit(DocEvent::DeleteSuperseded));
+                return ops;
+            }
+        }
         ops.push(DocOp::SetShadow(new_shadow));
         return ops;
     }
@@ -1098,20 +1125,93 @@ mod apply_change_tests {
     }
 
     #[test]
-    fn upsert_conflict_on_soft_deleted_keeps_delete_pending() {
+    fn an_upsert_that_changed_a_pending_delete_supersedes_it() {
         let mut s = synced(json!({"a": {"x": 1}}), 1);
         s.content = json!({"a": {"x": 2}});
         s.soft_deleted = true;
         s.rows = vec![row(5, RowKind::Update), row(6, RowKind::Delete)];
-        let ops = apply_change(&s, &upsert("own", json!({}), 2), ME, &APPEND);
-        assert!(!ops.iter().any(|o| matches!(
-            o,
-            DocOp::Recover { .. } | DocOp::SetContent(_) | DocOp::Emit(_)
-        )));
+        let ops = apply_change(&s, &upsert("own", json!({"a": {"x": 3}}), 2), ME, &APPEND);
+        assert!(ops.contains(&DocOp::Emit(DocEvent::DeleteSuperseded)));
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"a": {"x": 2}}),
+            reason: RecoverReason::DeleteSuperseded
+        }));
+        assert!(!ops
+            .iter()
+            .any(|op| matches!(op, DocOp::RecoverFields { .. })));
         let after = s.project(&ops);
-        assert_eq!(after.rows, s.rows);
-        assert_eq!(after.content, s.content);
+        assert!(after.exists && !after.soft_deleted);
+        assert!(after.rows.is_empty());
+        assert_eq!(after.content, json!({"a": {"x": 3}}));
         assert_eq!(after.shadow.unwrap().seq, 2);
+    }
+
+    #[test]
+    fn an_upsert_holding_the_deleted_version_keeps_the_delete() {
+        let mut s = synced(json!({"a": 1}), 1);
+        s.soft_deleted = true;
+        s.rows = vec![row(6, RowKind::Delete)];
+        let ops = apply_change(&s, &upsert("own", json!({"a": 1}), 2), ME, &APPEND);
+        assert!(!ops
+            .iter()
+            .any(|op| matches!(op, DocOp::Emit(_) | DocOp::Undelete)));
+        let after = s.project(&ops);
+        assert!(after.soft_deleted);
+        assert_eq!(after.rows, s.rows);
+        assert_eq!(
+            after.shadow.unwrap().seq,
+            2,
+            "the delete goes out on the new base"
+        );
+    }
+
+    #[test]
+    fn an_upsert_holding_our_own_last_edit_keeps_the_delete() {
+        // Our update landed but its reply was lost; then the user deleted the document.
+        let mut s = synced(json!({"a": 1}), 1);
+        s.content = json!({"a": 2});
+        s.soft_deleted = true;
+        s.rows = vec![row(5, RowKind::Update), row(6, RowKind::Delete)];
+        let ops = apply_change(&s, &upsert("own", json!({"a": 2}), 2), ME, &APPEND);
+        assert!(!ops
+            .iter()
+            .any(|op| matches!(op, DocOp::Emit(_) | DocOp::Undelete)));
+        let after = s.project(&ops);
+        assert!(after.soft_deleted);
+        assert_eq!(after.rows, s.rows);
+        assert_eq!(after.shadow.unwrap().content, json!({"a": 2}));
+    }
+
+    #[test]
+    fn a_server_copy_that_changed_a_pending_delete_supersedes_it() {
+        let mut s = synced(json!({"a": 1}), 1);
+        s.soft_deleted = true;
+        s.rows = vec![row(6, RowKind::Delete)];
+        let ops = apply_server_copy(&s, &env(json!({"a": 3}), 4), ME, &APPEND);
+        assert!(ops.contains(&DocOp::Emit(DocEvent::DeleteSuperseded)));
+        assert!(
+            !ops.iter().any(|op| matches!(op, DocOp::Recover { .. })),
+            "an unedited document has nothing to keep"
+        );
+        let after = s.project(&ops);
+        assert!(!after.soft_deleted && after.rows.is_empty());
+        assert_eq!(after.content, json!({"a": 3}));
+    }
+
+    #[test]
+    fn a_pending_delete_without_a_shadow_is_never_superseded() {
+        let mut s = synced(json!({"a": 1}), 0);
+        s.shadow = None;
+        s.soft_deleted = true;
+        s.rows = vec![row(1, RowKind::Create), row(2, RowKind::Delete)];
+        let ops = apply_change(&s, &upsert("own", json!({"a": 9}), 3), ME, &APPEND);
+        assert!(!ops
+            .iter()
+            .any(|op| matches!(op, DocOp::Emit(_) | DocOp::Undelete)));
+        let after = s.project(&ops);
+        assert!(after.soft_deleted);
+        assert_eq!(after.rows, s.rows);
+        assert_eq!(after.shadow.unwrap().seq, 3);
     }
 
     #[test]
@@ -3620,12 +3720,22 @@ mod snapshot_doc_tests {
     }
 
     #[test]
-    fn snapshot_doc_with_pending_delete_keeps_the_delete() {
+    fn snapshot_doc_that_changed_a_pending_delete_supersedes_it() {
         let (mut s, doc) = pending_append();
+        s.soft_deleted = true;
         s.rows.push(row(2, RowKind::Delete));
-        let after = s.project(&apply_snapshot_doc(&s, "own", &doc, ME, &APPEND));
-        assert_eq!(after.rows.len(), 2);
-        assert_eq!(after.content, json!({"items": ["a", "b"]}));
+        let ops = apply_snapshot_doc(&s, "own", &doc, ME, &APPEND);
+        assert!(ops.contains(&DocOp::Emit(DocEvent::DeleteSuperseded)));
+        assert!(
+            ops.contains(&DocOp::Recover {
+                content: json!({"items": ["a", "b"]}),
+                reason: RecoverReason::DeleteSuperseded
+            }),
+            "the local edit made before the delete is kept"
+        );
+        let after = s.project(&ops);
+        assert!(after.rows.is_empty() && !after.soft_deleted);
+        assert_eq!(after.content, json!({"items": ["a", "b"], "theirs": 1}));
         assert_eq!(after.shadow.unwrap().seq, 5);
     }
 

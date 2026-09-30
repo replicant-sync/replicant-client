@@ -492,14 +492,7 @@ impl Model {
             ("update", Some(doc)) if !doc.deleted => {
                 let current_hash = content_hash(&jsonb(&doc.content));
                 if base_hash.as_deref() != Some(current_hash.as_str()) {
-                    return UploadResult {
-                        reply: Some((
-                            "error",
-                            json!({"code": "hash_mismatch", "is_fatal": false,
-                                "current_hash": current_hash, "current_seq": doc.seq}),
-                        )),
-                        close: false,
-                    };
+                    return hash_mismatch(current_hash, doc.seq);
                 }
                 let Ok(patch) = serde_json::from_value::<json_patch::Patch>(body) else {
                     return error("validation");
@@ -512,7 +505,12 @@ impl Model {
                 }
                 doc.content = rounded;
             }
-            ("delete", Some(doc)) if !doc.deleted => {}
+            ("delete", Some(doc)) if !doc.deleted => {
+                let current_hash = content_hash(&jsonb(&doc.content));
+                if base_hash.as_ref().is_some_and(|base| *base != current_hash) {
+                    return hash_mismatch(current_hash, doc.seq);
+                }
+            }
             _ => return error("not_found"),
         }
         let lost = std::mem::take(&mut self.lose_next_upload);
@@ -572,6 +570,17 @@ fn jason_prints_scientific(float: f64) -> bool {
 
 fn uuid_field(payload: &Value, name: &str) -> Option<Uuid> {
     payload.get(name)?.as_str()?.parse().ok()
+}
+
+fn hash_mismatch(current_hash: String, current_seq: i64) -> UploadResult {
+    UploadResult {
+        reply: Some((
+            "error",
+            json!({"code": "hash_mismatch", "is_fatal": false,
+                "current_hash": current_hash, "current_seq": current_seq}),
+        )),
+        close: false,
+    }
 }
 
 async fn accept_loop(
@@ -986,6 +995,49 @@ mod tests {
             ("exists", Some(ME))
         );
         assert_eq!(server.uploads_for(doc_id).len(), 4);
+    }
+
+    #[tokio::test]
+    async fn delete_on_a_stale_base_is_a_hash_mismatch() {
+        let server = ScriptedServer::start(ME).await;
+        let mut connection = joined(&server, "k1").await;
+        let doc_id = Uuid::from_u128(0xD1);
+        server.put_doc(doc_id, json!({"n": 1}));
+        let _push = received(&mut connection).await;
+        let stale = upload(
+            0x71,
+            doc_id,
+            UploadKind::Delete,
+            Some("stale".into()),
+            Value::Null,
+        );
+        let Received::Input(Input::Reply {
+            req: 2,
+            result: Err(error),
+        }) = reply(&mut connection, 2, stale).await
+        else {
+            panic!("expected hash_mismatch");
+        };
+        assert_eq!(
+            (error.code.as_str(), error.current_seq),
+            ("hash_mismatch", Some(1))
+        );
+        assert!(!server.doc(doc_id).unwrap().2, "nothing was deleted");
+        let current = upload(
+            0x72,
+            doc_id,
+            UploadKind::Delete,
+            error.current_hash,
+            Value::Null,
+        );
+        let Received::Input(Input::Reply {
+            req: 3,
+            result: Ok(Response::Uploaded(_)),
+        }) = reply(&mut connection, 3, current).await
+        else {
+            panic!("expected the delete on the current base to land");
+        };
+        assert!(server.doc(doc_id).unwrap().2);
     }
 
     #[tokio::test]

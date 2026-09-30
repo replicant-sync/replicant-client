@@ -866,3 +866,138 @@ async fn returning_user_offline_edits_rebase_onto_a_changed_snapshot() {
     );
     engine.stop().await;
 }
+
+#[tokio::test]
+async fn an_edit_from_another_device_supersedes_an_offline_delete() {
+    let server = ScriptedServer::start(ME).await;
+    let doc_id = Uuid::from_u128(0xDE1);
+    server.put_doc(doc_id, json!({"title": "Scale", "n": 1}));
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, _events) = live_engine(&server, &path).await;
+    engine.stop().await;
+
+    // Deleted offline here while another device edits the document.
+    let store = Store::open(&path).await.unwrap();
+    store.delete_document(ME, doc_id).await.unwrap();
+    store.close().await;
+    server.put_doc(doc_id, json!({"title": "Scale", "n": 2}));
+
+    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let engine = Engine::start(&path, config(&server.url, credentials("k1")), events_tx)
+        .await
+        .unwrap();
+    let store = engine.store();
+    wait_for(&mut events, "DeleteSuperseded", |event| {
+        *event
+            == EngineEvent::Doc(DocNotice {
+                doc_id,
+                event: DocEvent::DeleteSuperseded,
+            })
+    })
+    .await;
+    eventually("settled", || async { outbox_rows(&store).await == 0 }).await;
+    let after = snapshot(&store, doc_id).await;
+    assert!(
+        after.exists && !after.soft_deleted,
+        "the newer version is back"
+    );
+    assert_eq!(after.content, json!({"title": "Scale", "n": 2}));
+    assert!(
+        !server.doc(doc_id).unwrap().2,
+        "the other device's edit survives"
+    );
+    assert_eq!(recovered_rows(&store, doc_id).await, 0);
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn an_offline_edit_then_delete_superseded_by_another_device_keeps_the_edit() {
+    let server = ScriptedServer::start(ME).await;
+    let doc_id = Uuid::from_u128(0xDE3);
+    server.put_doc(doc_id, json!({"title": "Scale", "n": 1}));
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, _events) = live_engine(&server, &path).await;
+    engine.stop().await;
+
+    let edited = json!({"title": "Scale", "n": 1, "note": "mine"});
+    let store = Store::open(&path).await.unwrap();
+    store
+        .update_document(ME, doc_id, edited.clone())
+        .await
+        .unwrap();
+    store.delete_document(ME, doc_id).await.unwrap();
+    store.close().await;
+    server.put_doc(doc_id, json!({"title": "Scale", "n": 2}));
+
+    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let engine = Engine::start(&path, config(&server.url, credentials("k1")), events_tx)
+        .await
+        .unwrap();
+    let store = engine.store();
+    wait_for(&mut events, "DeleteSuperseded", |event| {
+        *event
+            == EngineEvent::Doc(DocNotice {
+                doc_id,
+                event: DocEvent::DeleteSuperseded,
+            })
+    })
+    .await;
+    eventually("settled", || async { outbox_rows(&store).await == 0 }).await;
+    let after = snapshot(&store, doc_id).await;
+    assert!(after.exists && !after.soft_deleted);
+    assert_eq!(after.content, json!({"title": "Scale", "n": 2}));
+    assert!(!server.doc(doc_id).unwrap().2);
+    let kept: Vec<_> = store
+        .list_recovered()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|copy| copy.doc_id == doc_id)
+        .collect();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].content, edited);
+    assert_eq!(kept[0].reason, "delete_superseded");
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn a_delete_on_a_stale_version_is_refused_and_can_be_repeated() {
+    let server = ScriptedServer::start(ME).await;
+    let doc_id = Uuid::from_u128(0xDE2);
+    server.put_doc(doc_id, json!({"n": 1}));
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, mut events) = live_engine(&server, &path).await;
+    let store = engine.store();
+    assert!(snapshot(&store, doc_id).await.exists);
+    // Another device's edit this client has not heard of yet.
+    server.drop_next_push();
+    server.put_doc(doc_id, json!({"n": 2}));
+    store.delete_document(ME, doc_id).await.unwrap();
+    engine.notify_outbox();
+    wait_for(&mut events, "DeleteSuperseded", |event| {
+        *event
+            == EngineEvent::Doc(DocNotice {
+                doc_id,
+                event: DocEvent::DeleteSuperseded,
+            })
+    })
+    .await;
+    let uploads = server.uploads_for(doc_id);
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0]["kind"], "delete");
+    assert!(
+        uploads[0]["base_hash"].is_string(),
+        "the delete names the version it was made on"
+    );
+    assert!(!server.doc(doc_id).unwrap().2);
+    assert_eq!(snapshot(&store, doc_id).await.content, json!({"n": 2}));
+
+    store.delete_document(ME, doc_id).await.unwrap();
+    engine.notify_outbox();
+    eventually("the repeated delete lands", || async {
+        server.doc(doc_id).is_some_and(|(_, _, deleted)| deleted) && outbox_rows(&store).await == 0
+    })
+    .await;
+    assert!(!snapshot(&store, doc_id).await.exists);
+    engine.stop().await;
+}

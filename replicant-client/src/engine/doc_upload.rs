@@ -57,7 +57,12 @@ pub fn build_upload(snap: &DocSnapshot, me: Uuid) -> BuildResult {
     };
 
     match (&snap.shadow, ends_in_delete) {
-        (_, true) => send(UploadKind::Delete, None, Value::Null, Value::Null),
+        (shadow, true) => send(
+            UploadKind::Delete,
+            shadow.as_ref().map(|sh| sh.hash.clone()),
+            Value::Null,
+            Value::Null,
+        ),
         (None, false) if has_create => send(
             UploadKind::Create,
             None,
@@ -130,12 +135,20 @@ pub fn settle(
             SettleResult::Ops(with_settle_invariant(snap, ops, me))
         }
         Err(e) => match e.code.as_str() {
+            // The server copy decides: it supersedes the delete, or the delete goes out on it.
+            "hash_mismatch" if inflight.kind == UploadKind::Delete => {
+                if mismatch_attempts >= MAX_MISMATCH_ATTEMPTS {
+                    SettleResult::Retry {
+                        after_ms: None,
+                        mismatch: false,
+                    }
+                } else {
+                    SettleResult::FetchServerCopy
+                }
+            }
             "hash_mismatch" if mismatch_attempts >= MAX_MISMATCH_ATTEMPTS => {
                 if delete_pending(snap) {
-                    SettleResult::Ops(vec![
-                        DocOp::DropAllRows,
-                        DocOp::InsertMarker(RowKind::Delete),
-                    ])
+                    SettleResult::FetchServerCopy
                 } else {
                     SettleResult::Ops(conflict_ops(snap))
                 }
@@ -266,13 +279,17 @@ mod upload_tests {
     }
 
     #[test]
-    fn delete_with_shadow_sends_unconditional_delete() {
+    fn delete_with_shadow_carries_the_shadow_hash() {
         let mut s = synced(sample(), 4);
         s.soft_deleted = true;
         s.rows = vec![row(1, RowKind::Update), row(2, RowKind::Delete)];
-        let (u, _) = sent(build_upload(&s, ME));
+        let (u, f) = sent(build_upload(&s, ME));
         assert_eq!(u.kind, UploadKind::Delete);
-        assert_eq!(u.base_hash, None);
+        assert_eq!(
+            u.base_hash,
+            Some(crate::engine::hash::content_hash(&sample()))
+        );
+        assert_eq!(f.base_hash, u.base_hash);
     }
 
     #[test]
@@ -459,7 +476,7 @@ mod upload_tests {
     }
 
     #[test]
-    fn mismatch_conflict_on_soft_deleted_requeues_delete() {
+    fn mismatch_limit_with_a_pending_delete_fetches_the_server_copy() {
         let mut s = synced(json!({"a": 1}), 1);
         s.content = json!({"a": 2});
         s.soft_deleted = true;
@@ -467,10 +484,53 @@ mod upload_tests {
         let f = inflight_update(vec![m(1)], json!({"a": 2}));
         assert_eq!(
             settle(&s, &f, &Err(mismatch("x")), ME, MAX_MISMATCH_ATTEMPTS),
-            SettleResult::Ops(vec![
-                DocOp::DropAllRows,
-                DocOp::InsertMarker(RowKind::Delete)
-            ])
+            SettleResult::FetchServerCopy
+        );
+    }
+
+    fn inflight_delete(s: &DocSnapshot) -> InFlight {
+        InFlight {
+            kind: UploadKind::Delete,
+            base_hash: s.shadow.as_ref().map(|sh| sh.hash.clone()),
+            ..inflight_update(vec![m(1)], Value::Null)
+        }
+    }
+
+    #[test]
+    fn a_stale_delete_fetches_the_server_copy() {
+        let mut s = synced(json!({"a": 1}), 1);
+        s.soft_deleted = true;
+        s.rows = vec![row(1, RowKind::Delete)];
+        let f = inflight_delete(&s);
+        assert_eq!(
+            settle(&s, &f, &Err(mismatch("newer")), ME, 0),
+            SettleResult::FetchServerCopy
+        );
+        let current = s.shadow.as_ref().unwrap().hash.clone();
+        assert_eq!(
+            settle(&s, &f, &Err(mismatch(&current)), ME, 0),
+            SettleResult::FetchServerCopy,
+            "a delete is never retried blind on the same base"
+        );
+    }
+
+    #[test]
+    fn a_delete_that_keeps_mismatching_backs_off() {
+        let mut s = synced(json!({"a": 1}), 1);
+        s.soft_deleted = true;
+        s.rows = vec![row(1, RowKind::Delete)];
+        assert_eq!(
+            settle(
+                &s,
+                &inflight_delete(&s),
+                &Err(mismatch("newer")),
+                ME,
+                MAX_MISMATCH_ATTEMPTS
+            ),
+            SettleResult::Retry {
+                after_ms: None,
+                mismatch: false
+            }
         );
     }
 
