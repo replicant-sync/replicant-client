@@ -630,7 +630,7 @@ mod tests {
     async fn undelete_clears_the_soft_delete_and_logs_an_upsert() {
         let t = temp_store().await;
         seed_synced(&t.store, DOC, SCOPE_OWN, Some(ME), json!({"a": 1}), 1).await;
-        t.store.delete_document(ME, DOC).await.unwrap();
+        t.store.delete_document(DOC).await.unwrap();
         apply(&t.store, DOC, |_| vec![DocOp::DropAllRows, DocOp::Undelete]).await;
         let after = snapshot(&t.store, DOC).await;
         assert!(after.exists && !after.soft_deleted);

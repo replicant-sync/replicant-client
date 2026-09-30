@@ -251,7 +251,7 @@ mod tests {
         .await;
         let local = json!({"items": ["a", "b"]});
         t.store
-            .update_document(ME, doc(1), local.clone())
+            .update_document(doc(1), local.clone())
             .await
             .unwrap();
         // The append went out and its reply was lost.
@@ -302,7 +302,7 @@ mod tests {
         )
         .await;
         t.store
-            .update_document(ME, doc(1), json!({"a": 2, "b": 1}))
+            .update_document(doc(1), json!({"a": 2, "b": 1}))
             .await
             .unwrap();
         // Months later: another device changed `b`; the resync delivers it as a snapshot.
@@ -351,7 +351,7 @@ mod tests {
         )
         .await;
         t.store
-            .update_document(ME, doc(3), json!({"pending": 2}))
+            .update_document(doc(3), json!({"pending": 2}))
             .await
             .unwrap();
         seed_synced(
@@ -470,7 +470,7 @@ mod tests {
             tokio::join!(t.store.apply_snapshot_page(ME, SCOPE_OWN, &docs), async {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 let began = std::time::Instant::now();
-                let created = other.create_document(ME, None, json!({"n": 1})).await;
+                let created = other.create_document(None, json!({"n": 1})).await;
                 (created, began.elapsed())
             });
         page.unwrap();

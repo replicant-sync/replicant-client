@@ -184,7 +184,7 @@ mod tests {
     async fn lost_create_of_an_integral_float_adopts_the_servers_copy() {
         let t = temp_store().await;
         t.store
-            .create_document(ME, Some(DOC), json!({"n": 1200.0}))
+            .create_document(Some(DOC), json!({"n": 1200.0}))
             .await
             .unwrap();
         let (_, inflight) = sent(&t.store, DOC).await;
@@ -209,17 +209,17 @@ mod tests {
         let t = temp_store().await;
         let first = t
             .store
-            .create_document(ME, None, json!({"a": 1}))
+            .create_document(None, json!({"a": 1}))
             .await
             .unwrap();
         let parked = t
             .store
-            .create_document(ME, None, json!({"b": 1}))
+            .create_document(None, json!({"b": 1}))
             .await
             .unwrap();
         let last = t
             .store
-            .create_document(ME, None, json!({"c": 1}))
+            .create_document(None, json!({"c": 1}))
             .await
             .unwrap();
         sqlx::query("UPDATE outbox SET parked_error = 'validation' WHERE doc_id = ?")
@@ -235,7 +235,7 @@ mod tests {
         let t = temp_store().await;
         let doc_id = t
             .store
-            .create_document(ME, None, json!({"a": 1}))
+            .create_document(None, json!({"a": 1}))
             .await
             .unwrap();
         sqlx::query("UPDATE outbox SET parked_error = 'validation'")
@@ -264,11 +264,11 @@ mod tests {
         let t = temp_store().await;
         let doc_id = t
             .store
-            .create_document(ME, None, json!({"n": 1}))
+            .create_document(None, json!({"n": 1}))
             .await
             .unwrap();
         t.store
-            .update_document(ME, doc_id, json!({"n": 2}))
+            .update_document(doc_id, json!({"n": 2}))
             .await
             .unwrap();
         let rows: Vec<String> = sqlx::query_scalar(
@@ -295,15 +295,9 @@ mod tests {
     async fn ack_deletes_only_covered_rows_and_keeps_the_server_hash_verbatim() {
         let t = temp_store().await;
         seed_synced(&t.store, DOC, SCOPE_OWN, Some(ME), json!({"n": 0}), 1).await;
-        t.store
-            .update_document(ME, DOC, json!({"n": 1}))
-            .await
-            .unwrap();
+        t.store.update_document(DOC, json!({"n": 1})).await.unwrap();
         let (_, inflight) = sent(&t.store, DOC).await;
-        t.store
-            .update_document(ME, DOC, json!({"n": 2}))
-            .await
-            .unwrap();
+        t.store.update_document(DOC, json!({"n": 2})).await.unwrap();
 
         let mut reply = envelope(DOC, Some(ME), json!({"n": 1}), 2);
         reply.hash = "server-hash-2".into();
@@ -334,10 +328,7 @@ mod tests {
     async fn settling_the_same_reply_twice_is_a_noop_the_second_time() {
         let t = temp_store().await;
         seed_synced(&t.store, DOC, SCOPE_OWN, Some(ME), json!({"n": 0}), 1).await;
-        t.store
-            .update_document(ME, DOC, json!({"n": 1}))
-            .await
-            .unwrap();
+        t.store.update_document(DOC, json!({"n": 1})).await.unwrap();
         let (_, inflight) = sent(&t.store, DOC).await;
 
         let mut reply = envelope(DOC, Some(ME), json!({"n": 1}), 2);
@@ -383,7 +374,7 @@ mod tests {
         let t = temp_store().await;
         let doc_id = t
             .store
-            .create_document(ME, None, json!({"title": "Offline"}))
+            .create_document(None, json!({"title": "Offline"}))
             .await
             .unwrap();
         let first = t.store.build_upload(ME, doc_id).await.unwrap();
@@ -396,10 +387,7 @@ mod tests {
     async fn empty_diff_settles_locally() {
         let t = temp_store().await;
         seed_synced(&t.store, DOC, SCOPE_OWN, Some(ME), json!({"n": 0}), 1).await;
-        t.store
-            .update_document(ME, DOC, json!({"n": 0}))
-            .await
-            .unwrap();
+        t.store.update_document(DOC, json!({"n": 0})).await.unwrap();
         assert_eq!(
             t.store.build_upload(ME, DOC).await.unwrap(),
             BuildOutcome::SettledLocally { rows_remain: false }
@@ -411,16 +399,10 @@ mod tests {
     async fn unsent_edit_whose_row_was_lost_gets_a_new_marker() {
         let t = temp_store().await;
         seed_synced(&t.store, DOC, SCOPE_OWN, Some(ME), json!({"n": 0}), 1).await;
-        t.store
-            .update_document(ME, DOC, json!({"n": 1}))
-            .await
-            .unwrap();
+        t.store.update_document(DOC, json!({"n": 1})).await.unwrap();
         let (_, inflight) = sent(&t.store, DOC).await;
         let other = open_again(&t.path()).await;
-        other
-            .update_document(ME, DOC, json!({"n": 2}))
-            .await
-            .unwrap();
+        other.update_document(DOC, json!({"n": 2})).await.unwrap();
         // The other process settled rows up to an echo's upload_id; UUIDv7 order across
         // processes is approximate, so its own unsent row went too.
         sqlx::query("DELETE FROM outbox WHERE doc_id = ?")
@@ -455,10 +437,7 @@ mod tests {
     async fn hash_drift_does_not_reinsert_a_marker() {
         let t = temp_store().await;
         seed_synced(&t.store, DOC, SCOPE_OWN, Some(ME), json!({"f": 1}), 1).await;
-        t.store
-            .update_document(ME, DOC, json!({"f": 2}))
-            .await
-            .unwrap();
+        t.store.update_document(DOC, json!({"f": 2})).await.unwrap();
         let (_, inflight) = sent(&t.store, DOC).await;
         let mut reply = envelope(DOC, Some(ME), json!({"f": 2}), 2);
         reply.hash = "jsonb-normalised-hash".into();
@@ -483,10 +462,7 @@ mod tests {
         let t = temp_store().await;
         seed_synced(&t.store, DOC, SCOPE_OWN, Some(ME), json!({"n": 0}), 1).await;
         let local = json!({"n": 1, "mine": true});
-        t.store
-            .update_document(ME, DOC, local.clone())
-            .await
-            .unwrap();
+        t.store.update_document(DOC, local.clone()).await.unwrap();
         let (_, inflight) = sent(&t.store, DOC).await;
         let mut mismatch = ServerError::new("hash_mismatch");
         mismatch.current_hash = Some("elsewhere".into());
@@ -520,10 +496,7 @@ mod tests {
     async fn validation_error_leaves_the_sent_mark_and_a_later_snapshot_still_conflicts() {
         let t = temp_store().await;
         seed_synced(&t.store, DOC, SCOPE_OWN, Some(ME), json!({"n": 0}), 1).await;
-        t.store
-            .update_document(ME, DOC, json!({"n": 1}))
-            .await
-            .unwrap();
+        t.store.update_document(DOC, json!({"n": 1})).await.unwrap();
         let (_, inflight) = sent(&t.store, DOC).await;
         t.store.mark_sent(DOC, inflight.upload_id).await.unwrap();
 
@@ -587,10 +560,7 @@ mod tests {
     async fn server_deleted_takes_delete_wins_path() {
         let t = temp_store().await;
         seed_synced(&t.store, DOC, SCOPE_OWN, Some(ME), json!({"n": 0}), 1).await;
-        t.store
-            .update_document(ME, DOC, json!({"n": 5}))
-            .await
-            .unwrap();
+        t.store.update_document(DOC, json!({"n": 5})).await.unwrap();
 
         let notices = t.store.apply_server_deleted(DOC, 7).await.unwrap();
 
@@ -688,17 +658,14 @@ mod tests {
         .await;
         // The first upload appends x and lands, but its reply and echo are never seen.
         t.store
-            .update_document(ME, DOC, json!({"items": ["a", "x"], "n": 0}))
+            .update_document(DOC, json!({"items": ["a", "x"], "n": 0}))
             .await
             .unwrap();
         let (_, first) = sent(&t.store, DOC).await;
         t.store.mark_sent(DOC, first.upload_id).await.unwrap();
         // A later edit; the resend covers both rows on the stale base and is refused.
         let local = json!({"items": ["a", "x"], "n": 1});
-        t.store
-            .update_document(ME, DOC, local.clone())
-            .await
-            .unwrap();
+        t.store.update_document(DOC, local.clone()).await.unwrap();
         let (_, second) = sent(&t.store, DOC).await;
         t.store.mark_sent(DOC, second.upload_id).await.unwrap();
         let refused = ServerError {

@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{Row, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use uuid::Uuid;
 
 use docs::{LogOrigin, Writer};
@@ -115,10 +115,7 @@ impl Store {
     }
 
     pub async fn user_id(&self) -> StoreResult<Uuid> {
-        let user_id: Option<String> = sqlx::query_scalar("SELECT user_id FROM user_config LIMIT 1")
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(Uuid::parse_str(&user_id.ok_or(StoreError::NoUserConfig)?)?)
+        read_user_id(&mut *self.pool.acquire().await?).await
     }
 
     /// The join's user id against this data dir: adopt it if none was ever adopted.
@@ -190,6 +187,15 @@ pub(crate) fn now_unix() -> i64 {
 /// `documents` timestamps stay RFC 3339: v1 readers parse them.
 pub(crate) fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+/// The data dir's user. Writes read it inside their own transaction: another process's first
+/// join may have re-stamped it since this process last looked.
+pub(crate) async fn read_user_id(conn: &mut SqliteConnection) -> StoreResult<Uuid> {
+    let user_id: Option<String> = sqlx::query_scalar("SELECT user_id FROM user_config LIMIT 1")
+        .fetch_optional(&mut *conn)
+        .await?;
+    Ok(Uuid::parse_str(&user_id.ok_or(StoreError::NoUserConfig)?)?)
 }
 
 pub mod change_log;

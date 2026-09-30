@@ -50,7 +50,7 @@ async fn own_write_is_emitted_once_as_local() {
     let (engine, mut events) = offline_engine(&path).await;
     let doc_id = engine
         .store()
-        .create_document(ME, None, json!({"n": 1}))
+        .create_document(None, json!({"n": 1}))
         .await
         .unwrap();
     engine.notify_outbox();
@@ -72,7 +72,7 @@ async fn other_process_edit_is_emitted_within_a_tick() {
     let (daw, _daw_events) = offline_engine(&path).await;
     let doc_id = daw
         .store()
-        .create_document(ME, None, json!({"n": 1}))
+        .create_document(None, json!({"n": 1}))
         .await
         .unwrap();
     // No notify reaches the app: only its change-log tick can see the other process's write.

@@ -7,56 +7,63 @@ use uuid::Uuid;
 use super::docs::{
     append_change_log, insert_marker, load_snapshot, refresh_search, title_of, LogOrigin,
 };
-use super::{now_rfc3339, Store, StoreError, StoreResult};
+use super::{now_rfc3339, read_user_id, Store, StoreError, StoreResult};
 use crate::engine::doc::{DocSnapshot, FieldConflict, RowKind};
 use crate::engine::hash::{canonicalise_numbers, content_hash};
 
 impl Store {
-    /// Creates a document owned by `me`, returning its id.
-    pub async fn create_document(
-        &self,
-        me: Uuid,
-        doc_id: Option<Uuid>,
-        mut content: Value,
-    ) -> StoreResult<Uuid> {
-        canonicalise_numbers(&mut content);
+    /// Creates a document owned by this data dir's user, returning its id.
+    pub async fn create_document(&self, doc_id: Option<Uuid>, content: Value) -> StoreResult<Uuid> {
         let doc_id = doc_id.unwrap_or_else(Uuid::new_v4);
         let mut tx = self.begin().await?;
-        let snap = load_snapshot(&mut tx, doc_id).await?;
+        self.create_in(&mut tx, doc_id, content).await?;
+        tx.commit().await?;
+        Ok(doc_id)
+    }
+
+    async fn create_in(
+        &self,
+        conn: &mut SqliteConnection,
+        doc_id: Uuid,
+        mut content: Value,
+    ) -> StoreResult<()> {
+        canonicalise_numbers(&mut content);
+        let content = &content;
+        let snap = load_snapshot(&mut *conn, doc_id).await?;
         if snap.exists || snap.tombstone_seq.is_some() {
             return Err(StoreError::AlreadyExists(doc_id));
         }
+        let owner = read_user_id(&mut *conn).await?;
         let now = now_rfc3339();
         sqlx::query(
             "INSERT INTO documents (id, user_id, content, hash, title, read_only, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
         )
         .bind(doc_id.to_string())
-        .bind(me.to_string())
+        .bind(owner.to_string())
         .bind(content.to_string())
-        .bind(content_hash(&content))
-        .bind(title_of(&content, None))
+        .bind(content_hash(content))
+        .bind(title_of(content, None))
         .bind(&now)
         .bind(&now)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
-        insert_marker(&mut tx, doc_id, RowKind::Create).await?;
-        append_change_log(&mut tx, &self.writer(LogOrigin::Local), doc_id, false).await?;
-        refresh_search(&mut tx, doc_id).await?;
-        tx.commit().await?;
-        Ok(doc_id)
+        insert_marker(&mut *conn, doc_id, RowKind::Create).await?;
+        append_change_log(&mut *conn, &self.writer(LogOrigin::Local), doc_id, false).await?;
+        refresh_search(&mut *conn, doc_id).await?;
+        Ok(())
     }
 
-    pub async fn update_document(&self, me: Uuid, doc_id: Uuid, content: Value) -> StoreResult<()> {
+    pub async fn update_document(&self, doc_id: Uuid, content: Value) -> StoreResult<()> {
         let mut tx = self.begin().await?;
-        self.update_in(&mut tx, me, doc_id, content).await?;
+        self.update_in(&mut tx, doc_id, content).await?;
         tx.commit().await?;
         Ok(())
     }
 
     /// Writes a field conflict's kept local values back at their paths as a local edit and
     /// deletes the kept copy, in one transaction. Other paths keep the server's values.
-    pub async fn restore_fields(&self, me: Uuid, recovered_id: i64) -> StoreResult<()> {
+    pub async fn restore_fields(&self, recovered_id: i64) -> StoreResult<()> {
         let mut tx = self.begin().await?;
         let kept: Option<(String, Option<String>)> = sqlx::query_as(
             "SELECT doc_id, fields FROM recovered WHERE id = ? AND reason = 'field_conflict'",
@@ -73,7 +80,7 @@ impl Store {
         for field in &fields {
             put_field(&mut content, field)?;
         }
-        self.update_in(&mut tx, me, doc_id, content).await?;
+        self.update_in(&mut tx, doc_id, content).await?;
         sqlx::query("DELETE FROM recovered WHERE id = ?")
             .bind(recovered_id)
             .execute(&mut *tx)
@@ -85,13 +92,12 @@ impl Store {
     async fn update_in(
         &self,
         conn: &mut SqliteConnection,
-        me: Uuid,
         doc_id: Uuid,
         mut content: Value,
     ) -> StoreResult<()> {
         canonicalise_numbers(&mut content);
         let snap = load_snapshot(&mut *conn, doc_id).await?;
-        check_writable(&snap, me)?;
+        check_writable(&snap, read_user_id(&mut *conn).await?)?;
         sqlx::query(
             "UPDATE documents SET content = ?, hash = ?, title = COALESCE(?, title), updated_at = ? \
              WHERE id = ?",
@@ -111,10 +117,10 @@ impl Store {
     }
 
     /// Soft delete: the shadow stays so the delete upload can be built.
-    pub async fn delete_document(&self, me: Uuid, doc_id: Uuid) -> StoreResult<()> {
+    pub async fn delete_document(&self, doc_id: Uuid) -> StoreResult<()> {
         let mut tx = self.begin().await?;
         let snap = load_snapshot(&mut tx, doc_id).await?;
-        check_writable(&snap, me)?;
+        check_writable(&snap, read_user_id(&mut tx).await?)?;
         let now = now_rfc3339();
         sqlx::query("UPDATE documents SET deleted_at = ?, updated_at = ? WHERE id = ?")
             .bind(&now)
@@ -213,6 +219,42 @@ mod tests {
 
     const OTHER: Uuid = Uuid::from_u128(0xB);
 
+    #[tokio::test]
+    async fn a_write_after_another_process_adopts_the_identity_is_stamped_with_the_adopted_id() {
+        let t = temp_store().await;
+        let provisional = Uuid::from_u128(0x1);
+        let server = Uuid::from_u128(0x2);
+        seed_user(&t.store, provisional, false).await;
+        let before = t
+            .store
+            .create_document(None, json!({"n": 1}))
+            .await
+            .unwrap();
+        let other_process = open_again(&t.path()).await;
+        other_process.check_identity(server).await.unwrap();
+        let after = t
+            .store
+            .create_document(None, json!({"n": 2}))
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot(&t.store, before).await.owner_id,
+            Some(server),
+            "re-stamped by the other process's join"
+        );
+        assert_eq!(
+            snapshot(&t.store, after).await.owner_id,
+            Some(server),
+            "stamped with the adopted id, not the one this process saw first"
+        );
+        t.store
+            .update_document(after, json!({"n": 3}))
+            .await
+            .unwrap();
+        t.store.delete_document(before).await.unwrap();
+        other_process.close().await;
+    }
+
     fn doc(n: u128) -> Uuid {
         Uuid::from_u128(0xD000 + n)
     }
@@ -222,7 +264,7 @@ mod tests {
         let t = temp_store().await;
         let doc_id = t
             .store
-            .create_document(ME, None, json!({"n": 1200.0, "x": 1.5, "list": [2.0]}))
+            .create_document(None, json!({"n": 1200.0, "x": 1.5, "list": [2.0]}))
             .await
             .unwrap();
         let canonical = json!({"n": 1200, "x": 1.5, "list": [2]});
@@ -234,7 +276,7 @@ mod tests {
             .unwrap();
         assert_eq!(hash, content_hash(&canonical));
         t.store
-            .update_document(ME, doc_id, json!({"n": 1300.0}))
+            .update_document(doc_id, json!({"n": 1300.0}))
             .await
             .unwrap();
         assert_eq!(snapshot(&t.store, doc_id).await.content, json!({"n": 1300}));
@@ -245,7 +287,7 @@ mod tests {
         let t = temp_store().await;
         let doc_id = t
             .store
-            .create_document(ME, None, json!({"title": "New"}))
+            .create_document(None, json!({"title": "New"}))
             .await
             .unwrap();
         let snap = snapshot(&t.store, doc_id).await;
@@ -274,18 +316,18 @@ mod tests {
     async fn create_rejects_existing_soft_deleted_or_tombstoned_ids() {
         let t = temp_store().await;
         t.store
-            .create_document(ME, Some(doc(1)), json!({}))
+            .create_document(Some(doc(1)), json!({}))
             .await
             .unwrap();
-        let again = t.store.create_document(ME, Some(doc(1)), json!({})).await;
+        let again = t.store.create_document(Some(doc(1)), json!({})).await;
         assert!(matches!(again, Err(StoreError::AlreadyExists(id)) if id == doc(1)));
 
-        t.store.delete_document(ME, doc(1)).await.unwrap();
-        let after_delete = t.store.create_document(ME, Some(doc(1)), json!({})).await;
+        t.store.delete_document(doc(1)).await.unwrap();
+        let after_delete = t.store.create_document(Some(doc(1)), json!({})).await;
         assert!(matches!(after_delete, Err(StoreError::AlreadyExists(_))));
 
         apply(&t.store, doc(2), |_| vec![DocOp::RecordTombstone(5)]).await;
-        let tombstoned = t.store.create_document(ME, Some(doc(2)), json!({})).await;
+        let tombstoned = t.store.create_document(Some(doc(2)), json!({})).await;
         assert!(matches!(tombstoned, Err(StoreError::AlreadyExists(id)) if id == doc(2)));
     }
 
@@ -293,7 +335,7 @@ mod tests {
     async fn update_and_delete_reject_foreign_read_only_and_missing_documents() {
         let t = temp_store().await;
         seed_synced(&t.store, doc(1), SCOPE_OWN, Some(OTHER), json!({}), 1).await;
-        let foreign = t.store.update_document(ME, doc(1), json!({"x": 1})).await;
+        let foreign = t.store.update_document(doc(1), json!({"x": 1})).await;
         assert!(matches!(foreign, Err(StoreError::NotWritable(id)) if id == doc(1)));
 
         seed_synced(&t.store, doc(2), SCOPE_CURATED, Some(ME), json!({}), 1).await;
@@ -305,22 +347,22 @@ mod tests {
         })
         .await;
         assert!(matches!(
-            t.store.update_document(ME, doc(2), json!({"x": 1})).await,
+            t.store.update_document(doc(2), json!({"x": 1})).await,
             Err(StoreError::NotWritable(_))
         ));
         assert!(matches!(
-            t.store.delete_document(ME, doc(2)).await,
+            t.store.delete_document(doc(2)).await,
             Err(StoreError::NotWritable(_))
         ));
 
         assert!(matches!(
-            t.store.update_document(ME, doc(3), json!({})).await,
+            t.store.update_document(doc(3), json!({})).await,
             Err(StoreError::NotFound(id)) if id == doc(3)
         ));
-        let created = t.store.create_document(ME, None, json!({})).await.unwrap();
-        t.store.delete_document(ME, created).await.unwrap();
+        let created = t.store.create_document(None, json!({})).await.unwrap();
+        t.store.delete_document(created).await.unwrap();
         assert!(matches!(
-            t.store.delete_document(ME, created).await,
+            t.store.delete_document(created).await,
             Err(StoreError::NotFound(_))
         ));
     }
@@ -330,7 +372,7 @@ mod tests {
         let t = temp_store().await;
         seed_synced(&t.store, doc(1), SCOPE_OWN, Some(ME), json!({"n": 0}), 1).await;
         t.store
-            .update_document(ME, doc(1), json!({"n": 1}))
+            .update_document(doc(1), json!({"n": 1}))
             .await
             .unwrap();
         apply(&t.store, doc(1), |snap| {
@@ -343,7 +385,7 @@ mod tests {
         assert!(snapshot(&t.store, doc(1)).await.rows[0].parked);
 
         t.store
-            .update_document(ME, doc(1), json!({"n": 2}))
+            .update_document(doc(1), json!({"n": 2}))
             .await
             .unwrap();
         let rows = snapshot(&t.store, doc(1)).await.rows;
@@ -376,7 +418,7 @@ mod tests {
         plant_marker(&t.store, doc(1), planted).await;
 
         t.store
-            .update_document(ME, doc(1), json!({"n": 1}))
+            .update_document(doc(1), json!({"n": 1}))
             .await
             .unwrap();
 
@@ -385,7 +427,7 @@ mod tests {
         assert!(newest.mutation_id > planted);
         assert_eq!(newest.kind, RowKind::Update);
 
-        t.store.delete_document(ME, doc(1)).await.unwrap();
+        t.store.delete_document(doc(1)).await.unwrap();
         let rows = snapshot(&t.store, doc(1)).await.rows;
         let newest = rows.last().unwrap();
         assert!(newest.mutation_id > planted);
@@ -401,7 +443,7 @@ mod tests {
 
         let other = open_again(&t.path()).await;
         other
-            .update_document(ME, doc(1), json!({"n": 1}))
+            .update_document(doc(1), json!({"n": 1}))
             .await
             .unwrap();
 
@@ -415,7 +457,7 @@ mod tests {
     async fn delete_is_soft_and_keeps_the_shadow() {
         let t = temp_store().await;
         seed_synced(&t.store, doc(1), SCOPE_OWN, Some(ME), json!({"n": 1}), 3).await;
-        t.store.delete_document(ME, doc(1)).await.unwrap();
+        t.store.delete_document(doc(1)).await.unwrap();
         let snap = snapshot(&t.store, doc(1)).await;
         assert!(snap.exists);
         assert!(snap.soft_deleted);
@@ -434,7 +476,7 @@ mod tests {
         let t = temp_store().await;
         let doc_id = t
             .store
-            .create_document(ME, None, json!({"title": "From v2"}))
+            .create_document(None, json!({"title": "From v2"}))
             .await
             .unwrap();
         let v1 = ClientDatabase::new(&format!("sqlite://{}?mode=rwc", t.path().display()))
@@ -443,7 +485,7 @@ mod tests {
         let read = v1.get_document(&doc_id).await.unwrap();
         assert_eq!(read.content, json!({"title": "From v2"}));
         assert_eq!(read.title.as_deref(), Some("From v2"));
-        t.store.delete_document(ME, doc_id).await.unwrap();
+        t.store.delete_document(doc_id).await.unwrap();
         assert!(v1.get_document(&doc_id).await.unwrap().deleted_at.is_some());
         v1.close().await;
     }
@@ -453,12 +495,12 @@ mod tests {
         let t = temp_store().await;
         let doc_id = t
             .store
-            .create_document(ME, None, json!({"n": 0}))
+            .create_document(None, json!({"n": 0}))
             .await
             .unwrap();
         for n in 1..=200 {
             t.store
-                .update_document(ME, doc_id, json!({"n": n}))
+                .update_document(doc_id, json!({"n": n}))
                 .await
                 .unwrap();
         }
@@ -484,13 +526,13 @@ mod tests {
         let other = open_again(&t.path()).await;
         let doc_id = t
             .store
-            .create_document(ME, None, json!({"n": 0}))
+            .create_document(None, json!({"n": 0}))
             .await
             .unwrap();
         let mine = async {
             for n in 0..50 {
                 t.store
-                    .update_document(ME, doc_id, json!({"a": n}))
+                    .update_document(doc_id, json!({"a": n}))
                     .await
                     .unwrap();
             }
@@ -498,7 +540,7 @@ mod tests {
         let theirs = async {
             for n in 0..50 {
                 other
-                    .update_document(ME, doc_id, json!({"b": n}))
+                    .update_document(doc_id, json!({"b": n}))
                     .await
                     .unwrap();
             }
@@ -513,10 +555,7 @@ mod tests {
         t.store.close().await;
         for n in 0..20 {
             let store = open_again(&t.path()).await;
-            store
-                .create_document(ME, None, json!({"n": n}))
-                .await
-                .unwrap();
+            store.create_document(None, json!({"n": n})).await.unwrap();
             store.close().await;
         }
         let reopened = open_again(&t.path()).await;
@@ -534,7 +573,7 @@ mod tests {
             1,
         )
         .await;
-        t.store.update_document(ME, doc(1), local).await.unwrap();
+        t.store.update_document(doc(1), local).await.unwrap();
         let change = upsert_change(SCOPE_OWN, envelope(doc(1), Some(ME), theirs, 2));
         t.store
             .apply_changes(ME, SCOPE_OWN, &[change], 2)
@@ -593,7 +632,7 @@ mod tests {
         .await;
         let rows_before = count(&t.store, "SELECT COUNT(*) FROM outbox").await;
         t.store
-            .restore_fields(ME, kept_copy_id(&t).await)
+            .restore_fields(kept_copy_id(&t).await)
             .await
             .unwrap();
         assert_eq!(
@@ -612,7 +651,7 @@ mod tests {
         let t = temp_store().await;
         collide(&t, json!({"k": 1}), json!({"s": "theirs", "k": 1})).await;
         t.store
-            .restore_fields(ME, kept_copy_id(&t).await)
+            .restore_fields(kept_copy_id(&t).await)
             .await
             .unwrap();
         assert_eq!(snapshot(&t.store, doc(1)).await.content, json!({"k": 1}));
@@ -624,10 +663,7 @@ mod tests {
         let scale = json!({"pitches": [0, 200, 400, 500, 700, 900]});
         seed_synced(&t.store, doc(1), SCOPE_OWN, Some(ME), scale, 1).await;
         let mine = json!({"pitches": [0, 200, 500, 700, 900]});
-        t.store
-            .update_document(ME, doc(1), mine.clone())
-            .await
-            .unwrap();
+        t.store.update_document(doc(1), mine.clone()).await.unwrap();
         let theirs = json!({"pitches": [0, 200, 400, 500, 700]});
         let change = upsert_change(SCOPE_OWN, envelope(doc(1), Some(ME), theirs.clone(), 2));
         let notices = t
@@ -646,7 +682,7 @@ mod tests {
         );
         assert_eq!(snapshot(&t.store, doc(1)).await.content, theirs);
         t.store
-            .restore_fields(ME, kept_copy_id(&t).await)
+            .restore_fields(kept_copy_id(&t).await)
             .await
             .unwrap();
         assert_eq!(
@@ -673,7 +709,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            t.store.restore_fields(ME, id).await,
+            t.store.restore_fields(id).await,
             Err(StoreError::NoFieldConflict(refused)) if refused == id
         ));
     }

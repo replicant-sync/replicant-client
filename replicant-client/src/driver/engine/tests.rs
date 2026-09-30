@@ -43,13 +43,13 @@ async fn effects_run_in_order_and_answers_are_fifo() {
     let first = h
         .controls
         .store
-        .create_document(ME, None, json!({"n": 1}))
+        .create_document(None, json!({"n": 1}))
         .await
         .unwrap();
     let second = h
         .controls
         .store
-        .create_document(ME, None, json!({"n": 2}))
+        .create_document(None, json!({"n": 2}))
         .await
         .unwrap();
     h.owner
@@ -108,7 +108,7 @@ async fn joined_is_fed_only_after_the_identity_check() {
     let doc_id = h
         .controls
         .store
-        .create_document(previous, None, json!({"n": 1}))
+        .create_document(None, json!({"n": 1}))
         .await
         .unwrap();
     h.live().await;
@@ -265,7 +265,7 @@ async fn nothing_but_the_join_is_sent_while_connecting() {
         .await;
     h.controls
         .store
-        .create_document(ME, None, json!({"n": 1}))
+        .create_document(None, json!({"n": 1}))
         .await
         .unwrap();
     h.controls.outbox.notify_one();
@@ -326,7 +326,7 @@ async fn stale_settle_after_reconnect_is_dropped() {
     let doc_id = h
         .controls
         .store
-        .create_document(ME, None, json!({"n": 1}))
+        .create_document(None, json!({"n": 1}))
         .await
         .unwrap();
     let settled = Input::Settled {
@@ -517,7 +517,7 @@ async fn a_new_users_empty_snapshot_still_unlocks_uploads() {
     let doc_id = h
         .controls
         .store
-        .create_document(ME, None, json!({"n": 1}))
+        .create_document(None, json!({"n": 1}))
         .await
         .unwrap();
     h.controls.outbox.notify_one();
@@ -536,7 +536,7 @@ async fn upload_is_marked_sent_before_it_is_sent() {
     let doc_id = h
         .controls
         .store
-        .create_document(ME, None, json!({"n": 1}))
+        .create_document(None, json!({"n": 1}))
         .await
         .unwrap();
     h.controls.outbox.notify_one();
@@ -568,7 +568,7 @@ async fn live_with_unsent_doc(server: &ScriptedServer) -> (Harness, Uuid) {
     let doc_id = h
         .controls
         .store
-        .create_document(ME, None, json!({"n": 1}))
+        .create_document(None, json!({"n": 1}))
         .await
         .unwrap();
     (h, doc_id)
