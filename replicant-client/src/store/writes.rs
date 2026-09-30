@@ -212,7 +212,6 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::database::ClientDatabase;
     use crate::engine::doc::DocOp;
     use crate::engine::types::{SCOPE_CURATED, SCOPE_OWN};
     use crate::store::test_support::*;
@@ -469,25 +468,6 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(last, "delete");
-    }
-
-    #[tokio::test]
-    async fn v1_reader_parses_v2_written_documents() {
-        let t = temp_store().await;
-        let doc_id = t
-            .store
-            .create_document(None, json!({"title": "From v2"}))
-            .await
-            .unwrap();
-        let v1 = ClientDatabase::new(&format!("sqlite://{}?mode=rwc", t.path().display()))
-            .await
-            .unwrap();
-        let read = v1.get_document(&doc_id).await.unwrap();
-        assert_eq!(read.content, json!({"title": "From v2"}));
-        assert_eq!(read.title.as_deref(), Some("From v2"));
-        t.store.delete_document(doc_id).await.unwrap();
-        assert!(v1.get_document(&doc_id).await.unwrap().deleted_at.is_some());
-        v1.close().await;
     }
 
     #[tokio::test]

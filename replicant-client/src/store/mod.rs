@@ -42,6 +42,10 @@ pub enum StoreError {
     NilServerUserId,
     #[error("no field-conflict copy with id {0}")]
     NoFieldConflict(i64),
+    /// Migrating v1 sync data failed; the v1 tables are untouched and a backup sits next to
+    /// the database.
+    #[error("v1 data migration failed: {0}")]
+    MigrationFailed(String),
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
@@ -53,6 +57,10 @@ impl StoreError {
             self,
             StoreError::Migrate(sqlx::migrate::MigrateError::VersionMissing(_))
         )
+    }
+
+    pub fn is_migration_failed(&self) -> bool {
+        matches!(self, StoreError::MigrationFailed(_))
     }
 
     /// SQLITE_BUSY: another connection held the lock past the busy timeout.
@@ -102,6 +110,7 @@ impl Store {
             .max_connections(POOL_SIZE)
             .connect_with(options.clone())
             .await?;
+        v1_data::back_up_v1_database(&pool, path).await?;
         if let Err(error) = prepare(&pool).await {
             pool.close().await;
             return Err(error);
@@ -212,6 +221,7 @@ impl Store {
 
 async fn prepare(pool: &SqlitePool) -> StoreResult<()> {
     sqlx::migrate!("./migrations").run(pool).await?;
+    v1_data::migrate_v1_data(pool).await?;
     sqlx::query("INSERT OR IGNORE INTO subscriptions (scope) VALUES (?), (?)")
         .bind(SCOPE_OWN)
         .bind(SCOPE_CURATED)
@@ -248,6 +258,7 @@ mod docs;
 mod feed;
 mod recovered;
 mod uploads;
+mod v1_data;
 mod writes;
 
 pub use recovered::RecoveredCopy;
@@ -259,7 +270,6 @@ pub(crate) mod test_support;
 mod tests {
     use super::test_support::*;
     use super::*;
-    use serde_json::json;
 
     #[tokio::test]
     async fn ensure_user_config_creates_one_provisional_row_and_keeps_it() {
@@ -335,32 +345,6 @@ mod tests {
                 ("own".to_string(), 0)
             ]
         );
-    }
-
-    #[tokio::test]
-    async fn v1_database_still_reads_and_writes_after_013() {
-        let t = temp_store().await;
-        let url = format!("sqlite://{}?mode=rwc", t.path().display());
-        let v1 = crate::database::ClientDatabase::new(&url).await.unwrap();
-        v1.run_migrations().await.unwrap();
-        let now = chrono::Utc::now();
-        let doc = replicant_core::models::Document {
-            id: Uuid::new_v4(),
-            user_id: Some(ME),
-            content: json!({"title": "v1"}),
-            sync_revision: 1,
-            content_hash: None,
-            title: Some("v1".into()),
-            created_at: now,
-            updated_at: now,
-            deleted_at: None,
-            author_name: None,
-            visibility: None,
-            provenance: None,
-        };
-        v1.save_document(&doc).await.unwrap();
-        assert_eq!(v1.get_document(&doc.id).await.unwrap().content, doc.content);
-        v1.close().await;
     }
 
     #[tokio::test]

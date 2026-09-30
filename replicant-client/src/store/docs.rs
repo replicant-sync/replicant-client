@@ -72,7 +72,13 @@ pub(crate) async fn load_snapshot(
             snap.shadow = Some(Shadow {
                 content: serde_json::from_str(&server_content)?,
                 hash,
-                seq: row.try_get::<Option<i64>, _>("server_seq")?.unwrap_or(0),
+                seq: row
+                    .try_get::<Option<i64>, _>("server_seq")?
+                    .ok_or_else(|| {
+                        StoreError::Corrupt(format!(
+                            "document {doc_id}: server_content without server_seq"
+                        ))
+                    })?,
             });
         }
     }
@@ -668,5 +674,23 @@ mod tests {
         assert_eq!(hash, content_hash(&json!({"title": "Just Intonation"})));
         assert_eq!(author, Uuid::from_u128(0xB).to_string());
         assert_eq!(source, Uuid::from_u128(0x5).to_string());
+    }
+
+    #[tokio::test]
+    async fn server_content_without_a_server_seq_is_corrupt() {
+        let t = temp_store().await;
+        exec(
+            &t.store,
+            &format!(
+                "INSERT INTO documents (id, user_id, content, hash, server_content, server_hash, \
+                 created_at, updated_at) VALUES ('{DOC}', '{ME}', '{{}}', 'h', '{{}}', 'h', 't', 't')"
+            ),
+        )
+        .await;
+        let mut tx = t.store.begin().await.unwrap();
+        assert!(matches!(
+            load_snapshot(&mut tx, DOC).await,
+            Err(StoreError::Corrupt(_))
+        ));
     }
 }

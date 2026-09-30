@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 
 use serde_json::Value;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::SqlitePool;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -180,4 +182,80 @@ pub(crate) fn delete_change(scope: &str, doc_id: Uuid, seq: Seq) -> Change {
         client_id: None,
         upload_id: None,
     }
+}
+
+/// A data dir at the last v1 schema (migration 012), for migration 015 tests. Write v1 rows
+/// through the returned pool, close it, then `Store::open` the path.
+pub(crate) async fn v012_db() -> (TempDir, PathBuf, SqlitePool) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(DB_FILE);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+    let mut migrator = sqlx::migrate!("./migrations");
+    migrator.migrations = std::borrow::Cow::Owned(
+        migrator
+            .iter()
+            .filter(|migration| migration.version <= 12)
+            .cloned()
+            .collect(),
+    );
+    migrator.run(&pool).await.unwrap();
+    (dir, path, pool)
+}
+
+pub(crate) async fn v1_user(pool: &SqlitePool, user_id: Uuid, adopted: bool) {
+    sqlx::query(
+        "INSERT INTO user_config (user_id, client_id, server_url, identity_adopted) \
+         VALUES (?, ?, 'ws://v1', ?)",
+    )
+    .bind(user_id.to_string())
+    .bind(Uuid::new_v4().to_string())
+    .bind(adopted as i64)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A v1 `documents` row, with `id` stored exactly as given.
+pub(crate) async fn v1_doc(
+    pool: &SqlitePool,
+    id: &str,
+    owner: Option<Uuid>,
+    content: Value,
+    status: &str,
+    deleted_at: Option<&str>,
+) {
+    sqlx::query(
+        "INSERT INTO documents (id, user_id, content, sync_revision, created_at, updated_at, \
+         deleted_at, sync_status, title) \
+         VALUES (?, ?, ?, 1, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00', ?, ?, 'v1')",
+    )
+    .bind(id)
+    .bind(owner.map(|owner| owner.to_string()))
+    .bind(content.to_string())
+    .bind(deleted_at)
+    .bind(status)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+pub(crate) async fn v1_queue_row(pool: &SqlitePool, doc_id: &str, kind: &str, base: Option<Value>) {
+    sqlx::query(
+        "INSERT INTO sync_queue (document_id, operation_type, patch, base_content, created_at) \
+         VALUES (?, ?, '[]', ?, '2026-01-02 03:04:05')",
+    )
+    .bind(doc_id)
+    .bind(kind)
+    .bind(base.map(|base| base.to_string()))
+    .execute(pool)
+    .await
+    .unwrap();
 }

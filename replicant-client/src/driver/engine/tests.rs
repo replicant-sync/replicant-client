@@ -17,7 +17,7 @@ use crate::engine::list_merge::{ListMergePolicy, PathPattern};
 use crate::engine::machine::{
     ConnectionView, HaltReason, Input, Lifecycle, SettleOutcome, TimerId,
 };
-use crate::store::test_support::{count, exec, ME};
+use crate::store::test_support::{count, exec, v012_db, v1_doc, v1_queue_row, v1_user, ME};
 use crate::store::StoreError;
 use crate::transport::socket::SocketEvent;
 use crate::transport::wire::user_agent;
@@ -834,4 +834,36 @@ async fn start_refuses_a_full_list_merge_policy() {
         }
         other => panic!("expected a config error, got {:?}", other.map(|_| ())),
     }
+}
+
+#[tokio::test]
+async fn two_engines_starting_on_one_v1_database_both_start_and_migrate_it_once() {
+    let (_dir, path, pool) = v012_db().await;
+    v1_user(&pool, ME, true).await;
+    let doc_id = Uuid::from_u128(0xD1).to_string();
+    v1_doc(&pool, &doc_id, Some(ME), json!({"n": 1}), "pending", None).await;
+    v1_queue_row(&pool, &doc_id, "update", Some(json!({"n": 0}))).await;
+    pool.close().await;
+    let (app_events, _app) = mpsc::unbounded_channel();
+    let (daw_events, _daw) = mpsc::unbounded_channel();
+    let (app, daw) = tokio::join!(
+        Engine::start(
+            &path,
+            config("ws://127.0.0.1:9", no_credentials()),
+            app_events
+        ),
+        Engine::start(
+            &path,
+            config("ws://127.0.0.1:9", no_credentials()),
+            daw_events
+        ),
+    );
+    let (app, daw) = (app.unwrap(), daw.unwrap());
+    assert_eq!(
+        count(&app.store(), "SELECT COUNT(*) FROM outbox").await,
+        1,
+        "one marker, not one per engine"
+    );
+    app.stop().await;
+    daw.stop().await;
 }
