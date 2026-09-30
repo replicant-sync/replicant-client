@@ -114,6 +114,18 @@ async fn push_gap_triggers_catch_up() {
     let server = ScriptedServer::start(ME).await;
     let (_dir, path) = seeded_db(ME, true).await;
     let (engine, _events) = live_engine(&server, &path).await;
+    // A catch-up from cursor 0 starts with a snapshot, so both request kinds count.
+    let own_catch_ups = || {
+        server
+            .frames()
+            .iter()
+            .filter(|frame| {
+                matches!(frame.event.as_str(), "get_changes_since" | "get_snapshot")
+                    && frame.payload["scope"] == "own"
+            })
+            .count()
+    };
+    let before = own_catch_ups();
     let (first, second) = (Uuid::from_u128(0xD1), Uuid::from_u128(0xD2));
     server.drop_next_push();
     server.put_doc(first, json!({"a": 1}));
@@ -123,12 +135,9 @@ async fn push_gap_triggers_catch_up() {
         snapshot(&store, first).await.exists && snapshot(&store, second).await.exists
     })
     .await;
-    let own_catch_ups = server
-        .frames()
-        .iter()
-        .filter(|frame| frame.event == "get_changes_since" && frame.payload["scope"] == "own")
-        .count();
-    assert!(own_catch_ups >= 2, "the gap started a second catch-up");
+    // The first document's push was dropped, so it can only have arrived by a catch-up, whose
+    // request the server recorded before answering it.
+    assert!(own_catch_ups() > before, "the gap started a catch-up");
     engine.stop().await;
 }
 
