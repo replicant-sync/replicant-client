@@ -415,6 +415,37 @@ fn a_handle_without_credentials_reports_halted_not_enrolled() {
 }
 
 #[test]
+fn credentials_stored_by_0_6_need_the_config_email_to_sign_in() {
+    let store_0_6 = |dir: &Path| {
+        secret_store::store(
+            dir,
+            &secret_store::Credentials {
+                api_key: "k1".into(),
+                secret: "rps_test".into(),
+                user_id: Uuid::new_v4(),
+                email: None,
+            },
+        )
+        .unwrap();
+    };
+    let without_email = tempfile::tempdir().unwrap();
+    store_0_6(without_email.path());
+    let (result, handle) = create_with(without_email.path(), |config| config.email = ptr::null());
+    assert_eq!(result, SyncResult::Success);
+    wait_until("halted", || halted_not_enrolled(handle));
+    close(handle);
+
+    let with_email = tempfile::tempdir().unwrap();
+    store_0_6(with_email.path());
+    let handle = open(with_email.path());
+    wait_until("dialling", || {
+        state(handle).connection != ReplicantConnection::Idle
+    });
+    assert!(!halted_not_enrolled(handle));
+    close(handle);
+}
+
+#[test]
 fn process_events_on_another_thread_is_refused_and_keeps_the_events() {
     let dir = tempfile::tempdir().unwrap();
     let handle = open(dir.path());
@@ -1078,6 +1109,47 @@ fn a_field_copy_of_a_deleted_document_is_reported_gone_and_restores_whole() {
         "any copy can come back as a new document"
     );
     assert_eq!(listed(handle), json!([]));
+    close(handle);
+}
+
+#[test]
+fn restore_fields_on_a_whole_document_copy_is_invalid_input_and_keeps_the_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = open(dir.path());
+    keep_whole(dir.path(), "Lost");
+    let whole = listed(handle)[0]["recovered_id"].as_i64().unwrap();
+    assert_eq!(
+        unsafe { replicant_restore_fields(handle, whole) },
+        SyncResult::ErrorInvalidInput
+    );
+    assert_eq!(listed(handle)[0]["recovered_id"], whole);
+    assert_eq!(
+        unsafe { replicant_restore_fields(handle, whole + 1) },
+        SyncResult::ErrorNotFound
+    );
+    close(handle);
+}
+
+#[test]
+fn restore_fields_on_a_read_only_document_is_not_writable_and_keeps_the_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = open(dir.path());
+    let theirs = Uuid::new_v4().to_string();
+    sql(
+        dir.path(),
+        &format!(
+            "INSERT INTO documents (id, user_id, content, created_at, updated_at) \
+             VALUES ('{theirs}', '{}', '{{}}', 't', 't')",
+            Uuid::new_v4()
+        ),
+    );
+    keep_field(dir.path(), &theirs, "/s", json!("mine"));
+    let field = listed(handle)[0]["recovered_id"].as_i64().unwrap();
+    assert_eq!(
+        unsafe { replicant_restore_fields(handle, field) },
+        SyncResult::ErrorNotWritable
+    );
+    assert_eq!(listed(handle)[0]["recovered_id"], field);
     close(handle);
 }
 

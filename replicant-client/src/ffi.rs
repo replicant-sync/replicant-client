@@ -24,8 +24,10 @@ use crate::events::{
 use crate::host::{self, Handle, HostConfig, OpenError};
 use crate::store::StoreError;
 
-/// Opaque handle. Every call except `replicant_process_events` is thread-safe. Never call from an
-/// audio thread: every read and write is a SQLite transaction.
+/// Opaque handle. Every call except `replicant_process_events` and the
+/// `replicant_register_*_callback` calls is thread-safe; those run only on the thread the first
+/// registration bound. Never call from an audio thread: every read and write is a SQLite
+/// transaction.
 pub struct Replicant {
     handle: Handle,
     dispatcher: Dispatcher,
@@ -90,12 +92,16 @@ pub enum SyncResult {
     ErrorNotWritable = -8,
     /// The id exists here or was deleted. An import should skip the id, not count a failure.
     ErrorAlreadyExists = -9,
-    /// Migrating a v1 library failed; nothing was changed and a `.v1-backup` copy sits next to
-    /// the database. Show "Your library needs attention"; never fall back to a temporary library.
+    /// Migrating a v1 library failed. The documents are unchanged, and a copy of the v1 database
+    /// sits next to it (`<database>.v1-backup`, or `<database>.v1-backup-<unix seconds>` when that
+    /// name is taken). Schema changes already applied mean 0.6 builds cannot open the database;
+    /// restoring the backup is the way back. Show "Your library needs attention"; never fall back
+    /// to a temporary library.
     ErrorMigrationFailed = -10,
     /// Another process kept the database locked; try `replicant_create` again shortly.
     ErrorBusy = -11,
-    /// `replicant_process_events` was called on another thread than the one that registered.
+    /// `replicant_process_events` or a `replicant_register_*_callback` call came from another
+    /// thread than the one the handle's first registration bound.
     ErrorWrongThread = -12,
     /// `replicant_process_events` was called before any callback was registered.
     ErrorNoCallbacks = -13,
@@ -120,6 +126,8 @@ pub struct ReplicantConfig {
     pub database_file: *const c_char,
     pub server_url: *const c_char,
     /// May be null (`""` counts as null). Signs joins when the stored credentials carry no email.
+    /// Credentials stored by 0.6 carry none: with a null email here the engine reports
+    /// `NotEnrolled`, so a host upgrading from 0.6 must pass the user's email.
     pub email: *const c_char,
     /// Named in the User-Agent, e.g. "Entonal Studio" and "2.0.1 CLAP".
     pub host_app: *const c_char,
@@ -324,9 +332,8 @@ unsafe fn json_arg(value: *const c_char) -> Result<Value, SyncResult> {
 
 fn store_result(error: &StoreError) -> SyncResult {
     match error {
-        StoreError::NotFound(_) | StoreError::NoFieldConflict(_) | StoreError::NoKeptCopy(_) => {
-            SyncResult::ErrorNotFound
-        }
+        StoreError::NotFound(_) | StoreError::NoKeptCopy(_) => SyncResult::ErrorNotFound,
+        StoreError::NoFieldConflict(_) => SyncResult::ErrorInvalidInput,
         StoreError::NotWritable(_) => SyncResult::ErrorNotWritable,
         StoreError::DocumentGone(_) => SyncResult::ErrorDocumentGone,
         StoreError::AlreadyExists(_) => SyncResult::ErrorAlreadyExists,
@@ -501,8 +508,9 @@ pub unsafe extern "C" fn replicant_destroy(handle: *mut Replicant) {
 
 /// `replicant_destroy`, then waits up to `timeout_ms` for the engine to stop and its runtime to
 /// shut down. True when it has, or when other handles keep the engine running. It does not make
-/// unloading safe (see `replicant_destroy`). From inside a
-/// callback it cannot wait: it returns false and the handle is freed when the pump returns.
+/// unloading safe (see `replicant_destroy`). While this handle's `replicant_process_events` is
+/// running (from inside a callback, or on another thread) it cannot wait: it returns false at
+/// once and the handle is freed when the pump returns.
 ///
 /// # Safety
 /// As `replicant_destroy`.
@@ -948,11 +956,13 @@ struct KeptCopyJson<'a> {
 }
 
 /// Kept copies (local content sync set aside), newest first, as a JSON array of
-/// `{recovered_id, doc_id, title, reason, recovered_at, content, fields}`. `reason` is
+/// `{recovered_id, doc_id, title, reason, recovered_at, content, fields}`; `recovered_at` is in
+/// Unix seconds. `reason` is
 /// `conflict`, `field_conflict`, `delete_wins`, `delete_superseded`, `delete_refused`,
 /// `delete_publication`, `became_publication`, `create_rejected` or `unmigratable` (set aside
 /// while upgrading the database). `fields` is null for a whole-document copy, else `[{path, local_value, local_removed}]`.
-/// Copies never expire: they stay until dismissed or restored.
+/// Copies never expire: they stay until dismissed or restored. A copy that cannot be read is left
+/// out (and logged).
 ///
 /// # Safety
 /// Valid handle and out pointer; free the result with `replicant_string_free`.
@@ -1052,9 +1062,11 @@ pub unsafe extern "C" fn replicant_restore_document(
 /// keeps its current value) and removes the copy.
 ///
 /// A list conflict is kept as the whole list, so restoring it puts that list back exactly.
-/// `ErrorNotFound`: the copy is gone. `ErrorDocumentGone`: its document was deleted, and
-/// `ErrorNotWritable`: it became read-only; the copy stays in both cases, and
-/// `replicant_restore_document` brings it back as a new document.
+/// `ErrorNotFound`: the copy is gone. `ErrorInvalidInput`: it is a whole-document copy (its
+/// `fields` is null); it stays, and `replicant_restore_document` restores it.
+/// `ErrorDocumentGone`: its document was deleted, and `ErrorNotWritable`: it became read-only;
+/// the copy stays in both cases, and `replicant_restore_document` brings it back as a new
+/// document.
 ///
 /// # Safety
 /// Valid handle.

@@ -76,6 +76,7 @@ public:
         std::string database_file; ///< e.g. "tonaldb.sqlite3"
         std::string server_url;
         std::string email;         ///< Used only when stored credentials carry none; may be empty.
+                                   ///< 0.6-stored credentials carry none: pass it when upgrading.
         std::string host_app;      ///< Named in the User-Agent, e.g. "Entonal Studio".
         std::string host_version;  ///< e.g. "2.0.1 CLAP"
         ReplicantListMerge list_merge = ReplicantListMerge_Append; ///< When no rule matches.

@@ -65,13 +65,15 @@ impl Store {
     /// deletes the kept copy, in one transaction. Other paths keep the server's values.
     pub async fn restore_fields(&self, recovered_id: i64) -> StoreResult<()> {
         let mut tx = self.begin().await?;
-        let kept: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT doc_id, fields FROM recovered WHERE id = ? AND reason = 'field_conflict'",
-        )
-        .bind(recovered_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        let Some((doc_id, Some(fields))) = kept else {
+        let kept: Option<(String, Option<String>, String)> =
+            sqlx::query_as("SELECT doc_id, fields, reason FROM recovered WHERE id = ?")
+                .bind(recovered_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((doc_id, fields, reason)) = kept else {
+            return Err(StoreError::NoKeptCopy(recovered_id));
+        };
+        let (Some(fields), "field_conflict") = (fields, reason.as_str()) else {
             return Err(StoreError::NoFieldConflict(recovered_id));
         };
         let doc_id = Uuid::parse_str(&doc_id)?;
@@ -726,6 +728,10 @@ mod tests {
         assert!(matches!(
             t.store.restore_fields(id).await,
             Err(StoreError::NoFieldConflict(refused)) if refused == id
+        ));
+        assert!(matches!(
+            t.store.restore_fields(id + 1).await,
+            Err(StoreError::NoKeptCopy(missing)) if missing == id + 1
         ));
     }
 
