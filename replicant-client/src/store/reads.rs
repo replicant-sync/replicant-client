@@ -7,6 +7,7 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 use uuid::Uuid;
 
+use super::uploads::PENDING_DOC_IDS;
 use super::{Store, StoreResult};
 use crate::engine::types::SCOPE_CURATED;
 
@@ -46,13 +47,13 @@ pub struct ParkedDocument {
     pub code: String,
 }
 
-/// Visible documents (no pending delete), narrowed by `filter` (`AND …`, may be empty).
-fn select_documents(filter: &str) -> String {
+/// Visible documents (no pending delete), after `join`, narrowed by `filter` (`AND …`, may be empty).
+fn select_documents(join: &str, filter: &str) -> String {
     format!(
         "SELECT d.id, d.user_id, d.author_id, d.title, d.content, d.read_only, d.source_doc_id, \
          d.derived_from, d.created_at, d.updated_at, (d.read_only = 1 OR EXISTS (SELECT 1 FROM \
          doc_scopes s WHERE s.doc_id = d.id AND s.scope = '{SCOPE_CURATED}' AND s.member = 1)) \
-         AS public FROM documents d WHERE d.deleted_at IS NULL {filter}"
+         AS public FROM documents d {join} WHERE d.deleted_at IS NULL {filter}"
     )
 }
 
@@ -84,7 +85,7 @@ fn parse_document(row: &SqliteRow) -> StoreResult<StoredDocument> {
 
 impl Store {
     pub async fn get_document(&self, doc_id: Uuid) -> StoreResult<Option<StoredDocument>> {
-        let row = sqlx::query(&select_documents("AND d.id = ?"))
+        let row = sqlx::query(&select_documents("", "AND d.id = ?"))
             .bind(doc_id.to_string())
             .fetch_optional(&self.pool)
             .await?;
@@ -92,7 +93,7 @@ impl Store {
     }
 
     pub async fn list_documents(&self) -> StoreResult<Vec<StoredDocument>> {
-        let rows = sqlx::query(&select_documents("ORDER BY d.id"))
+        let rows = sqlx::query(&select_documents("", "ORDER BY d.id"))
             .fetch_all(&self.pool)
             .await?;
         rows.iter().map(parse_document).collect()
@@ -117,24 +118,24 @@ impl Store {
         Ok(count as u64)
     }
 
-    /// Documents with local changes still waiting to upload. A parked document is not
-    /// counted: it waits for the user's next edit (`list_parked`).
+    /// Documents the uploader will send. A parked document waits for the user's next edit
+    /// (`list_parked`).
     pub async fn count_pending_sync(&self) -> StoreResult<u64> {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(DISTINCT doc_id) FROM outbox WHERE parked_error IS NULL",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM ({PENDING_DOC_IDS})"))
+            .fetch_one(&self.pool)
+            .await?;
         Ok(count as u64)
     }
 
-    /// Documents that stopped uploading until their next local edit, with the code that
-    /// parked them (`validation`, `forbidden`, `too_large`, `diverged`).
+    /// Documents that stopped uploading until their next local edit, with the code of their
+    /// newest parked row (`validation`, `forbidden`, `too_large`, `diverged`).
     pub async fn list_parked(&self) -> StoreResult<Vec<ParkedDocument>> {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT doc_id, MAX(parked_error) FROM outbox WHERE parked_error IS NOT NULL \
-             GROUP BY doc_id ORDER BY doc_id",
-        )
+        let rows: Vec<(String, String)> = sqlx::query_as(&format!(
+            "SELECT p.doc_id, (SELECT n.parked_error FROM outbox n WHERE n.doc_id = p.doc_id \
+                 AND n.parked_error IS NOT NULL ORDER BY n.mutation_id DESC LIMIT 1) \
+             FROM (SELECT DISTINCT doc_id FROM outbox WHERE parked_error IS NOT NULL) p \
+             WHERE p.doc_id NOT IN ({PENDING_DOC_IDS}) ORDER BY p.doc_id"
+        ))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -184,8 +185,8 @@ impl Store {
         limit: u32,
     ) -> StoreResult<Vec<StoredDocument>> {
         let rows = sqlx::query(&select_documents(
-            "AND d.id IN (SELECT document_id FROM documents_fts WHERE documents_fts MATCH ?) \
-             ORDER BY d.id LIMIT ?",
+            "JOIN documents_fts f ON f.document_id = d.id",
+            "AND f.documents_fts MATCH ? ORDER BY f.rank LIMIT ?",
         ))
         .bind(query)
         .bind(i64::from(limit))
@@ -200,9 +201,10 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use crate::engine::types::{SCOPE_CURATED, SCOPE_OWN};
+    use crate::engine::machine::BuildOutcome;
+    use crate::engine::types::{ServerError, SCOPE_CURATED, SCOPE_OWN};
     use crate::store::test_support::*;
-    use crate::store::ParkedDocument;
+    use crate::store::{ParkedDocument, Store};
 
     fn doc(n: u128) -> Uuid {
         Uuid::from_u128(0xD000 + n)
@@ -268,7 +270,8 @@ mod tests {
     #[tokio::test]
     async fn counts_hide_pending_deletes_and_pending_sync_skips_parked_documents() {
         let t = temp_store().await;
-        let first = t.store.create_document(None, json!({})).await.unwrap();
+        seed_synced(&t.store, doc(8), SCOPE_OWN, Some(ME), json!({}), 1).await;
+        let first = doc(8);
         let parked = t.store.create_document(None, json!({})).await.unwrap();
         seed_synced(&t.store, doc(9), SCOPE_OWN, Some(ME), json!({}), 1).await;
         exec(
@@ -279,7 +282,7 @@ mod tests {
         assert_eq!(t.store.count_documents().await.unwrap(), 3);
         assert_eq!(
             t.store.count_pending_sync().await.unwrap(),
-            1,
+            0,
             "a parked document waits for an edit, not for sync; a synced one does not count"
         );
         t.store.delete_document(first).await.unwrap();
@@ -308,6 +311,180 @@ mod tests {
                 code: "too_large".into()
             }]
         );
+    }
+
+    /// Sends the document's queued rows and has the server refuse them as invalid.
+    async fn refuse_upload(t: &TempStore, doc_id: Uuid) {
+        let BuildOutcome::Send { inflight, .. } = t.store.build_upload(ME, doc_id).await.unwrap()
+        else {
+            panic!("expected an upload");
+        };
+        t.store
+            .settle_upload(
+                ME,
+                doc_id,
+                &inflight,
+                &Err(ServerError::new("validation")),
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn parked_ids(store: &Store) -> Vec<Uuid> {
+        let parked = store.list_parked().await.unwrap();
+        parked.into_iter().map(|parked| parked.doc_id).collect()
+    }
+
+    #[tokio::test]
+    async fn an_edit_made_during_a_refused_upload_leaves_the_document_parked_not_pending() {
+        let t = temp_store().await;
+        seed_synced(&t.store, doc(1), SCOPE_OWN, Some(ME), json!({"n": 0}), 1).await;
+        t.store
+            .update_document(doc(1), json!({"n": 1}))
+            .await
+            .unwrap();
+        let BuildOutcome::Send { inflight, .. } = t.store.build_upload(ME, doc(1)).await.unwrap()
+        else {
+            panic!("expected an upload");
+        };
+        t.store
+            .update_document(doc(1), json!({"n": 2}))
+            .await
+            .unwrap();
+        t.store
+            .settle_upload(
+                ME,
+                doc(1),
+                &inflight,
+                &Err(ServerError::new("validation")),
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(t.store.load_pending().await.unwrap().is_empty());
+        assert_eq!(t.store.count_pending_sync().await.unwrap(), 0);
+        assert_eq!(parked_ids(&t.store).await, vec![doc(1)]);
+    }
+
+    #[tokio::test]
+    async fn a_delete_after_a_refused_upload_is_pending_and_the_document_stays_hidden() {
+        let t = temp_store().await;
+        seed_synced(&t.store, doc(1), SCOPE_OWN, Some(ME), json!({"n": 0}), 1).await;
+        t.store
+            .update_document(doc(1), json!({"n": 1}))
+            .await
+            .unwrap();
+        let BuildOutcome::Send { inflight, .. } = t.store.build_upload(ME, doc(1)).await.unwrap()
+        else {
+            panic!("expected an upload");
+        };
+        t.store.delete_document(doc(1)).await.unwrap();
+        t.store
+            .settle_upload(
+                ME,
+                doc(1),
+                &inflight,
+                &Err(ServerError::new("validation")),
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(t.store.load_pending().await.unwrap(), vec![doc(1)]);
+        assert_eq!(t.store.count_pending_sync().await.unwrap(), 1);
+        assert!(parked_ids(&t.store).await.is_empty());
+        assert_eq!(t.store.get_document(doc(1)).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn every_document_with_outbox_rows_is_exactly_one_of_pending_or_parked() {
+        let t = temp_store().await;
+        for n in 1..=5 {
+            seed_synced(&t.store, doc(n), SCOPE_OWN, Some(ME), json!({"n": 0}), 1).await;
+            t.store
+                .update_document(doc(n), json!({"n": 1}))
+                .await
+                .unwrap();
+        }
+        // 1: queued. 2: refused. 3: edited during a refused upload. 4: refused then deleted.
+        refuse_upload(&t, doc(2)).await;
+        let BuildOutcome::Send { inflight, .. } = t.store.build_upload(ME, doc(3)).await.unwrap()
+        else {
+            panic!("expected an upload");
+        };
+        t.store
+            .update_document(doc(3), json!({"n": 2}))
+            .await
+            .unwrap();
+        t.store
+            .settle_upload(
+                ME,
+                doc(3),
+                &inflight,
+                &Err(ServerError::new("forbidden")),
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+        refuse_upload(&t, doc(4)).await;
+        t.store.delete_document(doc(4)).await.unwrap();
+        // 5: refused, deleted, and that delete parked too.
+        refuse_upload(&t, doc(5)).await;
+        t.store.delete_document(doc(5)).await.unwrap();
+        exec(
+            &t.store,
+            &format!(
+                "UPDATE outbox SET parked_error = 'forbidden' WHERE doc_id = '{}'",
+                doc(5)
+            ),
+        )
+        .await;
+
+        let pending = t.store.load_pending().await.unwrap();
+        let parked = parked_ids(&t.store).await;
+        assert!(pending.iter().all(|id| !parked.contains(id)));
+        let mut union: Vec<Uuid> = pending.iter().chain(&parked).copied().collect();
+        union.sort();
+        let with_rows: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT doc_id FROM outbox ORDER BY doc_id")
+                .fetch_all(&t.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            union.iter().map(Uuid::to_string).collect::<Vec<_>>(),
+            with_rows
+        );
+        assert_eq!(
+            t.store.count_pending_sync().await.unwrap(),
+            pending.len() as u64
+        );
+        assert_eq!(pending, vec![doc(1), doc(4)]);
+    }
+
+    #[tokio::test]
+    async fn list_parked_reports_the_code_of_the_newest_parked_row() {
+        let t = temp_store().await;
+        let doc_id = t.store.create_document(None, json!({})).await.unwrap();
+        exec(
+            &t.store,
+            &format!(
+                "UPDATE outbox SET parked_error = 'too_large' WHERE doc_id = '{doc_id}'; \
+                 INSERT INTO outbox (mutation_id, doc_id, kind, created_at, parked_error) \
+                 VALUES ('00000000-0000-0000-0000-000000000000', '{doc_id}', 'update', 0, 'validation')"
+            ),
+        )
+        .await;
+        let code = t.store.list_parked().await.unwrap()[0].code.clone();
+        let newest: String =
+            sqlx::query_scalar("SELECT parked_error FROM outbox ORDER BY mutation_id DESC LIMIT 1")
+                .fetch_one(&t.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(code, newest);
     }
 
     #[tokio::test]
@@ -348,5 +525,30 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_returns_the_best_match_first_when_limited() {
+        let t = temp_store().await;
+        t.store
+            .configure_search(&["$.body".to_string()])
+            .await
+            .unwrap();
+        let weak = Uuid::from_u128(0x1);
+        let strong = Uuid::from_u128(0xFFFF);
+        t.store
+            .create_document(
+                Some(weak),
+                json!({"body": "one mention of tuning among many other unrelated words here"}),
+            )
+            .await
+            .unwrap();
+        t.store
+            .create_document(Some(strong), json!({"body": "tuning tuning tuning"}))
+            .await
+            .unwrap();
+        let found = t.store.search_documents("tuning", 1).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, strong);
     }
 }

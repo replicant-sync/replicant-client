@@ -9,18 +9,19 @@ use crate::engine::doc_upload::reply_diverged;
 use crate::engine::machine::{BuildOutcome, SettleOutcome};
 use crate::engine::types::{DocEnvelope, Seq, ServerError};
 
+/// The documents the uploader will send. Every other document with outbox rows is parked.
+pub(super) const PENDING_DOC_IDS: &str = "SELECT doc_id FROM outbox GROUP BY doc_id \
+     HAVING SUM(parked_error IS NOT NULL) = 0 OR (SELECT kind = 'delete' AND parked_error IS NULL \
+         FROM outbox last WHERE last.doc_id = outbox.doc_id ORDER BY mutation_id DESC LIMIT 1)";
+
 impl Store {
     /// `Effect::LoadPending`: documents with outbox rows and none parked (or an unparked delete
     /// as the last row), oldest row first.
     pub async fn load_pending(&self) -> StoreResult<Vec<Uuid>> {
-        let ids: Vec<String> = sqlx::query_scalar(
-            "SELECT doc_id FROM outbox GROUP BY doc_id \
-             HAVING SUM(parked_error IS NOT NULL) = 0 OR (SELECT kind = 'delete' AND parked_error IS NULL FROM outbox last \
-                 WHERE last.doc_id = outbox.doc_id ORDER BY mutation_id DESC LIMIT 1) \
-             ORDER BY MIN(mutation_id)",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let ids: Vec<String> =
+            sqlx::query_scalar(&format!("{PENDING_DOC_IDS} ORDER BY MIN(mutation_id)"))
+                .fetch_all(&self.pool)
+                .await?;
         ids.iter()
             .map(|id| Uuid::parse_str(id).map_err(StoreError::from))
             .collect()
