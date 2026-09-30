@@ -2434,6 +2434,8 @@ mod property_tests {
         /// needed to tell whether this write's value actually won a race against a local upload
         /// that landed later in true time (see `check_shared_key_preserved`).
         other_shared_writes: Vec<(u64, Seq, Option<String>)>,
+        /// (base hash named, hash of the content deleted over) of every client delete committed.
+        deletes: Vec<(Option<String>, String)>,
     }
 
     impl Server {
@@ -2445,6 +2447,7 @@ mod property_tests {
                 other_edits: 0,
                 deleted: false,
                 other_shared_writes: Vec::new(),
+                deletes: Vec::new(),
             }
         }
 
@@ -2540,6 +2543,7 @@ mod property_tests {
                     {
                         return Err(self.mismatch(current_hash));
                     }
+                    self.deletes.push((upload.base_hash.clone(), current_hash));
                     self.deleted = true;
                     self.commit(self.current().clone(), Some(upload.upload_id), true)
                 }
@@ -3561,6 +3565,12 @@ mod property_tests {
                 check_invariants(seed, &client);
             }
             drain(seed, &mut server, &mut client, &mut rng);
+            for (base, deleted_over) in &server.deletes {
+                assert!(
+                    base.as_ref().is_none_or(|base| base == deleted_over),
+                    "seed {seed}: a delete destroyed a version the client had not seen"
+                );
+            }
 
             if server.deleted {
                 assert!(
