@@ -26,6 +26,16 @@ const HALT_RETRY: Duration = Duration::from_secs(300);
 const MAX_CATCH_UP_FAILURES: u32 = 3;
 const UNREADABLE_PUSHES_BEFORE_ERROR: u32 = 3;
 
+/// Halts that another process's sign-in can end, so the stored credentials are read again
+/// every `HALT_RETRY`.
+fn rechecks_credentials(reason: &HaltReason) -> bool {
+    match reason {
+        HaltReason::NotEnrolled | HaltReason::AuthInvalid => true,
+        HaltReason::Other(code) => code == "identity_drift",
+        _ => false,
+    }
+}
+
 /// Why the connection is halted and will not retry on its own schedule.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HaltReason {
@@ -496,12 +506,14 @@ impl Core {
                 if let Conn::Halted(reason) = &self.conn {
                     if has_credentials {
                         self.connect_now(fx);
-                    } else if matches!(reason, HaltReason::NotEnrolled | HaltReason::AuthInvalid) {
+                    } else if rechecks_credentials(reason) {
                         fx.push(Effect::Schedule {
                             timer: TimerId::HaltRetry,
                             after: HALT_RETRY,
                         });
                     }
+                } else if !has_credentials {
+                    self.sign_out(fx);
                 }
             }
             Input::SocketOpened { gen } | Input::SocketClosed { gen } if gen != self.socket_gen => {
@@ -626,13 +638,31 @@ impl Core {
             doc_id: None,
             fatal: true,
         }));
-        if matches!(reason, HaltReason::NotEnrolled | HaltReason::AuthInvalid) {
+        if rechecks_credentials(&reason) {
             fx.push(Effect::Schedule {
                 timer: TimerId::HaltRetry,
                 after: HALT_RETRY,
             });
         }
         self.conn = Conn::Halted(reason);
+    }
+
+    /// The stored credentials are gone: nothing may join with the old ones, so the connection
+    /// ends and the engine halts until someone signs in (spec §9, local "no credentials").
+    fn sign_out(&mut self, fx: &mut Vec<Effect>) {
+        match self.conn {
+            Conn::Connected(_) => self.catch_up_fatal(HaltReason::NotEnrolled, fx),
+            Conn::Connecting { .. } => {
+                fx.push(Effect::Cancel(TimerId::ConnectTimeout));
+                self.close_socket(fx);
+                self.halt(HaltReason::NotEnrolled, fx);
+            }
+            Conn::Disconnected => {
+                fx.push(Effect::Cancel(TimerId::Reconnect));
+                self.halt(HaltReason::NotEnrolled, fx);
+            }
+            Conn::Idle | Conn::Halted(_) | Conn::Stopped => {}
+        }
     }
 
     fn halt_reason_for(e: &ServerError) -> Option<HaltReason> {
@@ -907,7 +937,7 @@ impl Core {
         });
     }
 
-    /// A fatal server error ends the Connected period like `lose_connection`, then halts
+    /// A fatal error ends the Connected period like lose_connection, then halts
     /// instead of scheduling a reconnect.
     fn catch_up_fatal(&mut self, reason: HaltReason, fx: &mut Vec<Effect>) {
         fx.push(Effect::Emit(Lifecycle::ConnectionLost));
@@ -2244,6 +2274,118 @@ mod connection_tests {
             timer: TimerId::Reconnect,
             after: Duration::from_secs(1),
         }));
+    }
+
+    #[test]
+    fn sign_out_while_connected_ends_the_connection_and_halts_not_enrolled() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        open_and_join(&mut c);
+        assert_eq!(c.state().connection, ConnectionView::Connected);
+        let fx = c.step(Input::CredentialsChanged {
+            has_credentials: false,
+        });
+        assert_eq!(
+            c.state().connection,
+            ConnectionView::Halted(HaltReason::NotEnrolled)
+        );
+        assert!(closes(&fx));
+        assert_eq!(emitted(&fx).first(), Some(&Lifecycle::ConnectionLost));
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::HaltRetry,
+            after: Duration::from_secs(300)
+        }));
+    }
+
+    #[test]
+    fn sign_out_while_connecting_or_disconnected_halts_without_a_join() {
+        let mut connecting = core();
+        connecting.step(Input::Start {
+            has_credentials: true,
+        });
+        let fx = connecting.step(Input::CredentialsChanged {
+            has_credentials: false,
+        });
+        assert!(closes(&fx));
+        assert!(fx.contains(&Effect::Cancel(TimerId::ConnectTimeout)));
+        assert_eq!(
+            connecting.state().connection,
+            ConnectionView::Halted(HaltReason::NotEnrolled)
+        );
+        assert!(
+            sends(&connecting.step(opened(&connecting))).is_empty(),
+            "a socket that opens late sends no join"
+        );
+
+        let mut disconnected = core();
+        disconnected.step(Input::Start {
+            has_credentials: true,
+        });
+        disconnected.step(closed(&disconnected));
+        assert_eq!(
+            disconnected.state().connection,
+            ConnectionView::Disconnected
+        );
+        let fx = disconnected.step(Input::CredentialsChanged {
+            has_credentials: false,
+        });
+        assert!(fx.contains(&Effect::Cancel(TimerId::Reconnect)));
+        assert_eq!(
+            disconnected.state().connection,
+            ConnectionView::Halted(HaltReason::NotEnrolled)
+        );
+    }
+
+    #[test]
+    fn new_credentials_while_connected_change_nothing() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        open_and_join(&mut c);
+        let fx = c.step(Input::CredentialsChanged {
+            has_credentials: true,
+        });
+        assert!(fx.is_empty(), "they sign the next join (contract b)");
+        assert_eq!(c.state().connection, ConnectionView::Connected);
+    }
+
+    #[test]
+    fn an_identity_drift_halt_is_checked_again_every_five_minutes() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (req, _) = sends(&c.step(opened(&c))).pop().expect("join sent");
+        let mut drift = ServerError::new("identity_drift");
+        drift.is_fatal = true;
+        let fx = c.step(Input::Reply {
+            req,
+            result: Err(drift),
+        });
+        assert_eq!(
+            c.state().connection,
+            ConnectionView::Halted(HaltReason::Other("identity_drift".into()))
+        );
+        assert!(fx.contains(&Effect::Schedule {
+            timer: TimerId::HaltRetry,
+            after: HALT_RETRY
+        }));
+        assert!(c
+            .step(Input::Timer(TimerId::HaltRetry))
+            .contains(&Effect::CheckCredentials));
+        assert!(
+            c.step(Input::CredentialsChanged {
+                has_credentials: false
+            })
+            .contains(&Effect::Schedule {
+                timer: TimerId::HaltRetry,
+                after: HALT_RETRY
+            }),
+            "a check that finds the drifted credentials schedules the next one"
+        );
     }
 }
 

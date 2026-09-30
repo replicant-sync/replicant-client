@@ -2,7 +2,9 @@
 //! real sockets with long timers.
 
 use std::future::Future;
+use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,30 +41,51 @@ fn auth(api_key: &str) -> JoinAuth {
 
 pub(crate) fn credentials(api_key: &str) -> CredentialLoader {
     let api_key = api_key.to_string();
-    Arc::new(move || Some(auth(&api_key)))
+    Arc::new(move || Ok(Some(auth(&api_key))))
 }
 
 /// No stored credentials: the engine halts as not enrolled and never touches the network.
 pub(crate) fn no_credentials() -> CredentialLoader {
-    Arc::new(|| None)
+    Arc::new(|| Ok(None))
 }
 
-/// Credentials a test can change while the engine runs.
+/// Credentials a test can change, remove or make unreadable while the engine runs.
 #[derive(Clone)]
-pub(crate) struct SwitchableCredentials(Arc<Mutex<String>>);
+pub(crate) struct SwitchableCredentials {
+    api_key: Arc<Mutex<Option<String>>>,
+    unreadable: Arc<AtomicBool>,
+}
 
 impl SwitchableCredentials {
     pub fn new(api_key: &str) -> Self {
-        Self(Arc::new(Mutex::new(api_key.to_string())))
+        Self {
+            api_key: Arc::new(Mutex::new(Some(api_key.to_string()))),
+            unreadable: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     pub fn set(&self, api_key: &str) {
-        *self.0.lock().unwrap() = api_key.to_string();
+        *self.api_key.lock().unwrap() = Some(api_key.to_string());
+    }
+
+    /// As if the stored credentials were cleared, here or by another process.
+    pub fn sign_out(&self) {
+        *self.api_key.lock().unwrap() = None;
+    }
+
+    /// As if the file were half-written or corrupt: every read fails until `false`.
+    pub fn set_unreadable(&self, unreadable: bool) {
+        self.unreadable.store(unreadable, Ordering::SeqCst);
     }
 
     pub fn loader(&self) -> CredentialLoader {
-        let api_key = self.0.clone();
-        Arc::new(move || Some(auth(&api_key.lock().unwrap())))
+        let (api_key, unreadable) = (self.api_key.clone(), self.unreadable.clone());
+        Arc::new(move || {
+            if unreadable.load(Ordering::SeqCst) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "decrypt failed"));
+            }
+            Ok(api_key.lock().unwrap().as_deref().map(auth))
+        })
     }
 }
 

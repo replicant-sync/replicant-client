@@ -256,6 +256,112 @@ async fn credentials_changed_while_a_join_is_outstanding_rejects_the_signer_not_
 }
 
 #[tokio::test]
+async fn sign_out_while_live_halts_and_never_joins_with_the_old_credentials() {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = harness(&server.url, keys.loader(), ME, true).await;
+    h.live().await;
+    keys.sign_out();
+    assert!(h
+        .controls
+        .commands
+        .try_send(Command::CredentialsChanged)
+        .is_ok());
+    h.turn_until("halted as not enrolled", |o| {
+        connection(o) == ConnectionView::Halted(HaltReason::NotEnrolled)
+    })
+    .await;
+    jump(Duration::from_secs(2)).await;
+    h.turn_until("the dial cooldown has passed", |o| {
+        !o.timers.is_scheduled(&TimerId::DialCooldown)
+    })
+    .await;
+    assert!(h.controls.commands.try_send(Command::Reconnect).is_ok());
+    h.turn_until("one more dial, halted before its join", |o| {
+        server.stats.upgrades() == 2
+            && connection(o) == ConnectionView::Halted(HaltReason::NotEnrolled)
+    })
+    .await;
+    assert_eq!(
+        server.join_keys(),
+        vec!["k1".to_string()],
+        "nothing joined after the sign-out"
+    );
+    keys.set("k2");
+    assert!(h
+        .controls
+        .commands
+        .try_send(Command::CredentialsChanged)
+        .is_ok());
+    h.turn_until("live with the new credentials", is_live).await;
+    assert_eq!(server.join_keys(), vec!["k1".to_string(), "k2".to_string()]);
+}
+
+#[tokio::test]
+async fn a_dial_after_the_stored_credentials_are_gone_halts_without_joining() {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = harness(&server.url, keys.loader(), ME, true).await;
+    h.live().await;
+    // Cleared by another process: this engine is never told.
+    keys.sign_out();
+    server.drop_connections();
+    h.turn_until("disconnected", |o| {
+        connection(o) == ConnectionView::Disconnected
+    })
+    .await;
+    jump(Duration::from_millis(2100)).await;
+    h.turn_until("halted at the next dial", |o| {
+        connection(o) == ConnectionView::Halted(HaltReason::NotEnrolled)
+    })
+    .await;
+    assert_eq!(server.join_keys(), vec!["k1".to_string()]);
+    assert_eq!(
+        server.stats.upgrades(),
+        2,
+        "the dial happened, the join did not"
+    );
+}
+
+#[tokio::test]
+async fn unreadable_credentials_are_retried_and_never_read_as_a_sign_out() {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = harness(&server.url, keys.loader(), ME, true).await;
+    h.live().await;
+    keys.set_unreadable(true);
+    server.drop_connections();
+    jump(Duration::from_millis(2100)).await;
+    h.turn_until("a dial that did not join", |o| {
+        server.stats.upgrades() == 2 && connection(o) != ConnectionView::Connected
+    })
+    .await;
+    assert_ne!(
+        connection(&h.owner),
+        ConnectionView::Halted(HaltReason::NotEnrolled),
+        "a torn read is not a sign-out"
+    );
+    keys.set_unreadable(false);
+    jump(Duration::from_secs(10)).await;
+    h.turn_until("live again with k1", is_live).await;
+    assert_eq!(server.join_keys(), vec!["k1".to_string(), "k1".to_string()]);
+}
+
+#[tokio::test]
+async fn a_sign_out_in_another_process_ends_a_live_connection_within_a_second() {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = harness(&server.url, keys.loader(), ME, true).await;
+    h.live().await;
+    keys.sign_out(); // this engine is never told
+    jump(Duration::from_millis(1100)).await;
+    h.turn_until("halted as not enrolled", |o| {
+        connection(o) == ConnectionView::Halted(HaltReason::NotEnrolled)
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn nothing_but_the_join_is_sent_while_connecting() {
     let server = ScriptedServer::start(ME).await;
     server.set_mode(Mode::SilentAfterUpgrade);

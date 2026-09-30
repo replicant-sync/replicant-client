@@ -4,6 +4,7 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -43,10 +44,12 @@ mod tests;
 const COMMAND_BUFFER: usize = 32;
 /// How often the change log is read when nothing else wakes the owner (spec §8).
 const LOG_TICK: Duration = Duration::from_millis(250);
+/// While connected, the stored credentials are read every this many ticks (once a second).
+const SIGNED_IN_CHECK_TICKS: u32 = 4;
 
-/// Reads the stored credentials: at start, on `Command::CredentialsChanged`, and on a halted
-/// engine's periodic credential check.
-pub type CredentialLoader = Arc<dyn Fn() -> Option<JoinAuth> + Send + Sync>;
+/// Reads the stored credentials: `Ok(None)` = signed out; `Err` = present but unreadable right
+/// now (a torn or corrupt file), which never counts as a sign-out.
+pub type CredentialLoader = Arc<dyn Fn() -> io::Result<Option<JoinAuth>> + Send + Sync>;
 
 pub struct EngineConfig {
     /// http(s) or ws(s), with or without `/socket/websocket`.
@@ -178,7 +181,8 @@ struct Owner {
     /// Fingerprint of the credentials that signed the most recently sent join; may differ from
     /// `auth_fingerprint` if credentials changed while that join was outstanding.
     join_fingerprint: Option<[u8; 32]>,
-    /// Fingerprint of credentials the server rejected with `auth_invalid`.
+    /// Fingerprint of credentials the server rejected with `auth_invalid`, or that joined as
+    /// another user (`identity_drift`).
     rejected: Option<[u8; 32]>,
     /// Seconds added to this machine's clock when signing a join; learnt from `clock_skew`.
     clock_offset: i64,
@@ -190,6 +194,8 @@ struct Owner {
     outbox: Arc<Notify>,
     cancel: CancellationToken,
     tick: Interval,
+    /// Ticks since the stored credentials were last read while connected.
+    ticks_since_signed_in_check: u32,
     #[cfg(test)]
     dropped_stale: usize,
 }
@@ -224,11 +230,9 @@ impl Owner {
         let me = store.user_id().await?;
         let scopes = store.subscribed_scopes().await?;
         let reader = ChangeLogReader::open(&store, now_unix()).await?;
-        let auth = (config.credentials)();
-        let auth_fingerprint = auth.as_ref().map(fingerprint);
         let connection = Connection::new(
             url,
-            auth,
+            None,
             user_agent(&config.host_app, &config.host_version),
         );
         let core = Core::new(scopes, config.jitter_seed);
@@ -246,7 +250,7 @@ impl Owner {
             timers: Timers::default(),
             reader,
             credentials: config.credentials,
-            auth_fingerprint,
+            auth_fingerprint: None,
             join_fingerprint: None,
             rejected: None,
             clock_offset: 0,
@@ -258,6 +262,7 @@ impl Owner {
             outbox: outbox.clone(),
             cancel: cancel.clone(),
             tick,
+            ticks_since_signed_in_check: 0,
             #[cfg(test)]
             dropped_stale: 0,
         };
@@ -277,8 +282,12 @@ impl Owner {
         self.shutdown().await;
     }
 
+    /// An unreadable credential file at start is not a sign-out: the join-time read decides.
     async fn start(&mut self) {
-        let has_credentials = self.auth_fingerprint.is_some();
+        let has_credentials = self.load_credentials().unwrap_or_else(|error| {
+            warn!(%error, "stored credentials unreadable at start");
+            true
+        });
         self.feed(Input::Start { has_credentials }).await;
     }
 
@@ -319,11 +328,13 @@ impl Owner {
         match wake {
             Wake::Cancelled => {}
             Wake::Command(Command::Reconnect) => self.feed(Input::Reconnect).await,
-            Wake::Command(Command::CredentialsChanged) => {
-                let has_credentials = self.reload_credentials();
-                self.feed(Input::CredentialsChanged { has_credentials })
-                    .await;
-            }
+            Wake::Command(Command::CredentialsChanged) => match self.load_credentials() {
+                Ok(has_credentials) => {
+                    self.feed(Input::CredentialsChanged { has_credentials })
+                        .await
+                }
+                Err(error) => warn!(%error, "stored credentials unreadable; keeping the last ones"),
+            },
             Wake::Socket(event) => {
                 if let Some(received) = self.connection.receive(event) {
                     let input = self.on_received(received).await;
@@ -339,7 +350,29 @@ impl Owner {
                 if self.read_change_log().await {
                     self.feed(Input::OutboxChanged).await;
                 }
+                self.check_still_signed_in().await;
             }
+        }
+    }
+
+    /// A sign-out in another process is never announced here: while connected, the stored
+    /// credentials are read once a second and their removal ends the connection. New or
+    /// unreadable credentials change nothing (the next join reads them again).
+    async fn check_still_signed_in(&mut self) {
+        if self.core.state().connection != ConnectionView::Connected {
+            self.ticks_since_signed_in_check = 0;
+            return;
+        }
+        self.ticks_since_signed_in_check += 1;
+        if self.ticks_since_signed_in_check < SIGNED_IN_CHECK_TICKS {
+            return;
+        }
+        self.ticks_since_signed_in_check = 0;
+        if let Ok(None) = (self.credentials)() {
+            self.feed(Input::CredentialsChanged {
+                has_credentials: false,
+            })
+            .await;
         }
     }
 
@@ -395,21 +428,37 @@ impl Owner {
         Input::Reply { req, result }
     }
 
-    /// An explicit credential change: whatever is stored now signs the next join.
-    fn reload_credentials(&mut self) -> bool {
-        let Some(auth) = (self.credentials)() else {
-            return false;
-        };
-        self.auth_fingerprint = Some(fingerprint(&auth));
-        self.connection.set_auth(auth);
-        true
+    /// Reads the stored credentials: what is stored now signs the next join, and with nothing
+    /// stored nothing may join. Runs on every explicit change and before every join, so a
+    /// sign-out in another process is honoured at this engine's next dial. An unreadable file
+    /// changes nothing: the last credentials loaded stay.
+    fn load_credentials(&mut self) -> io::Result<bool> {
+        match (self.credentials)()? {
+            Some(auth) => {
+                self.auth_fingerprint = Some(fingerprint(&auth));
+                self.connection.set_auth(auth);
+                Ok(true)
+            }
+            None => {
+                self.auth_fingerprint = None;
+                Ok(false)
+            }
+        }
     }
 
-    /// A halted engine's periodic check: credentials the server rejected with `auth_invalid`
-    /// are not tried again until they change.
+    /// A halted engine's periodic check: credentials the server rejected with `auth_invalid`, or
+    /// that joined as another user, are not tried again until they change.
     fn check_credentials(&mut self) -> bool {
-        let Some(auth) = (self.credentials)() else {
-            return false;
+        let auth = match (self.credentials)() {
+            Ok(Some(auth)) => auth,
+            Ok(None) => {
+                self.auth_fingerprint = None;
+                return false;
+            }
+            Err(error) => {
+                warn!(%error, "stored credentials unreadable");
+                return false;
+            }
         };
         let print = fingerprint(&auth);
         if self.rejected == Some(print) {
@@ -472,7 +521,30 @@ impl Owner {
             Effect::CloseSocket { gen } => self.connection.close(gen),
             Effect::Send { req, request } => {
                 if matches!(request, Request::Join) {
-                    self.join_fingerprint = self.auth_fingerprint;
+                    match self.load_credentials() {
+                        Ok(true) => self.join_fingerprint = self.auth_fingerprint,
+                        Ok(false) => {
+                            // Signed out since this dial began: the core halts instead of joining.
+                            self.queue.push_back(Queued {
+                                epoch: None,
+                                input: Input::CredentialsChanged {
+                                    has_credentials: false,
+                                },
+                            });
+                            return None;
+                        }
+                        Err(error) => {
+                            // Not a sign-out: drop this socket so the core backs off and dials again.
+                            warn!(%error, "stored credentials unreadable; retrying the dial");
+                            let gen = self.socket_gen;
+                            self.connection.close(gen);
+                            self.queue.push_back(Queued {
+                                epoch: Some(gen),
+                                input: Input::SocketClosed { gen },
+                            });
+                            return None;
+                        }
+                    }
                 }
                 // Marked before it can reach the server: an upload must never be sent unmarked.
                 if let Request::Upload(upload) = &request {
@@ -601,7 +673,9 @@ impl Owner {
             }
             Effect::Emit(lifecycle) => self.emit(EngineEvent::Lifecycle(lifecycle)),
             Effect::SetState(state) => {
-                if state.connection == ConnectionView::Halted(HaltReason::AuthInvalid) {
+                let drifted = matches!(&state.connection,
+                    ConnectionView::Halted(HaltReason::Other(code)) if code == "identity_drift");
+                if drifted || state.connection == ConnectionView::Halted(HaltReason::AuthInvalid) {
                     self.rejected = self.join_fingerprint;
                 }
                 self.state.send_replace(state);

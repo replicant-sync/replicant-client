@@ -78,6 +78,9 @@ fn next_input(rng: &mut Jitter, outstanding: &mut Vec<(u64, Request)>, socket_ge
                 error: refused,
             },
             Input::Reconnect,
+            Input::CredentialsChanged {
+                has_credentials: false,
+            },
             Input::OutboxChanged,
             Input::UnreadablePush {
                 scope: Some("own".into()),
