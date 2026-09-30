@@ -1,4 +1,5 @@
 //! HTTP client for the plugin-initiated enrollment flow.
+use crate::ffi::REPLICANT_CREDENTIAL_MAX_LEN as MAX_CRED_LEN;
 use crate::secret_store::Credentials;
 use std::time::Duration;
 
@@ -14,7 +15,6 @@ pub enum EnrollError {
     InsecureUrl,
 }
 
-const MAX_CRED_LEN: usize = 128;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 

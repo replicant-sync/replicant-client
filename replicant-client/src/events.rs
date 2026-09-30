@@ -197,11 +197,11 @@ struct Registered<F> {
 #[derive(Clone, Default)]
 struct Callbacks {
     thread: Option<ThreadId>,
-    document: Vec<(Registered<DocumentFn>, Option<EventType>)>,
-    sync: Vec<Registered<SyncFn>>,
-    error: Vec<Registered<ErrorFn>>,
-    connection: Vec<Registered<ConnectionFn>>,
-    conflict: Vec<Registered<ConflictFn>>,
+    document: Option<(Registered<DocumentFn>, Option<EventType>)>,
+    sync: Option<Registered<SyncFn>>,
+    error: Option<Registered<ErrorFn>>,
+    connection: Option<Registered<ConnectionFn>>,
+    conflict: Option<Registered<ConflictFn>>,
 }
 
 // The contexts are only ever passed back to callbacks on the registering thread.
@@ -210,35 +210,32 @@ unsafe impl Send for Callbacks {}
 #[derive(Default)]
 pub struct Dispatcher(Mutex<Callbacks>);
 
+/// Each `register_*` replaces the kind's previous callback and context; `None` removes it.
 impl Dispatcher {
     /// `filter`: one of `DocumentChanged` / `DocumentDeleted`, or every document event.
     pub fn register_document(
         &self,
-        callback: DocumentFn,
+        callback: Option<DocumentFn>,
         context: *mut c_void,
         filter: Option<EventType>,
     ) {
-        self.bind()
-            .document
-            .push((Registered { callback, context }, filter));
+        self.bind().document = callback.map(|callback| (Registered { callback, context }, filter));
     }
 
-    pub fn register_sync(&self, callback: SyncFn, context: *mut c_void) {
-        self.bind().sync.push(Registered { callback, context });
+    pub fn register_sync(&self, callback: Option<SyncFn>, context: *mut c_void) {
+        self.bind().sync = callback.map(|callback| Registered { callback, context });
     }
 
-    pub fn register_error(&self, callback: ErrorFn, context: *mut c_void) {
-        self.bind().error.push(Registered { callback, context });
+    pub fn register_error(&self, callback: Option<ErrorFn>, context: *mut c_void) {
+        self.bind().error = callback.map(|callback| Registered { callback, context });
     }
 
-    pub fn register_connection(&self, callback: ConnectionFn, context: *mut c_void) {
-        self.bind()
-            .connection
-            .push(Registered { callback, context });
+    pub fn register_connection(&self, callback: Option<ConnectionFn>, context: *mut c_void) {
+        self.bind().connection = callback.map(|callback| Registered { callback, context });
     }
 
-    pub fn register_conflict(&self, callback: ConflictFn, context: *mut c_void) {
-        self.bind().conflict.push(Registered { callback, context });
+    pub fn register_conflict(&self, callback: Option<ConflictFn>, context: *mut c_void) {
+        self.bind().conflict = callback.map(|callback| Registered { callback, context });
     }
 
     fn bind(&self) -> std::sync::MutexGuard<'_, Callbacks> {
@@ -287,7 +284,7 @@ impl Callbacks {
                 let owner = document.user_id.map(|owner| text(&owner.to_string()));
                 let author = document.author_id.map(|author| text(&author.to_string()));
                 let visibility = text(document.visibility);
-                for (entry, filter) in &self.document {
+                if let Some((entry, filter)) = &self.document {
                     if filter.is_none_or(|wanted| wanted == EventType::DocumentChanged) {
                         (entry.callback)(
                             EventType::DocumentChanged,
@@ -306,7 +303,7 @@ impl Callbacks {
             }
             HostEvent::DocumentDeleted { doc_id, origin } => {
                 let id = text(&doc_id.to_string());
-                for (entry, filter) in &self.document {
+                if let Some((entry, filter)) = &self.document {
                     if filter.is_none_or(|wanted| wanted == EventType::DocumentDeleted) {
                         (entry.callback)(
                             EventType::DocumentDeleted,
@@ -337,7 +334,7 @@ impl Callbacks {
                 let error = text(code);
                 let document_id = doc_id.map(|id| text(&id.to_string()));
                 let scope = scope.as_deref().map(text);
-                for entry in &self.error {
+                if let Some(entry) = &self.error {
                     (entry.callback)(
                         EventType::SyncError,
                         error_code_for(code) as i32,
@@ -360,7 +357,7 @@ impl Callbacks {
                 let reason = text(reason);
                 let paths_json = (!paths.is_empty())
                     .then(|| text(&serde_json::to_string(paths).unwrap_or_default()));
-                for entry in &self.conflict {
+                if let Some(entry) = &self.conflict {
                     (entry.callback)(
                         EventType::ConflictDetected,
                         id.as_ptr(),
@@ -382,13 +379,13 @@ impl Callbacks {
     }
 
     fn sync_event(&self, event_type: EventType) {
-        for entry in &self.sync {
+        if let Some(entry) = &self.sync {
             (entry.callback)(event_type, entry.context);
         }
     }
 
     fn connection_event(&self, event_type: EventType, connected: bool, attempt: u32) {
-        for entry in &self.connection {
+        if let Some(entry) = &self.connection {
             (entry.callback)(event_type, connected, attempt, entry.context);
         }
     }
@@ -505,11 +502,11 @@ mod tests {
         let seen: Log = Mutex::new(Vec::new());
         let context = &seen as *const Log as *mut c_void;
         let dispatcher = Dispatcher::default();
-        dispatcher.register_document(on_document, context, None);
-        dispatcher.register_sync(on_sync, context);
-        dispatcher.register_error(on_error, context);
-        dispatcher.register_connection(on_connection, context);
-        dispatcher.register_conflict(on_conflict, context);
+        dispatcher.register_document(Some(on_document), context, None);
+        dispatcher.register_sync(Some(on_sync), context);
+        dispatcher.register_error(Some(on_error), context);
+        dispatcher.register_connection(Some(on_connection), context);
+        dispatcher.register_conflict(Some(on_conflict), context);
         let doc_id = Uuid::from_u128(1);
         let owner = Uuid::from_u128(0xA);
         let document = StoredDocument {
@@ -602,7 +599,7 @@ mod tests {
             Err(DispatchError::NoCallbacks)
         );
         let seen: Log = Mutex::new(Vec::new());
-        dispatcher.register_sync(on_sync, &seen as *const Log as *mut c_void);
+        dispatcher.register_sync(Some(on_sync), &seen as *const Log as *mut c_void);
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 assert_eq!(

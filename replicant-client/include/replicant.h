@@ -33,6 +33,21 @@ namespace replicant {
  */
 #define REPLICANT_ABI_VERSION_MINOR 0
 
+/**
+ * Longest `api_key` or `secret`, in bytes; a buffer for either needs one more for the NUL.
+ */
+#define REPLICANT_CREDENTIAL_MAX_LEN 128
+
+/**
+ * Longest email, in bytes.
+ */
+#define REPLICANT_EMAIL_MAX_LEN 254
+
+/**
+ * A user id's length; its buffer needs one more for the NUL.
+ */
+#define REPLICANT_USER_ID_LEN 36
+
 enum ReplicantEventOrigin
 #ifdef __cplusplus
   : int32_t
@@ -298,6 +313,10 @@ enum ReplicantSyncResult
    * The kept copy's document was deleted: `replicant_restore_document` re-creates the copy.
    */
   ReplicantSyncResult_ErrorDocumentGone = -14,
+  /**
+   * An output buffer is smaller than the value plus its NUL; see the `REPLICANT_*_LEN` limits.
+   */
+  ReplicantSyncResult_ErrorBufferTooSmall = -15,
   ReplicantSyncResult_ErrorUnknown = -99,
 };
 #ifndef __cplusplus
@@ -685,7 +704,9 @@ ReplicantSyncResult replicant_list_parked(struct Replicant *handle, char **out_j
 
 /**
  * `event_filter`: -1 every document event, 1 `DocumentChanged` only, 2 `DocumentDeleted` only.
- * The first registration on a handle fixes the thread that must call `replicant_process_events`.
+ * One callback per kind: registering again replaces the previous callback, filter and context;
+ * a null callback removes it (its events are then dropped when pumped). The first registration
+ * on a handle, of any kind, fixes the thread that must call `replicant_process_events`.
  *
  * # Safety
  * Valid handle; `context` must outlive the handle.
@@ -696,7 +717,8 @@ ReplicantSyncResult replicant_register_document_callback(struct Replicant *handl
                                                          int32_t event_filter);
 
 /**
- * `SyncStarted`, `SyncCompleted`, `DatabaseChanged` and `IdentityAdopted`.
+ * `SyncStarted`, `SyncCompleted`, `DatabaseChanged` and `IdentityAdopted`. Replaces or removes
+ * as `replicant_register_document_callback` does.
  *
  * # Safety
  * Valid handle; `context` must outlive the handle.
@@ -706,6 +728,8 @@ ReplicantSyncResult replicant_register_sync_callback(struct Replicant *handle,
                                                      void *context);
 
 /**
+ * Replaces or removes as `replicant_register_document_callback` does.
+ *
  * # Safety
  * Valid handle; `context` must outlive the handle.
  */
@@ -714,6 +738,8 @@ ReplicantSyncResult replicant_register_error_callback(struct Replicant *handle,
                                                       void *context);
 
 /**
+ * Replaces or removes as `replicant_register_document_callback` does.
+ *
  * # Safety
  * Valid handle; `context` must outlive the handle.
  */
@@ -722,6 +748,8 @@ ReplicantSyncResult replicant_register_connection_callback(struct Replicant *han
                                                            void *context);
 
 /**
+ * Replaces or removes as `replicant_register_document_callback` does.
+ *
  * # Safety
  * Valid handle; `context` must outlive the handle.
  */
@@ -751,9 +779,9 @@ ReplicantSyncResult replicant_process_events(struct Replicant *handle,
 void replicant_string_free(char *s);
 
 /**
- * This library's version; free the result with `replicant_string_free`.
+ * This library's version, e.g. "0.7.0". Static: never free it.
  */
-char *replicant_get_version(void);
+const char *replicant_get_version(void);
 
 /**
  * Requests an enrollment token be emailed to `email`. Needs no handle. Blocks the calling
@@ -766,10 +794,12 @@ char *replicant_get_version(void);
 ReplicantSyncResult replicant_enroll_request(const char *base_url, const char *email);
 
 /**
- * Exchanges an enrollment token for a per-user credential. On success writes
- * the api_key, secret, and canonical user id (36-char UUID string) into the
- * out buffers; each `*_cap` is the writable size of its buffer in bytes and
- * the call fails (without overflowing) when a value does not fit.
+ * Exchanges an enrollment token for credentials and stores them in `data_dir` with `email`,
+ * as `replicant_store_credentials` does, before writing the api key, secret and user id into
+ * the buffers (each `*_cap` is its buffer's size). A buffer too small for its value is
+ * `ErrorBufferTooSmall`, and the credentials are stored all the same: the token is spent.
+ * `ErrorInvalidInput`: the token was refused. `ErrorSerialization`: the server's reply was bad.
+ * `ErrorConnection`: the server could not be reached. Out buffers are only valid on `Success`.
  *
  * Blocks the calling thread for the HTTP round trip (up to about 10 s to connect and 30 s for
  * the request); never call it from an audio or UI thread.
@@ -779,6 +809,7 @@ ReplicantSyncResult replicant_enroll_request(const char *base_url, const char *e
  * must reference a writable buffer of at least its stated capacity.
  */
 ReplicantSyncResult replicant_enroll_claim(const char *base_url,
+                                           const char *data_dir,
                                            const char *email,
                                            const char *token,
                                            char *out_api_key,
@@ -789,10 +820,10 @@ ReplicantSyncResult replicant_enroll_claim(const char *base_url,
                                            size_t user_id_cap);
 
 /**
- * Loads stored credentials from `data_dir`. Returns Success and fills the
- * out buffers (api_key, secret, canonical user id), or ErrorDatabase if none
- * are stored / unreadable. Each `*_cap` is the writable size of its buffer;
- * the call fails (without overflowing) when a value does not fit.
+ * Loads the credentials stored in `data_dir` into the buffers (each `*_cap` is its buffer's
+ * size; see the `REPLICANT_*_LEN` limits). `ErrorNotFound`: none are stored.
+ * `ErrorDatabase`: they cannot be read. `ErrorBufferTooSmall`: a buffer is too small. Out
+ * buffers are only valid on `Success`.
  *
  * # Safety
  * `data_dir` must be a valid, non-null C string; each out pointer must
@@ -809,7 +840,7 @@ ReplicantSyncResult replicant_load_credentials(const char *data_dir,
 /**
  * Stores credentials in `data_dir` (encrypted at rest) and tells this process's engines on
  * that data dir. `email` (may be null; `""` counts as none) signs joins; `user_id` must be a
- * real UUID.
+ * real UUID. A value longer than its `REPLICANT_*_LEN` limit is `ErrorInvalidInput`.
  *
  * # Safety
  * Valid C strings; `email` may be null.

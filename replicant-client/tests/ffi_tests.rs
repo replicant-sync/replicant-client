@@ -567,30 +567,230 @@ fn null_arguments_are_refused_without_crashing() {
     }
     let dir = tempfile::tempdir().unwrap();
     let handle = open(dir.path());
+    // A null callback is not an error: it removes that kind's callback.
     let context = ptr::null_mut();
     unsafe {
         assert_eq!(
             replicant_register_document_callback(handle, None, context, -1),
-            SyncResult::ErrorInvalidInput
+            SyncResult::Success
         );
         assert_eq!(
             replicant_register_sync_callback(handle, None, context),
-            SyncResult::ErrorInvalidInput
+            SyncResult::Success
         );
         assert_eq!(
             replicant_register_error_callback(handle, None, context),
-            SyncResult::ErrorInvalidInput
+            SyncResult::Success
         );
         assert_eq!(
             replicant_register_connection_callback(handle, None, context),
-            SyncResult::ErrorInvalidInput
+            SyncResult::Success
         );
         assert_eq!(
             replicant_register_conflict_callback(handle, None, context),
-            SyncResult::ErrorInvalidInput
+            SyncResult::Success
         );
     }
     close(handle);
+}
+
+#[test]
+fn registering_again_replaces_the_callback_and_null_removes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = open(dir.path());
+    let (first, second): (Log, Log) = (Mutex::new(Vec::new()), Mutex::new(Vec::new()));
+    let register = |log: Option<&Log>| unsafe {
+        replicant_register_document_callback(
+            handle,
+            log.map(|_| on_document as _),
+            log.map_or(ptr::null_mut(), context),
+            -1,
+        )
+    };
+    assert_eq!(register(Some(&first)), SyncResult::Success);
+    assert_eq!(register(Some(&second)), SyncResult::Success);
+    let id = create_doc(handle, r#"{"title":"once"}"#);
+    pump_until(handle, &second, "the write's event", |seen| {
+        seen.iter().any(|line| line.contains(&id))
+    });
+    assert!(first.lock().unwrap().is_empty());
+    assert_eq!(second.lock().unwrap().len(), 1);
+
+    assert_eq!(register(None), SyncResult::Success);
+    let removed = create_doc(handle, r#"{"title":"unheard"}"#);
+    wait_until("the write's event to be taken", || {
+        let mut processed = 0;
+        assert_eq!(
+            unsafe { replicant_process_events(handle, &mut processed) },
+            SyncResult::Success
+        );
+        processed > 0
+    });
+    assert!(!second
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|line| line.contains(&removed)));
+    close(handle);
+}
+
+fn credentials_out(
+    call: impl FnOnce(*mut c_char, *mut c_char, *mut c_char) -> SyncResult,
+) -> (SyncResult, [String; 3]) {
+    let mut key = [0 as c_char; REPLICANT_CREDENTIAL_MAX_LEN + 1];
+    let mut secret = [0 as c_char; REPLICANT_CREDENTIAL_MAX_LEN + 1];
+    let mut user_id = [0 as c_char; REPLICANT_USER_ID_LEN + 1];
+    let result = call(key.as_mut_ptr(), secret.as_mut_ptr(), user_id.as_mut_ptr());
+    (
+        result,
+        [
+            read(key.as_ptr()),
+            read(secret.as_ptr()),
+            read(user_id.as_ptr()),
+        ],
+    )
+}
+
+fn load_credentials(dir: &Path) -> (SyncResult, [String; 3]) {
+    credentials_out(|key, secret, user_id| unsafe {
+        replicant_load_credentials(
+            c(dir.to_str().unwrap()).as_ptr(),
+            key,
+            REPLICANT_CREDENTIAL_MAX_LEN + 1,
+            secret,
+            REPLICANT_CREDENTIAL_MAX_LEN + 1,
+            user_id,
+            REPLICANT_USER_ID_LEN + 1,
+        )
+    })
+}
+
+fn store_credentials(dir: &Path, email: &str, api_key: &str, user_id: &str) -> SyncResult {
+    unsafe {
+        replicant_store_credentials(
+            c(dir.to_str().unwrap()).as_ptr(),
+            c(email).as_ptr(),
+            c(api_key).as_ptr(),
+            c("rps_s").as_ptr(),
+            c(user_id).as_ptr(),
+        )
+    }
+}
+
+#[test]
+fn loading_credentials_tells_none_stored_from_unreadable() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(load_credentials(dir.path()).0, SyncResult::ErrorNotFound);
+    let user_id = Uuid::new_v4().to_string();
+    assert_eq!(
+        store_credentials(dir.path(), "a@b.c", "rpa_k", &user_id),
+        SyncResult::Success
+    );
+    assert_eq!(
+        load_credentials(dir.path()),
+        (
+            SyncResult::Success,
+            ["rpa_k".to_string(), "rps_s".to_string(), user_id]
+        )
+    );
+    std::fs::write(dir.path().join("credentials.enc"), "torn").unwrap();
+    assert_eq!(load_credentials(dir.path()).0, SyncResult::ErrorDatabase);
+}
+
+#[test]
+fn credentials_longer_than_their_limits_are_refused_and_a_short_buffer_has_its_own_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let user_id = Uuid::new_v4().to_string();
+    let too_long_key = "k".repeat(REPLICANT_CREDENTIAL_MAX_LEN + 1);
+    let too_long_email = "e".repeat(REPLICANT_EMAIL_MAX_LEN + 1);
+    assert_eq!(
+        store_credentials(dir.path(), "a@b.c", &too_long_key, &user_id),
+        SyncResult::ErrorInvalidInput
+    );
+    assert_eq!(
+        store_credentials(dir.path(), &too_long_email, "rpa_k", &user_id),
+        SyncResult::ErrorInvalidInput
+    );
+    let longest_key = "k".repeat(REPLICANT_CREDENTIAL_MAX_LEN);
+    assert_eq!(
+        store_credentials(dir.path(), "a@b.c", &longest_key, &user_id),
+        SyncResult::Success
+    );
+    assert_eq!(load_credentials(dir.path()).1[0], longest_key);
+    let mut small = [0 as c_char; 8];
+    let mut secret = [0 as c_char; REPLICANT_CREDENTIAL_MAX_LEN + 1];
+    let mut uid = [0 as c_char; REPLICANT_USER_ID_LEN + 1];
+    assert_eq!(
+        unsafe {
+            replicant_load_credentials(
+                c(dir.path().to_str().unwrap()).as_ptr(),
+                small.as_mut_ptr(),
+                small.len(),
+                secret.as_mut_ptr(),
+                secret.len(),
+                uid.as_mut_ptr(),
+                uid.len(),
+            )
+        },
+        SyncResult::ErrorBufferTooSmall
+    );
+}
+
+#[test]
+fn a_claim_into_a_short_buffer_still_stores_the_credentials() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let user_id = Uuid::new_v4();
+    let server = runtime.block_on(async {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/enroll/claim"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "api_key": "rpa_claimed", "secret": "rps_claimed", "user_id": user_id
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        server
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let mut small = [0 as c_char; 4];
+    let (result, _) = credentials_out(|_, secret, user_id_out| unsafe {
+        replicant_enroll_claim(
+            c(&server.uri()).as_ptr(),
+            c(dir.path().to_str().unwrap()).as_ptr(),
+            c("a@b.c").as_ptr(),
+            c("TOKEN").as_ptr(),
+            small.as_mut_ptr(),
+            small.len(),
+            secret,
+            REPLICANT_CREDENTIAL_MAX_LEN + 1,
+            user_id_out,
+            REPLICANT_USER_ID_LEN + 1,
+        )
+    });
+    assert_eq!(result, SyncResult::ErrorBufferTooSmall);
+    assert_eq!(
+        load_credentials(dir.path()),
+        (
+            SyncResult::Success,
+            [
+                "rpa_claimed".to_string(),
+                "rps_claimed".to_string(),
+                user_id.to_string()
+            ]
+        )
+    );
+    runtime.block_on(server.verify());
+}
+
+#[test]
+fn the_version_string_is_static() {
+    let first = replicant_get_version();
+    assert_eq!(first, replicant_get_version());
+    assert_eq!(read(first), env!("CARGO_PKG_VERSION"));
 }
 
 #[test]

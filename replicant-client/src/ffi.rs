@@ -53,6 +53,13 @@ pub extern "C" fn replicant_abi_version() -> u32 {
     (REPLICANT_ABI_VERSION_MAJOR << 16) | REPLICANT_ABI_VERSION_MINOR
 }
 
+/// Longest `api_key` or `secret`, in bytes; a buffer for either needs one more for the NUL.
+pub const REPLICANT_CREDENTIAL_MAX_LEN: usize = 128;
+/// Longest email, in bytes.
+pub const REPLICANT_EMAIL_MAX_LEN: usize = 254;
+/// A user id's length; its buffer needs one more for the NUL.
+pub const REPLICANT_USER_ID_LEN: usize = 36;
+
 /// Every entry point's body runs in here: a panic becomes `ErrorUnknown` instead of unwinding
 /// into C, which would abort the host (a DAW).
 fn guard(body: impl FnOnce() -> SyncResult) -> SyncResult {
@@ -94,6 +101,8 @@ pub enum SyncResult {
     ErrorNoCallbacks = -13,
     /// The kept copy's document was deleted: `replicant_restore_document` re-creates the copy.
     ErrorDocumentGone = -14,
+    /// An output buffer is smaller than the value plus its NUL; see the `REPLICANT_*_LEN` limits.
+    ErrorBufferTooSmall = -15,
     ErrorUnknown = -99,
 }
 
@@ -1066,7 +1075,9 @@ pub unsafe extern "C" fn replicant_list_parked(
 }
 
 /// `event_filter`: -1 every document event, 1 `DocumentChanged` only, 2 `DocumentDeleted` only.
-/// The first registration on a handle fixes the thread that must call `replicant_process_events`.
+/// One callback per kind: registering again replaces the previous callback, filter and context;
+/// a null callback removes it (its events are then dropped when pumped). The first registration
+/// on a handle, of any kind, fixes the thread that must call `replicant_process_events`.
 ///
 /// # Safety
 /// Valid handle; `context` must outlive the handle.
@@ -1078,9 +1089,9 @@ pub unsafe extern "C" fn replicant_register_document_callback(
     event_filter: i32,
 ) -> SyncResult {
     guard(|| {
-        let (false, Some(callback)) = (handle.is_null(), callback) else {
+        if handle.is_null() {
             return SyncResult::ErrorInvalidInput;
-        };
+        }
         let filter = match event_filter {
             -1 => None,
             1 => Some(EventType::DocumentChanged),
@@ -1094,7 +1105,8 @@ pub unsafe extern "C" fn replicant_register_document_callback(
     })
 }
 
-/// `SyncStarted`, `SyncCompleted`, `DatabaseChanged` and `IdentityAdopted`.
+/// `SyncStarted`, `SyncCompleted`, `DatabaseChanged` and `IdentityAdopted`. Replaces or removes
+/// as `replicant_register_document_callback` does.
 ///
 /// # Safety
 /// Valid handle; `context` must outlive the handle.
@@ -1105,14 +1117,16 @@ pub unsafe extern "C" fn replicant_register_sync_callback(
     context: *mut c_void,
 ) -> SyncResult {
     guard(|| {
-        let (false, Some(callback)) = (handle.is_null(), callback) else {
+        if handle.is_null() {
             return SyncResult::ErrorInvalidInput;
-        };
+        }
         (*handle).dispatcher.register_sync(callback, context);
         SyncResult::Success
     })
 }
 
+/// Replaces or removes as `replicant_register_document_callback` does.
+///
 /// # Safety
 /// Valid handle; `context` must outlive the handle.
 #[no_mangle]
@@ -1122,14 +1136,16 @@ pub unsafe extern "C" fn replicant_register_error_callback(
     context: *mut c_void,
 ) -> SyncResult {
     guard(|| {
-        let (false, Some(callback)) = (handle.is_null(), callback) else {
+        if handle.is_null() {
             return SyncResult::ErrorInvalidInput;
-        };
+        }
         (*handle).dispatcher.register_error(callback, context);
         SyncResult::Success
     })
 }
 
+/// Replaces or removes as `replicant_register_document_callback` does.
+///
 /// # Safety
 /// Valid handle; `context` must outlive the handle.
 #[no_mangle]
@@ -1139,14 +1155,16 @@ pub unsafe extern "C" fn replicant_register_connection_callback(
     context: *mut c_void,
 ) -> SyncResult {
     guard(|| {
-        let (false, Some(callback)) = (handle.is_null(), callback) else {
+        if handle.is_null() {
             return SyncResult::ErrorInvalidInput;
-        };
+        }
         (*handle).dispatcher.register_connection(callback, context);
         SyncResult::Success
     })
 }
 
+/// Replaces or removes as `replicant_register_document_callback` does.
+///
 /// # Safety
 /// Valid handle; `context` must outlive the handle.
 #[no_mangle]
@@ -1156,9 +1174,9 @@ pub unsafe extern "C" fn replicant_register_conflict_callback(
     context: *mut c_void,
 ) -> SyncResult {
     guard(|| {
-        let (false, Some(callback)) = (handle.is_null(), callback) else {
+        if handle.is_null() {
             return SyncResult::ErrorInvalidInput;
-        };
+        }
         (*handle).dispatcher.register_conflict(callback, context);
         SyncResult::Success
     })
@@ -1239,16 +1257,12 @@ pub unsafe extern "C" fn replicant_string_free(s: *mut c_char) {
 #[used]
 static VERSION_MARKER: &str = concat!("replicant-client-version=", env!("CARGO_PKG_VERSION"), "\0");
 
-/// This library's version; free the result with `replicant_string_free`.
+/// This library's version, e.g. "0.7.0". Static: never free it.
 #[no_mangle]
-pub extern "C" fn replicant_get_version() -> *mut c_char {
-    std::panic::catch_unwind(|| {
-        let version = VERSION_MARKER
-            .trim_start_matches("replicant-client-version=")
-            .trim_end_matches('\0');
-        CString::new(version).map_or(ptr::null_mut(), CString::into_raw)
-    })
-    .unwrap_or(ptr::null_mut())
+pub extern "C" fn replicant_get_version() -> *const c_char {
+    VERSION_MARKER["replicant-client-version=".len()..]
+        .as_ptr()
+        .cast()
 }
 
 // ===== Enrollment and stored credentials =====
@@ -1319,10 +1333,55 @@ pub unsafe extern "C" fn replicant_enroll_request(
     })
 }
 
-/// Exchanges an enrollment token for a per-user credential. On success writes
-/// the api_key, secret, and canonical user id (36-char UUID string) into the
-/// out buffers; each `*_cap` is the writable size of its buffer in bytes and
-/// the call fails (without overflowing) when a value does not fit.
+/// Writes the three values into their buffers; `ErrorBufferTooSmall` when any does not fit.
+unsafe fn write_credentials(
+    credentials: &crate::secret_store::Credentials,
+    out_api_key: *mut c_char,
+    api_key_cap: usize,
+    out_secret: *mut c_char,
+    secret_cap: usize,
+    out_user_id: *mut c_char,
+    user_id_cap: usize,
+) -> SyncResult {
+    if write_cstr_buf(out_api_key, api_key_cap, &credentials.api_key)
+        && write_cstr_buf(out_secret, secret_cap, &credentials.secret)
+        && write_cstr_buf(out_user_id, user_id_cap, &credentials.user_id.to_string())
+    {
+        SyncResult::Success
+    } else {
+        SyncResult::ErrorBufferTooSmall
+    }
+}
+
+/// Refuses over-long values (`ErrorInvalidInput`), stores, and tells this process's engines.
+fn store_credentials_in(
+    data_dir: &Path,
+    credentials: &crate::secret_store::Credentials,
+) -> SyncResult {
+    if credentials.api_key.len() > REPLICANT_CREDENTIAL_MAX_LEN
+        || credentials.secret.len() > REPLICANT_CREDENTIAL_MAX_LEN
+        || credentials
+            .email
+            .as_ref()
+            .is_some_and(|email| email.len() > REPLICANT_EMAIL_MAX_LEN)
+    {
+        return SyncResult::ErrorInvalidInput;
+    }
+    match crate::secret_store::store(data_dir, credentials) {
+        Ok(()) => {
+            host::credentials_changed(data_dir);
+            SyncResult::Success
+        }
+        Err(_) => SyncResult::ErrorDatabase,
+    }
+}
+
+/// Exchanges an enrollment token for credentials and stores them in `data_dir` with `email`,
+/// as `replicant_store_credentials` does, before writing the api key, secret and user id into
+/// the buffers (each `*_cap` is its buffer's size). A buffer too small for its value is
+/// `ErrorBufferTooSmall`, and the credentials are stored all the same: the token is spent.
+/// `ErrorInvalidInput`: the token was refused. `ErrorSerialization`: the server's reply was bad.
+/// `ErrorConnection`: the server could not be reached. Out buffers are only valid on `Success`.
 ///
 /// Blocks the calling thread for the HTTP round trip (up to about 10 s to connect and 30 s for
 /// the request); never call it from an audio or UI thread.
@@ -1333,6 +1392,7 @@ pub unsafe extern "C" fn replicant_enroll_request(
 #[no_mangle]
 pub unsafe extern "C" fn replicant_enroll_claim(
     base_url: *const c_char,
+    data_dir: *const c_char,
     email: *const c_char,
     token: *const c_char,
     out_api_key: *mut c_char,
@@ -1343,38 +1403,28 @@ pub unsafe extern "C" fn replicant_enroll_claim(
     user_id_cap: usize,
 ) -> SyncResult {
     guard(|| {
-        if base_url.is_null()
-            || email.is_null()
-            || token.is_null()
-            || out_api_key.is_null()
-            || out_secret.is_null()
-            || out_user_id.is_null()
-        {
+        let (Some(base_url), Some(data_dir), Some(email), Some(token), false, false, false) = (
+            str_arg(base_url),
+            str_arg(data_dir),
+            str_arg(email),
+            str_arg(token),
+            out_api_key.is_null(),
+            out_secret.is_null(),
+            out_user_id.is_null(),
+        ) else {
+            return SyncResult::ErrorInvalidInput;
+        };
+        if email.is_empty() || email.len() > REPLICANT_EMAIL_MAX_LEN {
             return SyncResult::ErrorInvalidInput;
         }
-
-        let base_url = match CStr::from_ptr(base_url).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return SyncResult::ErrorInvalidInput,
-        };
-        let email = match CStr::from_ptr(email).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return SyncResult::ErrorInvalidInput,
-        };
-        let token = match CStr::from_ptr(token).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return SyncResult::ErrorInvalidInput,
-        };
-
+        let (base_url, request_email, token) =
+            (base_url.to_string(), email.to_string(), token.to_string());
         let join_result = std::thread::spawn(move || {
             let runtime = Runtime::new().map_err(|_| SyncResult::ErrorUnknown)?;
             runtime
-                .block_on(crate::enrollment::claim(&base_url, &email, &token))
-                .map_err(|e| match e {
+                .block_on(crate::enrollment::claim(&base_url, &request_email, &token))
+                .map_err(|error| match error {
                     crate::enrollment::EnrollError::InvalidToken => SyncResult::ErrorInvalidInput,
-                    // A malformed/incomplete 200 is a bad response, not a transport
-                    // failure — keep it distinct from network errors so callers can
-                    // tell "your code is wrong" from "the server misbehaved".
                     crate::enrollment::EnrollError::InvalidResponse => {
                         SyncResult::ErrorSerialization
                     }
@@ -1382,28 +1432,31 @@ pub unsafe extern "C" fn replicant_enroll_claim(
                 })
         })
         .join();
-
-        match join_result {
-            Ok(Ok(creds)) => {
-                if write_cstr_buf(out_api_key, api_key_cap, &creds.api_key)
-                    && write_cstr_buf(out_secret, secret_cap, &creds.secret)
-                    && write_cstr_buf(out_user_id, user_id_cap, &creds.user_id.to_string())
-                {
-                    SyncResult::Success
-                } else {
-                    SyncResult::ErrorInvalidInput
-                }
-            }
-            Ok(Err(err)) => err,
-            Err(_) => SyncResult::ErrorUnknown,
+        let mut credentials = match join_result {
+            Ok(Ok(credentials)) => credentials,
+            Ok(Err(result)) => return result,
+            Err(_) => return SyncResult::ErrorUnknown,
+        };
+        credentials.email = Some(email.to_string());
+        match store_credentials_in(Path::new(data_dir), &credentials) {
+            SyncResult::Success => write_credentials(
+                &credentials,
+                out_api_key,
+                api_key_cap,
+                out_secret,
+                secret_cap,
+                out_user_id,
+                user_id_cap,
+            ),
+            failed => failed,
         }
     })
 }
 
-/// Loads stored credentials from `data_dir`. Returns Success and fills the
-/// out buffers (api_key, secret, canonical user id), or ErrorDatabase if none
-/// are stored / unreadable. Each `*_cap` is the writable size of its buffer;
-/// the call fails (without overflowing) when a value does not fit.
+/// Loads the credentials stored in `data_dir` into the buffers (each `*_cap` is its buffer's
+/// size; see the `REPLICANT_*_LEN` limits). `ErrorNotFound`: none are stored.
+/// `ErrorDatabase`: they cannot be read. `ErrorBufferTooSmall`: a buffer is too small. Out
+/// buffers are only valid on `Success`.
 ///
 /// # Safety
 /// `data_dir` must be a valid, non-null C string; each out pointer must
@@ -1419,38 +1472,33 @@ pub unsafe extern "C" fn replicant_load_credentials(
     user_id_cap: usize,
 ) -> SyncResult {
     guard(|| {
-        if data_dir.is_null()
-            || out_api_key.is_null()
-            || out_secret.is_null()
-            || out_user_id.is_null()
-        {
+        let (Some(data_dir), false, false, false) = (
+            str_arg(data_dir),
+            out_api_key.is_null(),
+            out_secret.is_null(),
+            out_user_id.is_null(),
+        ) else {
             return SyncResult::ErrorInvalidInput;
-        }
-
-        let data_dir = match CStr::from_ptr(data_dir).to_str() {
-            Ok(s) => s,
-            Err(_) => return SyncResult::ErrorInvalidInput,
         };
-
-        match crate::secret_store::load(std::path::Path::new(data_dir)) {
-            Ok(Some(creds)) => {
-                if write_cstr_buf(out_api_key, api_key_cap, &creds.api_key)
-                    && write_cstr_buf(out_secret, secret_cap, &creds.secret)
-                    && write_cstr_buf(out_user_id, user_id_cap, &creds.user_id.to_string())
-                {
-                    SyncResult::Success
-                } else {
-                    SyncResult::ErrorInvalidInput
-                }
-            }
-            Ok(None) | Err(_) => SyncResult::ErrorDatabase,
+        match crate::secret_store::load(Path::new(data_dir)) {
+            Ok(Some(credentials)) => write_credentials(
+                &credentials,
+                out_api_key,
+                api_key_cap,
+                out_secret,
+                secret_cap,
+                out_user_id,
+                user_id_cap,
+            ),
+            Ok(None) => SyncResult::ErrorNotFound,
+            Err(_) => SyncResult::ErrorDatabase,
         }
     })
 }
 
 /// Stores credentials in `data_dir` (encrypted at rest) and tells this process's engines on
 /// that data dir. `email` (may be null; `""` counts as none) signs joins; `user_id` must be a
-/// real UUID.
+/// real UUID. A value longer than its `REPLICANT_*_LEN` limit is `ErrorInvalidInput`.
 ///
 /// # Safety
 /// Valid C strings; `email` may be null.
@@ -1481,13 +1529,7 @@ pub unsafe extern "C" fn replicant_store_credentials(
             user_id,
             email: email.filter(|email| !email.is_empty()).map(str::to_string),
         };
-        match crate::secret_store::store(Path::new(data_dir), &credentials) {
-            Ok(()) => {
-                host::credentials_changed(Path::new(data_dir));
-                SyncResult::Success
-            }
-            Err(_) => SyncResult::ErrorDatabase,
-        }
+        store_credentials_in(Path::new(data_dir), &credentials)
     })
 }
 
@@ -1570,6 +1612,7 @@ mod tests {
         let result = unsafe {
             replicant_enroll_claim(
                 url.as_ptr(),
+                url.as_ptr(),
                 email.as_ptr(),
                 token.as_ptr(),
                 key.as_mut_ptr() as *mut c_char,
@@ -1647,12 +1690,12 @@ mod tests {
             VERSION_MARKER,
             concat!("replicant-client-version=", env!("CARGO_PKG_VERSION"), "\0")
         );
-        let version = replicant_get_version();
         assert_eq!(
-            unsafe { CStr::from_ptr(version) }.to_str().unwrap(),
+            unsafe { CStr::from_ptr(replicant_get_version()) }
+                .to_str()
+                .unwrap(),
             env!("CARGO_PKG_VERSION")
         );
-        unsafe { replicant_string_free(version) };
     }
 
     #[test]
