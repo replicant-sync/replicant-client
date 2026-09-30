@@ -397,7 +397,12 @@ pub(crate) async fn back_up_v1_database(pool: &SqlitePool, db_path: &Path) -> St
     }
     // Holding the write lock serialises backups across processes, so a temporary file found
     // here was left by a crash.
-    let lock = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let mut lock = pool.begin_with("BEGIN IMMEDIATE").await?;
+    // Another process may have migrated the file while this one waited for the lock.
+    if !holds_v1_data(&mut *lock).await? {
+        lock.rollback().await?;
+        return Ok(());
+    }
     let backup = sibling(db_path, ".v1-backup");
     let partial = sibling(db_path, ".v1-backup.tmp");
     let written = if backup.exists() {
@@ -1203,14 +1208,18 @@ mod tests {
         let subscriber = tracing_subscriber::fmt()
             .with_writer(log.clone())
             .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
+            .with_max_level(tracing::Level::WARN)
             .finish();
         let guard = tracing::subscriber::set_default(subscriber);
         let store = migrated(pool, &path).await;
         drop(guard);
         store.close().await;
         let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
-        assert!(logged.contains("rows=2"), "{logged}");
+        assert!(
+            logged.contains("v1 queue rows dropped: their documents are missing or were set aside")
+                && logged.contains("rows=2"),
+            "{logged}"
+        );
     }
 
     fn partial_backup_of(path: &Path) -> PathBuf {
@@ -1325,6 +1334,45 @@ mod tests {
             backed_up_content(&path, doc(1)).await,
             json!({"n": 1}).to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn a_backup_that_waited_for_the_lock_does_not_copy_a_migrated_file() {
+        use sqlx::sqlite::SqlitePoolOptions;
+        use sqlx::ConnectOptions;
+
+        let (_dir, path, pool) = v012_db().await;
+        v1_user(&pool, ME, true).await;
+        pool.close().await;
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .busy_timeout(std::time::Duration::from_secs(10));
+        let mut other = options.connect().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut other)
+            .await
+            .unwrap();
+        let opener = SqlitePoolOptions::new()
+            .max_connections(2)
+            .connect_with(options)
+            .await
+            .unwrap();
+        let backup_path = path.clone();
+        let backup = tokio::spawn(async move {
+            let result = back_up_v1_database(&opener, &backup_path).await;
+            opener.close().await;
+            result
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        // Another process migrates the file while the backup waits for the lock.
+        sqlx::query("DROP TABLE sync_queue")
+            .execute(&mut other)
+            .await
+            .unwrap();
+        sqlx::query("COMMIT").execute(&mut other).await.unwrap();
+        backup.await.unwrap().unwrap();
+        assert!(!backup_of(&path).exists());
+        assert!(!partial_backup_of(&path).exists());
     }
 
     #[tokio::test]
