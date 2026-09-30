@@ -1,7 +1,8 @@
 //! End-to-end smoke test of the v2 transport against a real replicant-server v2.
 //!
-//! Ignored by default. `test/run_phoenix_interop_local.sh` boots a server, seeds an account
-//! and exports the variables read below.
+//! Ignored by default. Needs a running v2 server and an enrolled account: set
+//! `SYNC_SERVER_URL`, `REPLICANT_API_KEY`, `REPLICANT_API_SECRET` and `REPLICANT_TEST_USER_ID`,
+//! then run `cargo test -p replicant-client --test v2_smoke -- --ignored`.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -62,7 +63,7 @@ async fn opened(url: String, auth: JoinAuth) -> Connection {
 }
 
 #[tokio::test]
-#[ignore = "needs a v2 server: run through test/run_phoenix_interop_local.sh"]
+#[ignore = "needs a v2 server: see the file header"]
 async fn joins_requests_heartbeats_and_closes() {
     let mut connection = opened(server_socket_url(), seeded_auth()).await;
 
@@ -110,7 +111,7 @@ async fn joins_requests_heartbeats_and_closes() {
 }
 
 #[tokio::test]
-#[ignore = "needs a v2 server: run through test/run_phoenix_interop_local.sh"]
+#[ignore = "needs a v2 server: see the file header"]
 async fn unsupported_protocol_version_is_refused_with_update_required() {
     let url = server_socket_url().replace("protocol_version=2", "protocol_version=1");
     let mut connection = Connection::new(url, Some(seeded_auth()), "replicant-client/smoke".into());
@@ -124,7 +125,7 @@ async fn unsupported_protocol_version_is_refused_with_update_required() {
 }
 
 #[tokio::test]
-#[ignore = "needs a v2 server: run through test/run_phoenix_interop_local.sh"]
+#[ignore = "needs a v2 server: see the file header"]
 async fn wrong_secret_is_a_fatal_auth_invalid_join_error() {
     let wrong_secret = JoinAuth {
         api_secret: "rps_wrong".into(),

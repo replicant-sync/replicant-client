@@ -3,11 +3,11 @@
 
 use std::collections::BTreeSet;
 
+use replicant_client::engine::hash::content_hash;
 use replicant_client::engine::machine::{Request, Response};
 use replicant_client::engine::types::{ChangeKind, DocEnvelope, ServerError, Upload, UploadKind};
 use replicant_client::transport::codec::{Codec, Incoming};
 use replicant_client::transport::wire::{socket_url, JoinAuth, ReplyEnvelope};
-use replicant_core::patches::calculate_checksum;
 use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
@@ -486,9 +486,9 @@ fn float_content_decodes_to_canonical_numbers_under_the_server_hash() {
         "the server hash survives the jsonb round trip"
     );
     assert_eq!(
-        calculate_checksum(&json!({"cents": 1200.0, "title": "t"})),
+        content_hash(&json!({"cents": 1200.0, "title": "t"})),
         upload_doc.hash,
         "the server hashed the float as written"
     );
-    assert_ne!(calculate_checksum(&upload_doc.content), upload_doc.hash);
+    assert_ne!(content_hash(&upload_doc.content), upload_doc.hash);
 }

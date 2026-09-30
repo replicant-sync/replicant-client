@@ -1,8 +1,9 @@
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 /// Canonical content hash shared with the server: compact key-sorted JSON, SHA-256, lowercase hex.
 pub fn content_hash(content: &Value) -> String {
-    replicant_core::patches::calculate_checksum(content)
+    format!("{:x}", Sha256::digest(content.to_string().as_bytes()))
 }
 
 /// Makes every integral float an integer (`1200.0` → `1200`, `-0.0` → `0`). The server's
