@@ -576,6 +576,7 @@ impl Core {
             skew_retried: false,
         };
         self.socket_gen += 1;
+        fx.push(Effect::Cancel(TimerId::HaltRetry));
         fx.push(Effect::Emit(Lifecycle::ConnectionAttempted));
         fx.push(Effect::OpenSocket {
             gen: self.socket_gen,
@@ -777,7 +778,9 @@ impl Core {
                 self.close_socket(fx);
                 self.fail_connect(None, fx);
             }
-            (Conn::Halted(_), TimerId::HaltRetry) => fx.push(Effect::CheckCredentials),
+            (Conn::Halted(reason), TimerId::HaltRetry) if is_credential_halt(reason) => {
+                fx.push(Effect::CheckCredentials)
+            }
             (Conn::Connected(_), TimerId::StableReset) => self.attempt = 0,
             (Conn::Connected(s), TimerId::Heartbeat) => {
                 let req = self.next_req;
@@ -4613,6 +4616,43 @@ mod server_copy_tests {
         assert!(
             builds(&fx, doc(1)),
             "the pushed seq commits applied[own] to 6, releasing the doc without waiting for the round to finish"
+        );
+    }
+
+    #[test]
+    fn a_credential_recheck_left_over_from_an_earlier_halt_never_dials_after_update_required() {
+        let mut c = core();
+        c.step(Input::Start {
+            has_credentials: true,
+        });
+        let (req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        c.step(Input::Reply {
+            req,
+            result: Err(ServerError {
+                is_fatal: true,
+                ..ServerError::new("auth_invalid")
+            }),
+        });
+        // Signed in again in this process: the dial drops the pending recheck.
+        let fx = c.step(Input::CredentialsChanged {
+            has_credentials: true,
+        });
+        assert!(opens(&fx));
+        assert!(fx.contains(&Effect::Cancel(TimerId::HaltRetry)));
+        let (req, _) = sends(&c.step(opened(&c))).pop().unwrap();
+        c.step(Input::Reply {
+            req,
+            result: Err(ServerError {
+                is_fatal: true,
+                ..ServerError::new("update_required")
+            }),
+        });
+        let fx = c.step(Input::Timer(TimerId::HaltRetry));
+        assert!(!fx.contains(&Effect::CheckCredentials));
+        assert!(!opens(&fx));
+        assert_eq!(
+            c.state().connection,
+            ConnectionView::Halted(HaltReason::UpdateRequired)
         );
     }
 }
