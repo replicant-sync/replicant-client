@@ -15,7 +15,7 @@ use crate::engine::hash::{canonicalise_numbers, content_hash};
 use crate::engine::types::{SCOPE_CURATED, SCOPE_OWN};
 
 #[derive(Default)]
-struct Counts {
+pub(crate) struct Counts {
     synced: usize,
     hard_deleted: usize,
     pending: usize,
@@ -33,11 +33,11 @@ struct QueueRow {
     created_at: Option<i64>,
 }
 
-pub(crate) async fn migrate_v1_data(pool: &SqlitePool) -> StoreResult<()> {
+pub(crate) async fn migrate_v1_data(pool: &SqlitePool) -> StoreResult<Counts> {
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     if !holds_v1_data(&mut *tx).await? {
         tx.commit().await?;
-        return Ok(());
+        return Ok(Counts::default());
     }
     let counts = migrate(&mut tx).await.map_err(migration_failed)?;
     tx.commit()
@@ -72,7 +72,7 @@ pub(crate) async fn migrate_v1_data(pool: &SqlitePool) -> StoreResult<()> {
             "v1 edits with no known base: each is kept aside if the server's copy differs"
         );
     }
-    Ok(())
+    Ok(counts)
 }
 
 async fn migrate(conn: &mut SqliteConnection) -> StoreResult<Counts> {
@@ -1165,48 +1165,14 @@ mod tests {
         raw.close().await;
     }
 
-    #[derive(Clone, Default)]
-    struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for LogBuffer {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
-        type Writer = LogBuffer;
-        fn make_writer(&'a self) -> LogBuffer {
-            self.clone()
-        }
-    }
-
-    /// Migrates with a WARN-level subscriber and returns what it logged.
-    async fn migrated_with_warnings(pool: SqlitePool, path: &Path) -> (Store, String) {
-        let log = LogBuffer::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(log.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        let store = migrated(pool, path).await;
-        drop(guard);
-        let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
-        (store, logged)
-    }
-
-    fn assert_dropped(logged: &str, rows: usize) {
-        assert!(
-            logged.lines().any(|line| line.contains(
-                "v1 queue rows dropped: their documents are missing, set aside, or kept aside"
-            ) && line.contains(&format!("rows={rows}"))),
-            "{logged}"
-        );
+    /// Runs the v1 migration on `pool`'s file and returns what it counted.
+    async fn migrated_with_counts(pool: SqlitePool, path: &Path) -> (Store, super::Counts) {
+        pool.close().await;
+        let raw = raw_pool(path).await;
+        sqlx::migrate!("./migrations").run(&raw).await.unwrap();
+        let counts = super::migrate_v1_data(&raw).await.unwrap();
+        raw.close().await;
+        (Store::open(path).await.unwrap(), counts)
     }
 
     #[tokio::test]
@@ -1229,9 +1195,9 @@ mod tests {
             .await
             .unwrap();
         v1_queue_row(&pool, &id(3), "update", None).await;
-        let (store, logged) = migrated_with_warnings(pool, &path).await;
+        let (store, counts) = migrated_with_counts(pool, &path).await;
         store.close().await;
-        assert_dropped(&logged, 2);
+        assert_eq!(counts.dropped_queue_rows, 2);
     }
 
     fn partial_backup_of(path: &Path) -> PathBuf {
@@ -1600,10 +1566,10 @@ mod tests {
         v1_doc(&pool, &id(1), Some(ME), json!({"n": 2}), "conflict", None).await;
         v1_queue_row(&pool, &id(1), "update", Some(json!({"n": 1}))).await;
         v1_queue_row(&pool, &id(1), "update", None).await;
-        let (store, logged) = migrated_with_warnings(pool, &path).await;
+        let (store, counts) = migrated_with_counts(pool, &path).await;
         assert!(outbox(&store, doc(1)).await.is_empty());
         assert_eq!(kept_copies(&store).await, kept(1, json!({"n": 2})));
-        assert_dropped(&logged, 2);
+        assert_eq!(counts.dropped_queue_rows, 2);
         store.close().await;
     }
 
@@ -1621,11 +1587,11 @@ mod tests {
         )
         .await;
         v1_queue_row(&pool, &id(1), "create", None).await;
-        let (store, logged) = migrated_with_warnings(pool, &path).await;
+        let (store, counts) = migrated_with_counts(pool, &path).await;
         let snap = snapshot(&store, doc(1)).await;
         assert!(snap.read_only && snap.rows.is_empty());
         assert_eq!(kept_copies(&store).await, kept(1, json!({"n": 3})));
-        assert_dropped(&logged, 1);
+        assert_eq!(counts.dropped_queue_rows, 1);
         store.close().await;
     }
 
@@ -1635,12 +1601,12 @@ mod tests {
         v1_user(&pool, ME, true).await;
         v1_doc(&pool, &id(1), Some(ME), json!({"n": 4}), "synced", None).await;
         v1_queue_row(&pool, &id(1), "update", None).await;
-        let (store, logged) = migrated_with_warnings(pool, &path).await;
+        let (store, counts) = migrated_with_counts(pool, &path).await;
         let snap = snapshot(&store, doc(1)).await;
         assert!(snap.rows.is_empty());
         assert_eq!(snap.shadow.map(|s| s.content), Some(json!({"n": 4})));
         assert_eq!(kept_copies(&store).await, kept(1, json!({"n": 4})));
-        assert_dropped(&logged, 1);
+        assert_eq!(counts.dropped_queue_rows, 1);
         store.close().await;
     }
 
@@ -1658,10 +1624,10 @@ mod tests {
         )
         .await;
         v1_queue_row(&pool, &id(1), "delete", None).await;
-        let (store, logged) = migrated_with_warnings(pool, &path).await;
+        let (store, counts) = migrated_with_counts(pool, &path).await;
         assert!(!snapshot(&store, doc(1)).await.exists);
         assert!(kept_copies(&store).await.is_empty());
-        assert_dropped(&logged, 1);
+        assert_eq!(counts.dropped_queue_rows, 1);
         store.close().await;
     }
 
@@ -1679,10 +1645,10 @@ mod tests {
         )
         .await;
         v1_queue_row(&pool, &id(1), "update", Some(json!({"n": 1}))).await;
-        let (store, logged) = migrated_with_warnings(pool, &path).await;
+        let (store, counts) = migrated_with_counts(pool, &path).await;
         assert!(!snapshot(&store, doc(1)).await.exists);
         assert_eq!(kept_copies(&store).await, kept(1, json!({"n": 2})));
-        assert_dropped(&logged, 1);
+        assert_eq!(counts.dropped_queue_rows, 1);
         store.close().await;
     }
 }
