@@ -114,6 +114,9 @@ enum ReplicantConnection
   : int32_t
 #endif // __cplusplus
  {
+  /**
+   * Never reported: `replicant_create` returns after the engine left it.
+   */
   ReplicantConnection_Idle = 0,
   ReplicantConnection_Disconnected = 1,
   ReplicantConnection_Connecting = 2,
@@ -490,8 +493,13 @@ uint32_t replicant_abi_version(void);
 /**
  * Attaches to the engine for `config`'s data dir, starting it if this process has none yet.
  * Opens (and after an upgrade migrates) the database on this thread; never waits on the
- * network. On success `*out_handle` is set; otherwise it is null. Call `replicant_get_state`
- * next: a handle attached to an engine that is already halted is not sent the halt again.
+ * network. On success `*out_handle` is set; otherwise it is null.
+ *
+ * The stored credentials are read before this returns, so `replicant_get_state` is already
+ * true: `Halted`/`NotEnrolled` without credentials, else dialling (or, for a later handle, the
+ * shared engine's current state). An engine that starts without credentials also sends one
+ * fatal `not_enrolled` error, to the handle that started it; a later handle on that engine is
+ * not sent it again and reads `replicant_get_state` instead.
  *
  * # Safety
  * `config` and `out_handle` must be valid; the config's strings valid C strings (`email` may be null).
@@ -619,7 +627,8 @@ bool replicant_is_connected(struct Replicant *handle);
 
 /**
  * Connection, sync phase and halt reason, for a status indicator. Set
- * `out_state->struct_size = sizeof(ReplicantState)` first.
+ * `out_state->struct_size = sizeof(ReplicantState)` first. True from the moment
+ * `replicant_create` returns: with no stored credentials it is already `Halted`/`NotEnrolled`.
  *
  * # Safety
  * Valid handle and out pointer.

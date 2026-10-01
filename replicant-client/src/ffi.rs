@@ -205,6 +205,7 @@ unsafe fn list_merge_arg(config: &ReplicantConfig) -> Option<ListMergeConfig> {
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicantConnection {
+    /// Never reported: `replicant_create` returns after the engine left it.
     Idle = 0,
     Disconnected = 1,
     Connecting = 2,
@@ -381,8 +382,13 @@ unsafe fn write_json(out: *mut *mut c_char, value: &impl Serialize) -> SyncResul
 
 /// Attaches to the engine for `config`'s data dir, starting it if this process has none yet.
 /// Opens (and after an upgrade migrates) the database on this thread; never waits on the
-/// network. On success `*out_handle` is set; otherwise it is null. Call `replicant_get_state`
-/// next: a handle attached to an engine that is already halted is not sent the halt again.
+/// network. On success `*out_handle` is set; otherwise it is null.
+///
+/// The stored credentials are read before this returns, so `replicant_get_state` is already
+/// true: `Halted`/`NotEnrolled` without credentials, else dialling (or, for a later handle, the
+/// shared engine's current state). An engine that starts without credentials also sends one
+/// fatal `not_enrolled` error, to the handle that started it; a later handle on that engine is
+/// not sent it again and reads `replicant_get_state` instead.
 ///
 /// # Safety
 /// `config` and `out_handle` must be valid; the config's strings valid C strings (`email` may be null).
@@ -800,7 +806,8 @@ pub unsafe extern "C" fn replicant_is_connected(handle: *mut Replicant) -> bool 
 }
 
 /// Connection, sync phase and halt reason, for a status indicator. Set
-/// `out_state->struct_size = sizeof(ReplicantState)` first.
+/// `out_state->struct_size = sizeof(ReplicantState)` first. True from the moment
+/// `replicant_create` returns: with no stored credentials it is already `Halted`/`NotEnrolled`.
 ///
 /// # Safety
 /// Valid handle and out pointer.

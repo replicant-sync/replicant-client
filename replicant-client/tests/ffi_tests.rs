@@ -415,6 +415,61 @@ fn a_handle_without_credentials_reports_halted_not_enrolled() {
 }
 
 #[test]
+fn create_returns_with_the_state_the_stored_credentials_give() {
+    let signed_out = tempfile::tempdir().unwrap();
+    let first = open(signed_out.path());
+    assert!(halted_not_enrolled(first));
+    let second = open(signed_out.path());
+    assert!(
+        halted_not_enrolled(second),
+        "a second handle shares the halt"
+    );
+    let seen: Log = Mutex::new(Vec::new());
+    assert_eq!(
+        unsafe { replicant_register_error_callback(first, Some(on_error), context(&seen)) },
+        SyncResult::Success
+    );
+    pump_until(first, &seen, "the not_enrolled error", |lines| {
+        !lines.is_empty()
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        unsafe { replicant_process_events(first, ptr::null_mut()) },
+        SyncResult::Success
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["SyncError 1003 not_enrolled null null true -1".to_string()],
+        "the start halt is reported once"
+    );
+    close(first);
+    close(second);
+
+    let signed_in = tempfile::tempdir().unwrap();
+    secret_store::store(
+        signed_in.path(),
+        &secret_store::Credentials {
+            api_key: "k1".into(),
+            secret: "rps_test".into(),
+            user_id: Uuid::new_v4(),
+            email: Some("a@b.c".into()),
+        },
+    )
+    .unwrap();
+    let handle = open(signed_in.path());
+    let dialling = state(handle);
+    assert!(
+        matches!(
+            dialling.connection,
+            ReplicantConnection::Connecting | ReplicantConnection::Disconnected
+        ),
+        "{dialling:?}"
+    );
+    assert_eq!(dialling.halt_reason, ReplicantHaltReason::None);
+    close(handle);
+}
+
+#[test]
 fn credentials_stored_by_0_6_need_the_config_email_to_sign_in() {
     let store_0_6 = |dir: &Path| {
         secret_store::store(

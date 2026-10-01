@@ -111,13 +111,15 @@ struct Controls {
 
 impl Engine {
     /// Opens the store at `db_path` (creating its `user_config` row if needed) and starts the
-    /// owner. Returns without waiting for the network.
+    /// owner. Returns without waiting for the network, once the stored credentials were read:
+    /// `state` is then `Halted(NotEnrolled)` with none, else `Connecting`.
     pub async fn start(
         db_path: &Path,
         config: EngineConfig,
         events: mpsc::UnboundedSender<EngineEvent>,
     ) -> Result<Engine, EngineError> {
-        let (owner, controls) = Owner::open(db_path, config, events).await?;
+        let (mut owner, controls) = Owner::open(db_path, config, events).await?;
+        owner.start().await;
         let task = tokio::spawn(owner.run());
         Ok(Engine { controls, task })
     }
@@ -286,8 +288,8 @@ impl Owner {
         Ok((owner, controls))
     }
 
+    /// Call `start` first.
     async fn run(mut self) {
-        self.start().await;
         while self.turn().await {}
         self.shutdown().await;
     }
