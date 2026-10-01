@@ -13,6 +13,7 @@ use crate::driver::test_server::{Mode, ScriptedServer};
 use crate::driver::test_support::{
     config, credentials, eventually, jump, seeded_db, SwitchableCredentials, WAIT,
 };
+use crate::engine::list_merge::{ListMergePolicy, PathPattern};
 use crate::engine::machine::{
     ConnectionView, HaltReason, Input, Lifecycle, SettleOutcome, TimerId,
 };
@@ -330,7 +331,10 @@ async fn stale_settle_after_reconnect_is_dropped() {
         .unwrap();
     let settled = Input::Settled {
         doc_id,
-        outcome: SettleOutcome::Done { rows_remain: true },
+        outcome: SettleOutcome::Done {
+            rows_remain: true,
+            diverged: false,
+        },
     };
     h.owner.queue.push_back(Queued {
         epoch: Some(stale_gen),
@@ -631,4 +635,21 @@ async fn failed_mark_sent_backs_the_doc_off_at_once() {
         server.doc(doc_id).is_some()
     })
     .await;
+}
+
+#[tokio::test]
+async fn start_refuses_a_full_list_merge_policy() {
+    let (_dir, path) = seeded_db(ME, true).await;
+    let mut refused = config("ws://127.0.0.1:9", credentials("k1"));
+    refused
+        .list_merge
+        .rules
+        .push((PathPattern("/pitches".into()), ListMergePolicy::Full));
+    let (events_tx, _events) = mpsc::unbounded_channel();
+    match Engine::start(&path, refused, events_tx).await {
+        Err(EngineError::Config(message)) => {
+            assert_eq!(message, "Full list merge is not supported yet")
+        }
+        other => panic!("expected a config error, got {:?}", other.map(|_| ())),
+    }
 }

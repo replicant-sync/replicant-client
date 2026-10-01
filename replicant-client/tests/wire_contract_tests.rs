@@ -423,12 +423,18 @@ fn upload_requests_match_the_recorded_frames_per_kind() {
         encode(&mut codec, 2, &update),
         frames["upload_update_request"]
     );
+    let recorded_delete = &frames["upload_delete_request"][4];
+    assert!(
+        recorded_delete["base_hash"].is_string(),
+        "a delete names the version it was made on"
+    );
+    let delete = upload(
+        UploadKind::Delete,
+        recorded_delete["base_hash"].as_str().map(String::from),
+        Value::Null,
+    );
     assert_eq!(
-        encode(
-            &mut codec,
-            2,
-            &upload(UploadKind::Delete, None, Value::Null)
-        ),
+        encode(&mut codec, 2, &delete),
         frames["upload_delete_request"]
     );
 }

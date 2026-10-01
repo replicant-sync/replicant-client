@@ -17,6 +17,7 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::timers::Timers;
+use crate::engine::list_merge::ListMergeConfig;
 use crate::engine::machine::{
     BuildOutcome, ConnectionView, Core, Effect, EngineState, HaltReason, Input, Lifecycle, Request,
     Response, SettleOutcome, TimerId,
@@ -56,6 +57,8 @@ pub struct EngineConfig {
     pub host_version: String,
     pub credentials: CredentialLoader,
     pub jitter_seed: u64,
+    /// How lists that both this device and another changed are merged. Local to this device.
+    pub list_merge: ListMergeConfig,
 }
 
 /// Idempotent, so a full command queue loses nothing.
@@ -178,6 +181,8 @@ struct Owner {
     join_fingerprint: Option<[u8; 32]>,
     /// Fingerprint of credentials the server rejected with `auth_invalid`.
     rejected: Option<[u8; 32]>,
+    /// Seconds added to this machine's clock when signing a join; learnt from `clock_skew`.
+    clock_offset: i64,
     socket_gen: u64,
     queue: VecDeque<Queued>,
     events: mpsc::UnboundedSender<EngineEvent>,
@@ -197,7 +202,10 @@ impl Owner {
         events: mpsc::UnboundedSender<EngineEvent>,
     ) -> Result<(Owner, Controls), EngineError> {
         let url = socket_url(&config.server_url, config.client_id).map_err(EngineError::Config)?;
-        let store = Arc::new(retry_migrate_once(|| Store::open(db_path)).await?);
+        config.list_merge.validate().map_err(EngineError::Config)?;
+        let mut store = retry_migrate_once(|| Store::open(db_path)).await?;
+        store.list_merge = config.list_merge;
+        let store = Arc::new(store);
         let me = store.user_id().await?;
         let scopes = store.subscribed_scopes().await?;
         let reader = ChangeLogReader::open(&store, now_unix()).await?;
@@ -226,6 +234,7 @@ impl Owner {
             auth_fingerprint,
             join_fingerprint: None,
             rejected: None,
+            clock_offset: 0,
             socket_gen: 0,
             queue: VecDeque::new(),
             events,
@@ -319,11 +328,32 @@ impl Owner {
         }
     }
 
+    /// A `clock_skew` join reply carries the server's clock; every later join is signed with it.
+    fn learn_clock_offset(&mut self, input: &Input) {
+        if let Input::Reply {
+            result:
+                Err(ServerError {
+                    code,
+                    server_time: Some(server_time),
+                    ..
+                }),
+            ..
+        } = input
+        {
+            if code == "clock_skew" {
+                self.clock_offset = server_time - now_unix();
+            }
+        }
+    }
+
     /// A join reaches the core only after its user id was checked against the data dir:
     /// adopted on the first join, and any other id afterwards halts as `identity_drift`.
     async fn on_received(&mut self, received: Received) -> Input {
         let (req, user_id) = match received {
-            Received::Input(input) => return input,
+            Received::Input(input) => {
+                self.learn_clock_offset(&input);
+                return input;
+            }
             Received::Joined { req, user_id } => (req, user_id),
         };
         let result = match self.store.check_identity(user_id).await {
@@ -438,7 +468,9 @@ impl Owner {
                         return None;
                     }
                 }
-                return self.connection.send(req, &request, now_unix());
+                return self
+                    .connection
+                    .send(req, &request, now_unix() + self.clock_offset);
             }
             Effect::Schedule { timer, after } => self.timers.schedule(timer, after),
             Effect::Cancel(timer) => self.timers.cancel(&timer),
@@ -505,9 +537,17 @@ impl Owner {
                 inflight,
                 reply,
                 mismatch_attempts,
+                divergent_replies,
             } => {
                 let outcome = match store
-                    .settle_upload(me, doc_id, &inflight, &reply, mismatch_attempts)
+                    .settle_upload(
+                        me,
+                        doc_id,
+                        &inflight,
+                        &reply,
+                        mismatch_attempts,
+                        divergent_replies,
+                    )
                     .await
                 {
                     Ok((outcome, notices)) => {

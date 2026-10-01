@@ -213,7 +213,8 @@ pub(crate) async fn apply_ops(
             DocOp::SetShadow(_)
             | DocOp::SetContent(_)
             | DocOp::SetMeta { .. }
-            | DocOp::HardDelete => {}
+            | DocOp::HardDelete
+            | DocOp::Undelete => {}
         }
     }
     let after = snap.project(ops);
@@ -277,6 +278,13 @@ async fn write_document(
             refresh_search(&mut *conn, before.doc_id).await?;
         }
     }
+    if before.soft_deleted && !after.soft_deleted {
+        sqlx::query("UPDATE documents SET deleted_at = NULL WHERE id = ?")
+            .bind(&id)
+            .execute(&mut *conn)
+            .await?;
+        refresh_search(&mut *conn, before.doc_id).await?;
+    }
     // The envelope's version became the shadow: keep its provenance metadata.
     let applied = envelope.filter(|env| {
         before.shadow != after.shadow && after.shadow.as_ref().is_some_and(|s| s.seq == env.seq)
@@ -300,7 +308,8 @@ fn visible_change(before: &DocSnapshot, after: &DocSnapshot) -> bool {
         || (after.exists
             && (before.content != after.content
                 || before.owner_id != after.owner_id
-                || before.read_only != after.read_only))
+                || before.read_only != after.read_only
+                || before.soft_deleted != after.soft_deleted))
 }
 
 pub(crate) async fn insert_marker(
@@ -402,6 +411,8 @@ fn reason_str(reason: RecoverReason) -> &'static str {
         RecoverReason::Conflict => "conflict",
         RecoverReason::BecamePublication => "became_publication",
         RecoverReason::CreateRejected => "create_rejected",
+        RecoverReason::DeleteSuperseded => "delete_superseded",
+        RecoverReason::DeleteRefused => "delete_refused",
     }
 }
 
@@ -411,7 +422,7 @@ mod tests {
 
     use super::*;
     use crate::engine::doc::change_fixtures::{env, upsert, with_upload};
-    use crate::engine::doc::fixtures::{synced, DOC};
+    use crate::engine::doc::fixtures::{synced, APPEND, DOC};
     use crate::engine::doc::{apply_change, DocEvent};
     use crate::engine::types::{SCOPE_CURATED, SCOPE_OWN};
     use crate::store::test_support::*;
@@ -444,7 +455,10 @@ mod tests {
         let mut page_echo = with_upload(upsert(SCOPE_OWN, json!({}), 2), uploaded);
         page_echo.doc = Some(env(json!({"a": 1, "mine": true, "theirs": true}), 4));
 
-        let notices = apply(&t.store, DOC, |snap| apply_change(snap, &page_echo, ME)).await;
+        let notices = apply(&t.store, DOC, |snap| {
+            apply_change(snap, &page_echo, ME, &APPEND)
+        })
+        .await;
 
         assert_eq!(
             notices,
@@ -468,6 +482,24 @@ mod tests {
         let after = snapshot(&t.store, DOC).await;
         assert_eq!(after.content, json!({"a": 1, "mine": true, "theirs": true}));
         assert!(after.rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refused_delete_copy_is_listed_as_delete_refused() {
+        let t = temp_store().await;
+        seed_synced(&t.store, DOC, SCOPE_OWN, Some(ME), json!({"a": 1}), 1).await;
+        apply(&t.store, DOC, |_| {
+            vec![DocOp::Recover {
+                content: json!({"a": 2}),
+                reason: RecoverReason::DeleteRefused,
+            }]
+        })
+        .await;
+
+        let copies = t.store.list_recovered().await.unwrap();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].reason, "delete_refused");
+        assert_eq!(copies[0].content, json!({"a": 2}));
     }
 
     #[tokio::test]
@@ -595,6 +627,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn undelete_clears_the_soft_delete_and_logs_an_upsert() {
+        let t = temp_store().await;
+        seed_synced(&t.store, DOC, SCOPE_OWN, Some(ME), json!({"a": 1}), 1).await;
+        t.store.delete_document(ME, DOC).await.unwrap();
+        apply(&t.store, DOC, |_| vec![DocOp::DropAllRows, DocOp::Undelete]).await;
+        let after = snapshot(&t.store, DOC).await;
+        assert!(after.exists && !after.soft_deleted);
+        assert!(after.rows.is_empty());
+        let last_kind: String =
+            sqlx::query_scalar("SELECT kind FROM change_log ORDER BY local_seq DESC LIMIT 1")
+                .fetch_one(&t.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(last_kind, "upsert", "the host is told the document is back");
+    }
+
+    #[tokio::test]
     async fn title_hash_and_envelope_metadata_follow_the_applied_version() {
         let t = temp_store().await;
         let mut doc = envelope(DOC, None, json!({"title": "Just Intonation"}), 5);
@@ -603,7 +652,7 @@ mod tests {
         let change = upsert_change(SCOPE_CURATED, doc.clone());
 
         apply_with_envelope(&t.store, DOC, Some(&doc), |snap| {
-            apply_change(snap, &change, ME)
+            apply_change(snap, &change, ME, &APPEND)
         })
         .await;
 

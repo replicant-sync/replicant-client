@@ -5,15 +5,19 @@ use uuid::Uuid;
 use super::docs::{apply_ops, load_snapshot, LogOrigin};
 use super::{DocNotice, Store, StoreError, StoreResult};
 use crate::engine::doc::{self as rules, DocOp, DocSnapshot, InFlight};
+use crate::engine::doc_upload::reply_diverged;
 use crate::engine::machine::{BuildOutcome, SettleOutcome};
 use crate::engine::types::{DocEnvelope, Seq, ServerError};
 
 impl Store {
-    /// `Effect::LoadPending`: documents with outbox rows and none parked, oldest row first.
+    /// `Effect::LoadPending`: documents with outbox rows and none parked (or an unparked delete
+    /// as the last row), oldest row first.
     pub async fn load_pending(&self) -> StoreResult<Vec<Uuid>> {
         let ids: Vec<String> = sqlx::query_scalar(
             "SELECT doc_id FROM outbox GROUP BY doc_id \
-             HAVING SUM(parked_error IS NOT NULL) = 0 ORDER BY MIN(mutation_id)",
+             HAVING SUM(parked_error IS NOT NULL) = 0 OR (SELECT kind = 'delete' AND parked_error IS NULL FROM outbox last \
+                 WHERE last.doc_id = outbox.doc_id ORDER BY mutation_id DESC LIMIT 1) \
+             ORDER BY MIN(mutation_id)",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -65,15 +69,33 @@ impl Store {
         inflight: &InFlight,
         reply: &Result<DocEnvelope, ServerError>,
         mismatch_attempts: u32,
+        divergent_replies: u32,
     ) -> StoreResult<(SettleOutcome, Vec<DocNotice>)> {
         let mut tx = self.begin().await?;
         let snap = load_snapshot(&mut tx, doc_id).await?;
-        let settled = match rules::settle(&snap, inflight, reply, me, mismatch_attempts) {
+        let diverged = reply_diverged(&snap, inflight, reply);
+        if diverged {
+            tracing::warn!(%doc_id, "the server's copy differs from what was uploaded");
+        }
+        let settled = match rules::settle(
+            &snap,
+            inflight,
+            reply,
+            me,
+            mismatch_attempts,
+            divergent_replies,
+        ) {
             rules::SettleResult::Ops(ops) => {
                 let writer = self.writer(LogOrigin::Server);
                 let notices = apply_ops(&mut tx, &writer, &snap, &ops, reply.as_ref().ok()).await?;
                 let rows_remain = !snap.project(&ops).rows.is_empty();
-                (SettleOutcome::Done { rows_remain }, notices)
+                (
+                    SettleOutcome::Done {
+                        rows_remain,
+                        diverged,
+                    },
+                    notices,
+                )
             }
             rules::SettleResult::FetchServerCopy => (SettleOutcome::FetchServerCopy, Vec::new()),
             rules::SettleResult::Retry { after_ms, mismatch } => {
@@ -92,7 +114,7 @@ impl Store {
         doc: Option<&DocEnvelope>,
     ) -> StoreResult<Vec<DocNotice>> {
         self.apply_rule(doc_id, doc, |snap| match doc {
-            Some(doc) => rules::apply_server_copy(snap, doc, me),
+            Some(doc) => rules::apply_server_copy(snap, doc, me, &self.list_merge),
             None => rules::apply_server_missing(snap),
         })
         .await
@@ -209,6 +231,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_pending_lists_a_parked_doc_whose_last_row_is_a_delete() {
+        let t = temp_store().await;
+        let doc_id = t
+            .store
+            .create_document(ME, None, json!({"a": 1}))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE outbox SET parked_error = 'validation'")
+            .execute(&t.store.pool)
+            .await
+            .unwrap();
+        assert!(t.store.load_pending().await.unwrap().is_empty());
+        sqlx::query(
+            "INSERT INTO outbox (mutation_id, doc_id, kind, created_at) \
+             VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', ?, 'delete', 0)",
+        )
+        .bind(doc_id.to_string())
+        .execute(&t.store.pool)
+        .await
+        .unwrap();
+        assert_eq!(t.store.load_pending().await.unwrap(), vec![doc_id]);
+        sqlx::query("UPDATE outbox SET parked_error = 'forbidden'")
+            .execute(&t.store.pool)
+            .await
+            .unwrap();
+        assert!(t.store.load_pending().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn mark_sent_marks_only_the_rows_the_upload_covers() {
         let t = temp_store().await;
         let doc_id = t
@@ -258,11 +309,17 @@ mod tests {
         reply.hash = "server-hash-2".into();
         let (outcome, notices) = t
             .store
-            .settle_upload(ME, DOC, &inflight, &Ok(reply), 0)
+            .settle_upload(ME, DOC, &inflight, &Ok(reply), 0, 0)
             .await
             .unwrap();
 
-        assert_eq!(outcome, SettleOutcome::Done { rows_remain: true });
+        assert_eq!(
+            outcome,
+            SettleOutcome::Done {
+                rows_remain: true,
+                diverged: false
+            }
+        );
         assert!(notices.is_empty());
         let after = snapshot(&t.store, DOC).await;
         assert_eq!(after.rows.len(), 1);
@@ -288,21 +345,33 @@ mod tests {
 
         let (first_outcome, _) = t
             .store
-            .settle_upload(ME, DOC, &inflight, &Ok(reply.clone()), 0)
+            .settle_upload(ME, DOC, &inflight, &Ok(reply.clone()), 0, 0)
             .await
             .unwrap();
-        assert_eq!(first_outcome, SettleOutcome::Done { rows_remain: false });
+        assert_eq!(
+            first_outcome,
+            SettleOutcome::Done {
+                rows_remain: false,
+                diverged: false
+            }
+        );
         let before = snapshot(&t.store, DOC).await;
 
         // Two processes (or an ack retried after a dropped ack) settling the same upload_id
         // with the same reply: the second settle must be a no-op, not a second write.
         let (second_outcome, second_notices) = t
             .store
-            .settle_upload(ME, DOC, &inflight, &Ok(reply), 0)
+            .settle_upload(ME, DOC, &inflight, &Ok(reply), 0, 0)
             .await
             .unwrap();
 
-        assert_eq!(second_outcome, SettleOutcome::Done { rows_remain: false });
+        assert_eq!(
+            second_outcome,
+            SettleOutcome::Done {
+                rows_remain: false,
+                diverged: false
+            }
+        );
         assert!(second_notices.is_empty());
         let after = snapshot(&t.store, DOC).await;
         assert_eq!(after.shadow, before.shadow);
@@ -363,11 +432,17 @@ mod tests {
         let reply = envelope(DOC, Some(ME), json!({"n": 1}), 2);
         let (outcome, _) = t
             .store
-            .settle_upload(ME, DOC, &inflight, &Ok(reply.clone()), 0)
+            .settle_upload(ME, DOC, &inflight, &Ok(reply.clone()), 0, 0)
             .await
             .unwrap();
 
-        assert_eq!(outcome, SettleOutcome::Done { rows_remain: true });
+        assert_eq!(
+            outcome,
+            SettleOutcome::Done {
+                rows_remain: true,
+                diverged: false
+            }
+        );
         let (upload, _) = sent(&t.store, DOC).await;
         assert_eq!(upload.base_hash, Some(reply.hash));
         assert_eq!(
@@ -389,10 +464,16 @@ mod tests {
         reply.hash = "jsonb-normalised-hash".into();
         let (outcome, _) = t
             .store
-            .settle_upload(ME, DOC, &inflight, &Ok(reply), 0)
+            .settle_upload(ME, DOC, &inflight, &Ok(reply), 0, 0)
             .await
             .unwrap();
-        assert_eq!(outcome, SettleOutcome::Done { rows_remain: false });
+        assert_eq!(
+            outcome,
+            SettleOutcome::Done {
+                rows_remain: false,
+                diverged: false
+            }
+        );
         assert!(snapshot(&t.store, DOC).await.rows.is_empty());
         assert!(t.store.load_pending().await.unwrap().is_empty());
     }
@@ -413,11 +494,17 @@ mod tests {
 
         let (outcome, notices) = t
             .store
-            .settle_upload(ME, DOC, &inflight, &Err(mismatch), 3)
+            .settle_upload(ME, DOC, &inflight, &Err(mismatch), 3, 0)
             .await
             .unwrap();
 
-        assert_eq!(outcome, SettleOutcome::Done { rows_remain: false });
+        assert_eq!(
+            outcome,
+            SettleOutcome::Done {
+                rows_remain: false,
+                diverged: false
+            }
+        );
         assert_eq!(
             notices,
             vec![DocNotice {
@@ -442,11 +529,24 @@ mod tests {
 
         let (outcome, notices) = t
             .store
-            .settle_upload(ME, DOC, &inflight, &Err(ServerError::new("validation")), 0)
+            .settle_upload(
+                ME,
+                DOC,
+                &inflight,
+                &Err(ServerError::new("validation")),
+                0,
+                0,
+            )
             .await
             .unwrap();
 
-        assert_eq!(outcome, SettleOutcome::Done { rows_remain: true });
+        assert_eq!(
+            outcome,
+            SettleOutcome::Done {
+                rows_remain: true,
+                diverged: false
+            }
+        );
         assert_eq!(
             notices,
             vec![DocNotice {
@@ -572,5 +672,65 @@ mod tests {
         assert_eq!(after.content, json!({"n": 1}));
         assert!(after.rows.is_empty());
         assert_eq!(after.shadow.as_ref().unwrap().hash, server.hash);
+    }
+
+    #[tokio::test]
+    async fn a_refused_resend_keeps_its_mark_so_a_snapshot_cannot_resurrect_a_removed_element() {
+        let t = temp_store().await;
+        seed_synced(
+            &t.store,
+            DOC,
+            SCOPE_OWN,
+            Some(ME),
+            json!({"items": ["a"], "n": 0}),
+            1,
+        )
+        .await;
+        // The first upload appends x and lands, but its reply and echo are never seen.
+        t.store
+            .update_document(ME, DOC, json!({"items": ["a", "x"], "n": 0}))
+            .await
+            .unwrap();
+        let (_, first) = sent(&t.store, DOC).await;
+        t.store.mark_sent(DOC, first.upload_id).await.unwrap();
+        // A later edit; the resend covers both rows on the stale base and is refused.
+        let local = json!({"items": ["a", "x"], "n": 1});
+        t.store
+            .update_document(ME, DOC, local.clone())
+            .await
+            .unwrap();
+        let (_, second) = sent(&t.store, DOC).await;
+        t.store.mark_sent(DOC, second.upload_id).await.unwrap();
+        let refused = ServerError {
+            current_hash: Some("landed".into()),
+            current_seq: Some(4),
+            ..ServerError::new("hash_mismatch")
+        };
+        t.store
+            .settle_upload(ME, DOC, &second, &Err(refused), 0, 0)
+            .await
+            .unwrap();
+
+        // Another device removed x; a full resync snapshot arrives.
+        let server = envelope(DOC, Some(ME), json!({"items": ["a"], "n": 0}), 6);
+        let notices = t
+            .store
+            .apply_snapshot_page(ME, SCOPE_OWN, std::slice::from_ref(&server))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            notices,
+            vec![DocNotice {
+                doc_id: DOC,
+                event: DocEvent::ConflictDetected
+            }]
+        );
+        assert_eq!(recovered(&t).await, vec![(local, "conflict".to_string())]);
+        assert_eq!(
+            snapshot(&t.store, DOC).await.content,
+            json!({"items": ["a"], "n": 0}),
+            "x is not silently brought back"
+        );
     }
 }

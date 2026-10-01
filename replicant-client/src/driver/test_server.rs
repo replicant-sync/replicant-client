@@ -102,6 +102,7 @@ struct Model {
     mode: Mode,
     user_id: Uuid,
     join_error: Option<String>,
+    clock_ahead: Option<i64>,
     seq: i64,
     docs: HashMap<Uuid, ServerDoc>,
     log: Vec<LogEntry>,
@@ -109,9 +110,13 @@ struct Model {
     replies: HashMap<(Uuid, Option<String>), Value>,
     hold_uploads: bool,
     held: Vec<Held>,
+    hold_changes: bool,
+    held_changes: Vec<Held>,
     lose_next_upload: bool,
     drop_after_next_upload: bool,
     reject_next_upload: Option<String>,
+    reject_deletes: Option<String>,
+    stamp_updates: u32,
     drop_next_push: bool,
     frames: Vec<Frame>,
     user_agents: Vec<Option<String>>,
@@ -158,6 +163,12 @@ impl ScriptedServer {
         self.model().join_error = None;
     }
 
+    /// Joins are checked against a server clock `secs` ahead of this machine's, with the real
+    /// server's 300 s window.
+    pub fn clock_ahead_by(&self, secs: i64) {
+        self.model().clock_ahead = Some(secs);
+    }
+
     pub fn lose_next_upload(&self) {
         self.model().lose_next_upload = true;
     }
@@ -187,8 +198,36 @@ impl ScriptedServer {
         }
     }
 
+    /// Holds every `get_changes_since` until `release_held_changes`.
+    pub fn hold_changes(&self) {
+        self.model().hold_changes = true;
+    }
+
+    /// Stops holding and answers every held `get_changes_since` from the current log.
+    pub fn release_held_changes(&self) {
+        let mut model = self.model();
+        model.hold_changes = false;
+        for held in std::mem::take(&mut model.held_changes) {
+            let (status, response) = model.changes_since(&held.payload);
+            let frame = json!([held.join_ref, held.reference, "sync:v2", "phx_reply",
+                {"status": status, "response": response}])
+            .to_string();
+            let _ = model.outbound[held.connection].send(frame);
+        }
+    }
+
+    pub fn reject_deletes(&self, code: &str) {
+        self.model().reject_deletes = Some(code.to_string());
+    }
+
     pub fn reject_next_upload(&self, code: &str) {
         self.model().reject_next_upload = Some(code.to_string());
+    }
+
+    /// The next `times` updates store `"stamped": true` on top of the patched content
+    /// (`u32::MAX`: every update), so the reply differs from what the client sent.
+    pub fn stamp_updates(&self, times: u32) {
+        self.model().stamp_updates = times;
     }
 
     pub fn drop_next_push(&self) {
@@ -286,6 +325,7 @@ impl Model {
             mode: Mode::Normal,
             user_id,
             join_error: None,
+            clock_ahead: None,
             seq: 0,
             docs: HashMap::new(),
             log: Vec::new(),
@@ -293,9 +333,13 @@ impl Model {
             replies: HashMap::new(),
             hold_uploads: false,
             held: Vec::new(),
+            hold_changes: false,
+            held_changes: Vec::new(),
             lose_next_upload: false,
             drop_after_next_upload: false,
             reject_next_upload: None,
+            reject_deletes: None,
+            stamp_updates: 0,
             drop_next_push: false,
             frames: Vec::new(),
             user_agents: Vec::new(),
@@ -467,6 +511,11 @@ impl Model {
         if let Some(code) = self.reject_next_upload.take() {
             return error(&code);
         }
+        if payload["kind"] == "delete" {
+            if let Some(code) = self.reject_deletes.clone() {
+                return error(&code);
+            }
+        }
         let kind = payload["kind"].as_str().unwrap_or_default().to_string();
         let body = payload["payload"].clone();
         match (kind.as_str(), self.docs.get_mut(&doc_id)) {
@@ -492,14 +541,7 @@ impl Model {
             ("update", Some(doc)) if !doc.deleted => {
                 let current_hash = content_hash(&jsonb(&doc.content));
                 if base_hash.as_deref() != Some(current_hash.as_str()) {
-                    return UploadResult {
-                        reply: Some((
-                            "error",
-                            json!({"code": "hash_mismatch", "is_fatal": false,
-                                "current_hash": current_hash, "current_seq": doc.seq}),
-                        )),
-                        close: false,
-                    };
+                    return hash_mismatch(current_hash, doc.seq);
                 }
                 let Ok(patch) = serde_json::from_value::<json_patch::Patch>(body) else {
                     return error("validation");
@@ -510,9 +552,20 @@ impl Model {
                 if json_patch::patch(&mut rounded, &patch).is_err() {
                     return error("validation");
                 }
+                if self.stamp_updates > 0 {
+                    rounded["stamped"] = json!(true);
+                    if self.stamp_updates != u32::MAX {
+                        self.stamp_updates -= 1;
+                    }
+                }
                 doc.content = rounded;
             }
-            ("delete", Some(doc)) if !doc.deleted => {}
+            ("delete", Some(doc)) if !doc.deleted => {
+                let current_hash = content_hash(&jsonb(&doc.content));
+                if base_hash.as_ref().is_some_and(|base| *base != current_hash) {
+                    return hash_mismatch(current_hash, doc.seq);
+                }
+            }
             _ => return error("not_found"),
         }
         let lost = std::mem::take(&mut self.lose_next_upload);
@@ -572,6 +625,17 @@ fn jason_prints_scientific(float: f64) -> bool {
 
 fn uuid_field(payload: &Value, name: &str) -> Option<Uuid> {
     payload.get(name)?.as_str()?.parse().ok()
+}
+
+fn hash_mismatch(current_hash: String, current_seq: i64) -> UploadResult {
+    UploadResult {
+        reply: Some((
+            "error",
+            json!({"code": "hash_mismatch", "is_fatal": false,
+                "current_hash": current_hash, "current_seq": current_seq}),
+        )),
+        close: false,
+    }
 }
 
 async fn accept_loop(
@@ -680,16 +744,33 @@ fn handle(model: &Mutex<Model>, index: usize, text: &str) -> Outcome {
     let mut outcome = Outcome::default();
     match event.as_str() {
         "heartbeat" => outcome.replies.push(reply("ok", json!({}))),
-        "phx_join" => match model.join_error.clone() {
-            Some(code) => outcome
-                .replies
-                .push(reply("error", json!({"code": code, "is_fatal": true}))),
-            None => {
-                model.joined.insert(index);
-                let joined = json!({"user_id": model.user_id, "protocol_version": 2});
-                outcome.replies.push(reply("ok", joined));
+        "phx_join" => {
+            let skewed = model.clock_ahead.and_then(|ahead| {
+                let server_time = crate::store::now_unix() + ahead;
+                let signed = payload["timestamp"].as_i64().unwrap_or_default();
+                ((signed - server_time).abs() > 300).then_some(server_time)
+            });
+            match (skewed, model.join_error.clone()) {
+                (Some(server_time), _) => outcome.replies.push(reply(
+                    "error",
+                    json!({"code": "clock_skew", "is_fatal": false, "server_time": server_time}),
+                )),
+                (None, Some(code)) => outcome
+                    .replies
+                    .push(reply("error", json!({"code": code, "is_fatal": true}))),
+                (None, None) => {
+                    model.joined.insert(index);
+                    let joined = json!({"user_id": model.user_id, "protocol_version": 2});
+                    outcome.replies.push(reply("ok", joined));
+                }
             }
-        },
+        }
+        "get_changes_since" if model.hold_changes => model.held_changes.push(Held {
+            connection: index,
+            join_ref: join_ref.clone(),
+            reference: reference.clone(),
+            payload,
+        }),
         "get_changes_since" => {
             let (status, response) = model.changes_since(&payload);
             outcome.replies.push(reply(status, response));
@@ -986,6 +1067,49 @@ mod tests {
             ("exists", Some(ME))
         );
         assert_eq!(server.uploads_for(doc_id).len(), 4);
+    }
+
+    #[tokio::test]
+    async fn delete_on_a_stale_base_is_a_hash_mismatch() {
+        let server = ScriptedServer::start(ME).await;
+        let mut connection = joined(&server, "k1").await;
+        let doc_id = Uuid::from_u128(0xD1);
+        server.put_doc(doc_id, json!({"n": 1}));
+        let _push = received(&mut connection).await;
+        let stale = upload(
+            0x71,
+            doc_id,
+            UploadKind::Delete,
+            Some("stale".into()),
+            Value::Null,
+        );
+        let Received::Input(Input::Reply {
+            req: 2,
+            result: Err(error),
+        }) = reply(&mut connection, 2, stale).await
+        else {
+            panic!("expected hash_mismatch");
+        };
+        assert_eq!(
+            (error.code.as_str(), error.current_seq),
+            ("hash_mismatch", Some(1))
+        );
+        assert!(!server.doc(doc_id).unwrap().2, "nothing was deleted");
+        let current = upload(
+            0x72,
+            doc_id,
+            UploadKind::Delete,
+            error.current_hash,
+            Value::Null,
+        );
+        let Received::Input(Input::Reply {
+            req: 3,
+            result: Ok(Response::Uploaded(_)),
+        }) = reply(&mut connection, 3, current).await
+        else {
+            panic!("expected the delete on the current base to land");
+        };
+        assert!(server.doc(doc_id).unwrap().2);
     }
 
     #[tokio::test]

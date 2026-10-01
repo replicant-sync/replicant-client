@@ -9,6 +9,7 @@ use super::{Engine, EngineEvent};
 use crate::driver::test_server::ScriptedServer;
 use crate::driver::test_support::{config, credentials, eventually, jump, seeded_db, wait_for};
 use crate::engine::doc::DocEvent;
+use crate::engine::doc_upload::MAX_DIVERGENT_REPLIES;
 use crate::engine::machine::Lifecycle;
 use crate::store::change_log::{ChangeOrigin, DocChange};
 use crate::store::test_support::{count, snapshot, ME};
@@ -767,6 +768,71 @@ async fn offline_create_then_delete_uploads_one_delete_and_tombstones_at_zero() 
 }
 
 #[tokio::test]
+async fn a_delete_after_a_lost_create_reply_never_destroys_another_devices_edit() {
+    let server = ScriptedServer::start(ME).await;
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, _events) = live_engine(&server, &path).await;
+    let store = engine.store();
+    server.lose_next_upload();
+    let doc_id = store
+        .create_document(ME, None, json!({"n": 1}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    eventually("the create is applied", || async {
+        server.doc(doc_id).is_some()
+    })
+    .await;
+    engine.stop().await;
+
+    let theirs = json!({"n": 2, "note": "theirs"});
+    server.put_doc(doc_id, theirs.clone());
+    let store = Store::open(&path).await.unwrap();
+    store.delete_document(ME, doc_id).await.unwrap();
+    store.close().await;
+
+    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let engine = Engine::start(&path, config(&server.url, credentials("k1")), events_tx)
+        .await
+        .unwrap();
+    let store = engine.store();
+    wait_for(&mut events, "DeleteSuperseded", |event| {
+        *event
+            == EngineEvent::Doc(DocNotice {
+                doc_id,
+                event: DocEvent::DeleteSuperseded,
+            })
+    })
+    .await;
+    eventually("settled", || async { outbox_rows(&store).await == 0 }).await;
+    assert_eq!(
+        server
+            .doc(doc_id)
+            .map(|(content, _, deleted)| (content, deleted)),
+        Some((theirs.clone(), false)),
+        "the other device's edit survives on the server"
+    );
+    assert!(server
+        .uploads_for(doc_id)
+        .iter()
+        .all(|upload| upload["kind"] != "delete"));
+    let after = snapshot(&store, doc_id).await;
+    assert!(after.exists && !after.soft_deleted);
+    assert_eq!(after.content, theirs);
+    let kept: Vec<_> = store
+        .list_recovered()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|copy| copy.doc_id == doc_id)
+        .collect();
+    assert_eq!(kept.len(), 1, "with no shadow the local content is kept");
+    assert_eq!(kept[0].content, json!({"n": 1}));
+    assert_eq!(kept[0].reason, "delete_superseded");
+    engine.stop().await;
+}
+
+#[tokio::test]
 async fn app_and_daw_on_one_data_dir_upload_an_edit_once() {
     let server = ScriptedServer::start(ME).await;
     let (_dir, path) = seeded_db(ME, true).await;
@@ -865,4 +931,458 @@ async fn returning_user_offline_edits_rebase_onto_a_changed_snapshot() {
         "a returning user sees no conflict"
     );
     engine.stop().await;
+}
+
+#[tokio::test]
+async fn an_edit_from_another_device_supersedes_an_offline_delete() {
+    let server = ScriptedServer::start(ME).await;
+    let doc_id = Uuid::from_u128(0xDE1);
+    server.put_doc(doc_id, json!({"title": "Scale", "n": 1}));
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, _events) = live_engine(&server, &path).await;
+    engine.stop().await;
+
+    // Deleted offline here while another device edits the document.
+    let store = Store::open(&path).await.unwrap();
+    store.delete_document(ME, doc_id).await.unwrap();
+    store.close().await;
+    server.put_doc(doc_id, json!({"title": "Scale", "n": 2}));
+
+    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let engine = Engine::start(&path, config(&server.url, credentials("k1")), events_tx)
+        .await
+        .unwrap();
+    let store = engine.store();
+    wait_for(&mut events, "DeleteSuperseded", |event| {
+        *event
+            == EngineEvent::Doc(DocNotice {
+                doc_id,
+                event: DocEvent::DeleteSuperseded,
+            })
+    })
+    .await;
+    eventually("settled", || async { outbox_rows(&store).await == 0 }).await;
+    let after = snapshot(&store, doc_id).await;
+    assert!(
+        after.exists && !after.soft_deleted,
+        "the newer version is back"
+    );
+    assert_eq!(after.content, json!({"title": "Scale", "n": 2}));
+    assert!(
+        !server.doc(doc_id).unwrap().2,
+        "the other device's edit survives"
+    );
+    assert_eq!(recovered_rows(&store, doc_id).await, 0);
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn an_offline_edit_then_delete_superseded_by_another_device_keeps_the_edit() {
+    let server = ScriptedServer::start(ME).await;
+    let doc_id = Uuid::from_u128(0xDE3);
+    server.put_doc(doc_id, json!({"title": "Scale", "n": 1}));
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, _events) = live_engine(&server, &path).await;
+    engine.stop().await;
+
+    let edited = json!({"title": "Scale", "n": 1, "note": "mine"});
+    let store = Store::open(&path).await.unwrap();
+    store
+        .update_document(ME, doc_id, edited.clone())
+        .await
+        .unwrap();
+    store.delete_document(ME, doc_id).await.unwrap();
+    store.close().await;
+    server.put_doc(doc_id, json!({"title": "Scale", "n": 2}));
+
+    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let engine = Engine::start(&path, config(&server.url, credentials("k1")), events_tx)
+        .await
+        .unwrap();
+    let store = engine.store();
+    wait_for(&mut events, "DeleteSuperseded", |event| {
+        *event
+            == EngineEvent::Doc(DocNotice {
+                doc_id,
+                event: DocEvent::DeleteSuperseded,
+            })
+    })
+    .await;
+    eventually("settled", || async { outbox_rows(&store).await == 0 }).await;
+    let after = snapshot(&store, doc_id).await;
+    assert!(after.exists && !after.soft_deleted);
+    assert_eq!(after.content, json!({"title": "Scale", "n": 2}));
+    assert!(!server.doc(doc_id).unwrap().2);
+    let kept: Vec<_> = store
+        .list_recovered()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|copy| copy.doc_id == doc_id)
+        .collect();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].content, edited);
+    assert_eq!(kept[0].reason, "delete_superseded");
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn a_delete_on_a_stale_version_is_refused_and_can_be_repeated() {
+    let server = ScriptedServer::start(ME).await;
+    let doc_id = Uuid::from_u128(0xDE2);
+    server.put_doc(doc_id, json!({"n": 1}));
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, mut events) = live_engine(&server, &path).await;
+    let store = engine.store();
+    assert!(snapshot(&store, doc_id).await.exists);
+    // Another device's edit this client has not heard of yet.
+    server.drop_next_push();
+    server.put_doc(doc_id, json!({"n": 2}));
+    store.delete_document(ME, doc_id).await.unwrap();
+    engine.notify_outbox();
+    wait_for(&mut events, "DeleteSuperseded", |event| {
+        *event
+            == EngineEvent::Doc(DocNotice {
+                doc_id,
+                event: DocEvent::DeleteSuperseded,
+            })
+    })
+    .await;
+    let uploads = server.uploads_for(doc_id);
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0]["kind"], "delete");
+    assert!(
+        uploads[0]["base_hash"].is_string(),
+        "the delete names the version it was made on"
+    );
+    assert!(!server.doc(doc_id).unwrap().2);
+    assert_eq!(snapshot(&store, doc_id).await.content, json!({"n": 2}));
+
+    store.delete_document(ME, doc_id).await.unwrap();
+    engine.notify_outbox();
+    eventually("the repeated delete lands", || async {
+        server.doc(doc_id).is_some_and(|(_, _, deleted)| deleted) && outbox_rows(&store).await == 0
+    })
+    .await;
+    assert!(!snapshot(&store, doc_id).await.exists);
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn a_skewed_clock_joins_on_the_second_try_without_an_error() {
+    let server = ScriptedServer::start(ME).await;
+    server.clock_ahead_by(3600);
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let engine = Engine::start(&path, config(&server.url, credentials("k1")), events_tx)
+        .await
+        .unwrap();
+    wait_for(&mut events, "SyncCompleted", |event| {
+        assert!(
+            !matches!(event, EngineEvent::Lifecycle(Lifecycle::SyncError { code, .. }) if code == "clock_skew"),
+            "a clock the server corrected is not an error"
+        );
+        *event == EngineEvent::Lifecycle(Lifecycle::SyncCompleted)
+    })
+    .await;
+    let joins: Vec<i64> = server
+        .frames()
+        .into_iter()
+        .filter(|frame| frame.event == "phx_join")
+        .map(|frame| frame.payload["timestamp"].as_i64().unwrap())
+        .collect();
+    assert_eq!(joins.len(), 2, "one skewed join, one re-signed");
+    assert!(
+        (joins[1] - joins[0] - 3600).abs() <= 5,
+        "the second join is signed with the server's clock: {joins:?}"
+    );
+    assert_eq!(server.stats.upgrades(), 1, "on the same socket");
+
+    server.drop_connections();
+    let join_times = || {
+        server
+            .frames()
+            .into_iter()
+            .filter(|frame| frame.event == "phx_join")
+            .map(|frame| frame.payload["timestamp"].as_i64().unwrap())
+            .collect::<Vec<i64>>()
+    };
+    eventually("the reconnect joins", || async {
+        jump(Duration::from_millis(2100)).await;
+        join_times().len() >= 3
+    })
+    .await;
+    wait_for(&mut events, "SyncCompleted after the reconnect", |event| {
+        *event == EngineEvent::Lifecycle(Lifecycle::SyncCompleted)
+    })
+    .await;
+    let joins = join_times();
+    assert_eq!(joins.len(), 3, "the reconnect joins first time: {joins:?}");
+    assert!(
+        (joins[2] - joins[0] - 3600).abs() <= 5,
+        "the learnt offset signs the next join: {joins:?}"
+    );
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn a_one_off_divergent_reply_is_corrected_by_one_more_upload() {
+    let server = ScriptedServer::start(ME).await;
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, _events) = live_engine(&server, &path).await;
+    let store = engine.store();
+    let doc_id = store
+        .create_document(ME, None, json!({"n": 1}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    eventually("the create settles", || async {
+        in_sync(&store, &server, doc_id).await
+    })
+    .await;
+
+    server.stamp_updates(1);
+    store
+        .update_document(ME, doc_id, json!({"n": 2}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    eventually("the correction settles", || async {
+        server.uploads_for(doc_id).len() == 3 && in_sync(&store, &server, doc_id).await
+    })
+    .await;
+
+    assert_eq!(server_content(&server, doc_id), Some(json!({"n": 2})));
+    assert_eq!(snapshot(&store, doc_id).await.content, json!({"n": 2}));
+    let uploads = server.uploads_for(doc_id);
+    assert_eq!(uploads.len(), 3, "create, the stamped edit, one correction");
+    assert_eq!(
+        uploads[2]["payload"],
+        json!([{"op": "remove", "path": "/stamped"}])
+    );
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn a_persistent_divergent_reply_parks_the_document_after_a_bounded_number_of_uploads() {
+    let server = ScriptedServer::start(ME).await;
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, mut events) = live_engine(&server, &path).await;
+    let store = engine.store();
+    let doc_id = store
+        .create_document(ME, None, json!({"n": 1}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    eventually("the create settles", || async {
+        in_sync(&store, &server, doc_id).await
+    })
+    .await;
+
+    server.stamp_updates(u32::MAX);
+    store
+        .update_document(ME, doc_id, json!({"n": 2}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    wait_for(&mut events, "the park", |event| {
+        *event
+            == EngineEvent::Doc(DocNotice {
+                doc_id,
+                event: DocEvent::SyncError {
+                    code: "diverged".into(),
+                },
+            })
+    })
+    .await;
+    let bound = 1 + MAX_DIVERGENT_REPLIES as usize + 1;
+    assert_eq!(server.uploads_for(doc_id).len(), bound);
+    assert_eq!(
+        count(
+            &store,
+            "SELECT COUNT(*) FROM outbox WHERE parked_error = 'diverged'"
+        )
+        .await,
+        1
+    );
+    assert_eq!(snapshot(&store, doc_id).await.content, json!({"n": 2}));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        server.uploads_for(doc_id).len(),
+        bound,
+        "no uploads after the park"
+    );
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn a_delete_made_while_an_upload_is_refused_still_reaches_the_server() {
+    let server = ScriptedServer::start(ME).await;
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, _events) = live_engine(&server, &path).await;
+    let store = engine.store();
+    let doc_id = store
+        .create_document(ME, None, json!({"n": 1}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    eventually("the create settles", || async {
+        in_sync(&store, &server, doc_id).await
+    })
+    .await;
+
+    server.hold_uploads();
+    server.reject_next_upload("validation");
+    store
+        .update_document(ME, doc_id, json!({"n": 2}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    eventually("the edit is held", || async {
+        server.uploads_for(doc_id).len() == 2
+    })
+    .await;
+    store.delete_document(ME, doc_id).await.unwrap();
+    server.release_held();
+    eventually("the delete reaches the server", || async {
+        server.doc(doc_id).is_some_and(|(_, _, deleted)| deleted) && outbox_rows(&store).await == 0
+    })
+    .await;
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn a_trimmed_cursor_holds_uploads_until_the_resync_and_keeps_no_copy() {
+    let server = ScriptedServer::start(ME).await;
+    let doc_id = Uuid::from_u128(0xD1);
+    server.put_doc(doc_id, json!({"a": 1, "b": 1}));
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, _events) = live_engine(&server, &path).await;
+    engine.stop().await;
+
+    // Months offline: an edit here, another device's edit there, and the log trimmed past this
+    // data dir's nonzero cursor.
+    let store = Store::open(&path).await.unwrap();
+    store
+        .update_document(ME, doc_id, json!({"a": 2, "b": 1}))
+        .await
+        .unwrap();
+    store.close().await;
+    server.put_doc(doc_id, json!({"a": 1, "b": 2}));
+    server.trim_log_through(server.head());
+    server.hold_changes();
+    let asked = |server: &ScriptedServer| {
+        server
+            .frames()
+            .iter()
+            .filter(|frame| frame.event == "get_changes_since")
+            .count()
+    };
+    let asked_before = asked(&server);
+
+    let (events_tx, mut events) = mpsc::unbounded_channel();
+    let engine = Engine::start(&path, config(&server.url, credentials("k1")), events_tx)
+        .await
+        .unwrap();
+    let store = engine.store();
+    eventually("own asks for changes from its old cursor", || async {
+        asked(&server) > asked_before
+    })
+    .await;
+    // Well past the upload pump's quiet period.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        server.uploads_for(doc_id).is_empty(),
+        "nothing is sent before own's cursor is answered"
+    );
+
+    server.release_held_changes();
+    wait_for(&mut events, "SyncCompleted", |event| {
+        *event == EngineEvent::Lifecycle(Lifecycle::SyncCompleted)
+    })
+    .await;
+    eventually("the offline edit is uploaded", || async {
+        outbox_rows(&store).await == 0
+    })
+    .await;
+    assert_eq!(
+        server_content(&server, doc_id),
+        Some(json!({"a": 2, "b": 2}))
+    );
+    assert_eq!(recovered_rows(&store, doc_id).await, 0, "no kept copy");
+    engine.stop().await;
+}
+
+/// Syncs `{"n": 1}`, optionally edits it locally to `local_edit`, deletes it, and has the server
+/// refuse the delete. Returns the kept copies' reason and content.
+async fn refuse_a_delete(local_edit: Option<Value>) -> Vec<(String, Value)> {
+    let server = ScriptedServer::start(ME).await;
+    let (_dir, path) = seeded_db(ME, true).await;
+    let (engine, mut events) = live_engine(&server, &path).await;
+    let store = engine.store();
+    let doc_id = store
+        .create_document(ME, None, json!({"n": 1}))
+        .await
+        .unwrap();
+    engine.notify_outbox();
+    eventually("synced", || async { outbox_rows(&store).await == 0 }).await;
+    server.reject_deletes("forbidden");
+    if let Some(edit) = local_edit {
+        store.update_document(ME, doc_id, edit).await.unwrap();
+    }
+    store.delete_document(ME, doc_id).await.unwrap();
+    engine.notify_outbox();
+    let refusal = EngineEvent::Doc(DocNotice {
+        doc_id,
+        event: DocEvent::SyncError {
+            code: "forbidden".into(),
+        },
+    });
+    wait_for(&mut events, "the refusal", |event| *event == refusal).await;
+    let uploads_then = server.uploads_for(doc_id).len();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut refusals = 0;
+    while let Ok(event) = events.try_recv() {
+        refusals += usize::from(event == refusal);
+    }
+    let uploads = server.uploads_for(doc_id);
+    let deletes = uploads
+        .iter()
+        .filter(|upload| upload["kind"] == "delete")
+        .count();
+    let after = snapshot(&store, doc_id).await;
+    let outbox = outbox_rows(&store).await;
+    let kept: Vec<(String, Value)> = store
+        .list_recovered()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|copy| copy.doc_id == doc_id)
+        .map(|copy| (copy.reason, copy.content))
+        .collect();
+    engine.stop().await;
+    assert_eq!(deletes, 1, "the refused delete is sent once");
+    assert_eq!(
+        uploads.len(),
+        uploads_then,
+        "nothing is sent after the refusal"
+    );
+    assert_eq!(refusals, 0, "no second SyncError after the first");
+    assert!(after.exists && !after.soft_deleted, "visible again");
+    assert_eq!(after.content, json!({"n": 1}), "the server's version");
+    assert_eq!(outbox, 0);
+    kept
+}
+
+#[tokio::test]
+async fn a_delete_the_server_refuses_brings_the_server_version_back() {
+    assert_eq!(refuse_a_delete(None).await, vec![], "no kept copy");
+}
+
+#[tokio::test]
+async fn a_refused_delete_after_a_local_edit_keeps_the_edit_as_a_copy() {
+    assert_eq!(
+        refuse_a_delete(Some(json!({"n": 2}))).await,
+        vec![("delete_refused".to_string(), json!({"n": 2}))]
+    );
 }

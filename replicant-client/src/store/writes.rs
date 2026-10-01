@@ -619,6 +619,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restoring_a_whole_list_conflict_restores_the_list_exactly() {
+        let t = temp_store().await;
+        let scale = json!({"pitches": [0, 200, 400, 500, 700, 900]});
+        seed_synced(&t.store, doc(1), SCOPE_OWN, Some(ME), scale, 1).await;
+        let mine = json!({"pitches": [0, 200, 500, 700, 900]});
+        t.store
+            .update_document(ME, doc(1), mine.clone())
+            .await
+            .unwrap();
+        let theirs = json!({"pitches": [0, 200, 400, 500, 700]});
+        let change = upsert_change(SCOPE_OWN, envelope(doc(1), Some(ME), theirs.clone(), 2));
+        let notices = t
+            .store
+            .apply_changes(ME, SCOPE_OWN, &[change], 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            notices,
+            vec![crate::store::DocNotice {
+                doc_id: doc(1),
+                event: crate::engine::doc::DocEvent::FieldConflict {
+                    paths: vec!["/pitches".into()]
+                }
+            }]
+        );
+        assert_eq!(snapshot(&t.store, doc(1)).await.content, theirs);
+        t.store
+            .restore_fields(ME, kept_copy_id(&t).await)
+            .await
+            .unwrap();
+        assert_eq!(
+            snapshot(&t.store, doc(1)).await.content,
+            mine,
+            "the whole local list, exactly"
+        );
+    }
+
+    #[tokio::test]
     async fn restore_fields_refuses_a_whole_document_copy() {
         let t = temp_store().await;
         seed_synced(&t.store, doc(1), SCOPE_OWN, Some(ME), json!({}), 1).await;
