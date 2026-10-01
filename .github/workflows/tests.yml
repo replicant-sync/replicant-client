@@ -137,7 +137,10 @@ jobs:
 
     - uses: dtolnay/rust-toolchain@stable
 
+    # Windows links the static-CRT library, as Entonal does (release.yml ships both variants).
     - run: cargo build -p replicant-client --release
+      env:
+        RUSTFLAGS: ${{ runner.os == 'Windows' && '-C target-feature=+crt-static' || '' }}
 
     - name: Link and check (Linux)
       if: runner.os == 'Linux'
@@ -164,7 +167,7 @@ jobs:
       shell: pwsh
       run: |
         $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
-        cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" && cl /O2 /Ireplicant-client\target\include scripts\release_link_probe.c target\release\replicant_client.lib ws2_32.lib userenv.lib bcrypt.lib ntdll.lib secur32.lib advapi32.lib crypt32.lib ole32.lib /link /OPT:REF /OPT:ICF /out:probe.exe"
+        cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" && cl /O2 /MT /Ireplicant-client\target\include scripts\release_link_probe.c target\release\replicant_client.lib ws2_32.lib userenv.lib bcrypt.lib ntdll.lib secur32.lib advapi32.lib crypt32.lib ole32.lib /link /OPT:REF /OPT:ICF /out:probe.exe"
         if ($LASTEXITCODE -ne 0) { exit 1 }
         .\probe.exe; if ($LASTEXITCODE -ne 0) { exit 1 }
         python scripts\check_replicant_versions.py probe.exe
