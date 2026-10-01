@@ -9,6 +9,8 @@ An offline-first JSON document sync library in Rust, with a C API, for the Repli
 
 `build_dist.py` puts the headers (`replicant.h`, `replicant.hpp`) and the libraries in `dist/`.
 
+The static library contains the bundled SQLite amalgamation (SQLite 3.46.0 today, through `libsqlite3-sys` 0.30.1) and exports its `sqlite3_*` C API. Code linked into the same binary must use that SQLite and not link a second copy; entonal-common's `Migration.cpp` and IndieKey's SQLiteCpp already do. These symbols are not part of the replicant ABI, and the SQLite version may change in any release. The shared library exports only the `replicant_*` functions.
+
 ## C API
 
 `#include "replicant.h"` for C, or `replicant.hpp` for C++ (`replicant::Client`, a thin RAII wrapper that throws `SyncException`). The header's comments are the reference. The ABI is `REPLICANT_ABI_VERSION_MAJOR.MINOR`: a breaking change bumps the major, an addition the minor; `replicant_abi_version` returns the library's, packed `(major << 16) | minor`.
