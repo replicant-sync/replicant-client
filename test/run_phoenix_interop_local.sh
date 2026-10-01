@@ -213,6 +213,8 @@ done
 # INTEROP_TEST_CMD lets a consumer suite (e.g. entonal-common's
 # TonalDBSyncIntegrationTest) run under this harness's boot/seed/teardown in
 # place of the cargo suites. It runs with the same seeded-credential env.
+# --include-ignored also runs two_process's offline test; the child_* tests are
+# skipped because they only do work when a two_process test spawns them.
 log "Running ${INTEROP_TEST_CMD:-interop suites} against clean DB"
 set +e
 ( cd "$CLIENT_CRATE" && \
@@ -224,7 +226,7 @@ set +e
   REPLICANT_LEGACY_API_KEY="$LEGACY_API_KEY" \
   REPLICANT_LEGACY_API_SECRET="$LEGACY_API_SECRET" \
   SYNC_SERVER_URL="ws://localhost:$SERVER_PORT/socket/websocket" \
-  bash -c "${INTEROP_TEST_CMD:-cargo test -p replicant-client --test interop --test v2_smoke --test two_process -- --ignored --test-threads=1 ${1:+\"$1\"}}" )
+  bash -c "${INTEROP_TEST_CMD:-cargo test -p replicant-client --test interop --test v2_smoke --test two_process -- --include-ignored --skip child_ --test-threads=1 ${1:+\"$1\"}}" )
 test_exit=$?
 set -e
 
