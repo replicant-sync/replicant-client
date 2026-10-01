@@ -116,6 +116,7 @@ fn create_with_config(
         c("a@b.c"),
         c("Test Host"),
         c("1.0"),
+        c("/title"),
     ];
     let mut config = ReplicantConfig {
         struct_size: std::mem::size_of::<ReplicantConfig>() as u32,
@@ -127,6 +128,7 @@ fn create_with_config(
         host_version: strings[5].as_ptr(),
         list_merge: 0,
         list_merge_rules_json: ptr::null(),
+        title_pointer: strings[6].as_ptr(),
     };
     change(&mut config);
     let mut handle = ptr::null_mut();
@@ -656,6 +658,86 @@ fn search_finds_configured_paths() {
     close(handle);
 }
 
+fn open_with_title(dir: &Path, pointer: Option<&str>) -> *mut Replicant {
+    let pointer = pointer.map(c);
+    let (result, handle) = create_with(dir, |config| {
+        config.title_pointer = pointer.as_ref().map_or(ptr::null(), |text| text.as_ptr());
+    });
+    assert_eq!(result, SyncResult::Success);
+    handle
+}
+
+fn title_search(handle: *mut Replicant, query: &str) -> usize {
+    json_out(|out| unsafe { replicant_search_documents(handle, c(query).as_ptr(), 0, out) })
+        .as_array()
+        .unwrap()
+        .len()
+}
+
+#[test]
+fn titles_come_from_the_configured_pointer_and_follow_a_new_one_at_the_next_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = open_with_title(dir.path(), Some("/title"));
+    assert_eq!(
+        unsafe { replicant_configure_search(handle, c(r#"["$.body"]"#).as_ptr()) },
+        SyncResult::Success
+    );
+    let id = create_doc(
+        handle,
+        r#"{"title":"Alpha","meta":{"name":"Beta"},"body":"notes"}"#,
+    );
+    assert_eq!(get_doc(handle, &id).unwrap()["title"], "Alpha");
+    assert_eq!(title_search(handle, "title:alpha"), 1);
+    close(handle);
+
+    let handle = open_with_title(dir.path(), Some("/meta/name"));
+    assert_eq!(get_doc(handle, &id).unwrap()["title"], "Beta");
+    assert_eq!(title_search(handle, "title:beta"), 1);
+    assert_eq!(title_search(handle, "title:alpha"), 0);
+    sql(
+        dir.path(),
+        &format!(
+            "INSERT INTO recovered (doc_id, content, reason, recovered_at) \
+             VALUES ('{id}', '{{\"title\":\"Old\",\"meta\":{{\"name\":\"Kept\"}}}}', 'conflict', 1)"
+        ),
+    );
+    let kept = json_out(|out| unsafe { replicant_list_recovered(handle, out) });
+    assert_eq!(kept[0]["title"], "Kept");
+    close(handle);
+
+    let handle = open_with_title(dir.path(), None);
+    assert!(get_doc(handle, &id).unwrap()["title"].is_null());
+    assert_eq!(title_search(handle, "title:beta"), 0);
+    assert!(json_out(|out| unsafe { replicant_list_recovered(handle, out) })[0]["title"].is_null());
+    let untitled = create_doc(handle, r#"{"title":"Gamma"}"#);
+    assert!(get_doc(handle, &untitled).unwrap()["title"].is_null());
+    close(handle);
+}
+
+#[test]
+fn create_refuses_a_malformed_title_pointer_and_another_pointer_on_an_open_engine() {
+    let dir = tempfile::tempdir().unwrap();
+    for malformed in ["title", "/a~2", "/a~"] {
+        let pointer = c(malformed);
+        let (result, handle) =
+            create_with(dir.path(), |config| config.title_pointer = pointer.as_ptr());
+        assert_eq!(result, SyncResult::ErrorInvalidInput, "{malformed}");
+        assert!(handle.is_null());
+    }
+    let handle = open_with_title(dir.path(), Some("/title"));
+    for other in [Some("/name"), None] {
+        let pointer = other.map(c);
+        let (result, second) = create_with(dir.path(), |config| {
+            config.title_pointer = pointer.as_ref().map_or(ptr::null(), |text| text.as_ptr());
+        });
+        assert_eq!(result, SyncResult::ErrorConfigMismatch, "{other:?}");
+        assert!(second.is_null());
+    }
+    let same = open_with_title(dir.path(), Some("/title"));
+    close(same);
+    close(handle);
+}
+
 #[test]
 fn a_malformed_search_query_is_invalid_input() {
     let dir = tempfile::tempdir().unwrap();
@@ -800,6 +882,7 @@ fn a_failed_create_leaves_the_out_handle_null() {
             host_version: strings[1].as_ptr(),
             list_merge: 0,
             list_merge_rules_json: ptr::null(),
+            title_pointer: ptr::null(),
         };
         change(&mut config);
         let mut handle = stale;

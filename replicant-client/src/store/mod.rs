@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use serde_json::Value;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, Sqlite, SqliteConnection, SqlitePool, Transaction};
 use uuid::Uuid;
@@ -116,6 +117,9 @@ pub struct Store {
     instance_id: Uuid,
     /// How the per-document rules merge lists; the engine sets it from its config.
     pub(crate) list_merge: ListMergeConfig,
+    /// The JSON Pointer titles are read from (`None`: no titles); the engine sets it from its
+    /// config and then calls `apply_title_pointer`.
+    pub(crate) title_pointer: Option<String>,
 }
 
 impl Store {
@@ -138,6 +142,7 @@ impl Store {
             options,
             instance_id: Uuid::new_v4(),
             list_merge: ListMergeConfig::default(),
+            title_pointer: None,
         })
     }
 
@@ -188,6 +193,58 @@ impl Store {
         };
         tx.commit().await?;
         Ok(client_id)
+    }
+
+    /// The title `content` has under this store's title pointer.
+    pub fn title_of(&self, content: &Value) -> Option<String> {
+        docs::title_of(content, self.title_pointer.as_deref())
+    }
+
+    /// When the titles were derived from another pointer (or never recorded), recomputes every
+    /// document's title and the search index from `title_pointer`, and records it. Returns
+    /// whether it recomputed.
+    pub async fn apply_title_pointer(&self) -> StoreResult<bool> {
+        let pointer = self.title_pointer.as_deref().unwrap_or("");
+        let mut tx = self.begin().await?;
+        let recorded: Option<String> =
+            sqlx::query_scalar("SELECT title_pointer FROM user_config LIMIT 1")
+                .fetch_optional(&mut *tx)
+                .await?
+                .flatten();
+        if recorded.as_deref() == Some(pointer) {
+            return Ok(false);
+        }
+        let rows = sqlx::query("SELECT id, content FROM documents")
+            .fetch_all(&mut *tx)
+            .await?;
+        for row in rows {
+            let id: String = row.try_get("id")?;
+            let title = serde_json::from_str::<Value>(&row.try_get::<String, _>("content")?)
+                .ok()
+                .and_then(|content| self.title_of(&content));
+            sqlx::query("UPDATE documents SET title = ? WHERE id = ?")
+                .bind(title)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let searchable: i64 = sqlx::query_scalar(reads::HAS_SEARCH_CONFIG)
+            .fetch_one(&mut *tx)
+            .await?;
+        if searchable != 0 {
+            sqlx::query("DELETE FROM documents_fts")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(reads::REBUILD_FTS_INDEX)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("UPDATE user_config SET title_pointer = ?")
+            .bind(pointer)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// The join's user id against this data dir: adopt it if none was ever adopted.
@@ -281,6 +338,7 @@ mod uploads;
 mod v1_data;
 mod writes;
 
+pub use docs::is_json_pointer;
 pub use reads::{ParkedDocument, StoredDocument};
 pub use recovered::RecoveredCopy;
 

@@ -57,7 +57,8 @@ impl From<Origin> for EventOrigin {
 }
 
 /// `DocumentChanged` / `DocumentDeleted`. For a deletion only `document_id` is set; for a change
-/// `title`, `owner_id` and `author_id` may be null.
+/// `title`, `owner_id` and `author_id` may be null. `title` comes from
+/// `ReplicantConfig.title_pointer`: always null without one.
 /// `visibility` is `public` (curated or read-only) or `private`. `content` is the document's
 /// content, the host's own JSON. Every id is a lowercase hyphenated UUID.
 /// Strings are valid only during the call; copy what you keep.

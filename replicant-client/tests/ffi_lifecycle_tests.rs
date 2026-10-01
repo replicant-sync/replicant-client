@@ -129,6 +129,7 @@ fn open(dir: &Path, server_url: &str) -> *mut Replicant {
         host_version: strings[5].as_ptr(),
         list_merge: 0,
         list_merge_rules_json: ptr::null(),
+        title_pointer: ptr::null(),
     };
     let mut handle = ptr::null_mut();
     assert_eq!(

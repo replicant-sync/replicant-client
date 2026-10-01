@@ -285,7 +285,8 @@ enum ReplicantSyncResult
    */
   ReplicantSyncResult_ErrorNewerSchema = -5,
   /**
-   * An engine is open on this data dir with a different server, host or list merge config.
+   * An engine is open on this data dir with a different server, host, list merge config or
+   * title pointer.
    * A programming error: every binary on a data dir must pass the same config. Never fall
    * back to a temporary library.
    */
@@ -390,6 +391,15 @@ typedef struct ReplicantConfig {
    * literal segments wins, a tie goes to the first listed.
    */
   const char *list_merge_rules_json;
+  /**
+   * May be null (`""` counts as null). An RFC 6901 JSON Pointer, e.g. "/title", to the string
+   * in each document's content that is its `title`: in reads, callbacks, kept copies and the
+   * `title:` search field. Null: the library assigns no titles. Anything else that is not a
+   * JSON Pointer is refused (`ErrorInvalidInput`). Every handle on a data dir must pass the
+   * same pointer (`ErrorConfigMismatch`); opening a database whose titles came from another
+   * pointer recomputes every title and the search index once.
+   */
+  const char *title_pointer;
 } ReplicantConfig;
 
 typedef struct ReplicantState {
@@ -406,7 +416,8 @@ typedef struct ReplicantState {
 
 /**
  * `DocumentChanged` / `DocumentDeleted`. For a deletion only `document_id` is set; for a change
- * `title`, `owner_id` and `author_id` may be null.
+ * `title`, `owner_id` and `author_id` may be null. `title` comes from
+ * `ReplicantConfig.title_pointer`: always null without one.
  * `visibility` is `public` (curated or read-only) or `private`. `content` is the document's
  * content, the host's own JSON. Every id is a lowercase hyphenated UUID.
  * Strings are valid only during the call; copy what you keep.
@@ -587,8 +598,8 @@ ReplicantSyncResult replicant_delete_document(struct Replicant *handle, const ch
  * - `id` (string): the document's id.
  * - `owner_id` (string or null): the owning user; null only for a legacy document with none.
  * - `author_id` (string or null): the author the server reports; null until it has synced.
- * - `title` (string or null): the content's `title` string, cut to 128 characters, else
- *   the title the server sent.
+ * - `title` (string or null): the string at `ReplicantConfig.title_pointer` in the content,
+ *   cut to 128 characters; null without a pointer or when that value is not a string.
  * - `content`: the host's own JSON value, as last written or synced.
  * - `read_only` (bool): the server marked it read-only (a publication); writes are refused.
  * - `visibility` (string): `public` (curated or read-only) or `private`.
@@ -679,7 +690,8 @@ ReplicantSyncResult replicant_get_user_id(struct Replicant *handle, char **out_u
 ReplicantSyncResult replicant_configure_search(struct Replicant *handle, const char *paths_json);
 
 /**
- * FTS5 query (`music`, `tun*`, `"a phrase"`, `a AND b`, `title:word`); `limit` 0 means 100. A
+ * FTS5 query (`music`, `tun*`, `"a phrase"`, `a AND b`, `title:word`, where `title` is the
+ * document's title from `ReplicantConfig.title_pointer`); `limit` 0 means 100. A
  * query FTS5 cannot parse is `ErrorInvalidInput`. The result is a JSON array of document
  * objects (see `replicant_get_document`), best match first.
  *
@@ -701,7 +713,7 @@ ReplicantSyncResult replicant_rebuild_search_index(struct Replicant *handle);
  * Kept copies (local content sync set aside), newest first, as a JSON array of objects:
  * - `recovered_id` (integer): the copy's id, for `replicant_dismiss_recovered` and the restores.
  * - `doc_id` (string): the document the copy was kept from (it may since have been deleted).
- * - `title` (string or null): the kept content's `title`, when it is a string.
+ * - `title` (string or null): the kept content's title, derived as a document's is.
  * - `reason` (string): `conflict`, `field_conflict`, `delete_wins`, `delete_superseded`,
  *   `delete_refused`, `delete_publication`, `became_publication`, `create_rejected` or
  *   `unmigratable` (set aside while upgrading the database).

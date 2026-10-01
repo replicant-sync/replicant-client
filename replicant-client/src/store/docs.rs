@@ -130,6 +130,7 @@ pub(crate) async fn apply_ops(
     snap: &DocSnapshot,
     ops: &[DocOp],
     envelope: Option<&DocEnvelope>,
+    title_pointer: Option<&str>,
 ) -> StoreResult<Vec<DocNotice>> {
     let id = snap.doc_id.to_string();
     let mut notices = Vec::new();
@@ -234,7 +235,7 @@ pub(crate) async fn apply_ops(
         }
     }
     let after = snap.project(ops);
-    write_document(&mut *conn, snap, &after, envelope).await?;
+    write_document(&mut *conn, snap, &after, envelope, title_pointer).await?;
     if visible_change(snap, &after) {
         append_change_log(&mut *conn, writer, snap.doc_id, !after.exists).await?;
     }
@@ -246,6 +247,7 @@ async fn write_document(
     before: &DocSnapshot,
     after: &DocSnapshot,
     envelope: Option<&DocEnvelope>,
+    title_pointer: Option<&str>,
 ) -> StoreResult<()> {
     let id = before.doc_id.to_string();
     if !after.exists {
@@ -271,7 +273,7 @@ async fn write_document(
              server_seq, read_only, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(id) DO UPDATE SET user_id = excluded.user_id, content = excluded.content, \
-             hash = excluded.hash, title = COALESCE(excluded.title, documents.title), \
+             hash = excluded.hash, title = excluded.title, \
              server_content = excluded.server_content, server_hash = excluded.server_hash, \
              server_seq = excluded.server_seq, read_only = excluded.read_only, \
              updated_at = CASE WHEN documents.content = excluded.content \
@@ -281,7 +283,7 @@ async fn write_document(
         .bind(after.owner_id.map(|owner| owner.to_string()))
         .bind(after.content.to_string())
         .bind(content_hash(&after.content))
-        .bind(title_of(&after.content, envelope))
+        .bind(title_of(&after.content, title_pointer))
         .bind(shadow.map(|s| s.content.to_string()))
         .bind(shadow.map(|s| s.hash.clone()))
         .bind(shadow.map(|s| s.seq))
@@ -396,12 +398,22 @@ pub(crate) async fn refresh_search(conn: &mut SqliteConnection, doc_id: Uuid) ->
     Ok(())
 }
 
-pub(crate) fn title_of(content: &Value, envelope: Option<&DocEnvelope>) -> Option<String> {
+/// The string at `title_pointer` in `content`, cut to `TITLE_MAX_CHARS`; `None` without a
+/// pointer or when the value there is missing or not a string.
+pub(crate) fn title_of(content: &Value, title_pointer: Option<&str>) -> Option<String> {
     content
-        .get("title")
+        .pointer(title_pointer?)
         .and_then(Value::as_str)
         .map(|title| title.chars().take(TITLE_MAX_CHARS).collect())
-        .or_else(|| envelope.and_then(|env| env.title.clone()))
+}
+
+/// RFC 6901: empty, or `/`-separated tokens where `~` only starts `~0` or `~1`.
+pub fn is_json_pointer(text: &str) -> bool {
+    (text.is_empty() || text.starts_with('/'))
+        && text
+            .split('~')
+            .skip(1)
+            .all(|rest| rest.starts_with('0') || rest.starts_with('1'))
 }
 
 fn row_kind_str(kind: RowKind) -> &'static str {
@@ -751,7 +763,8 @@ mod tests {
 
     #[tokio::test]
     async fn title_hash_and_envelope_metadata_follow_the_applied_version() {
-        let t = temp_store().await;
+        let mut t = temp_store().await;
+        t.store.title_pointer = Some("/title".into());
         let mut doc = envelope(DOC, None, json!({"title": "Just Intonation"}), 5);
         doc.author_id = Some(Uuid::from_u128(0xB));
         doc.source_doc_id = Some(Uuid::from_u128(0x5));
@@ -773,6 +786,61 @@ mod tests {
         assert_eq!(hash, content_hash(&json!({"title": "Just Intonation"})));
         assert_eq!(author, Uuid::from_u128(0xB).to_string());
         assert_eq!(source, Uuid::from_u128(0x5).to_string());
+    }
+
+    #[tokio::test]
+    async fn the_server_s_title_is_ignored_and_titles_follow_only_the_pointer() {
+        let mut t = temp_store().await;
+        t.store.title_pointer = Some("/name".into());
+        let title = |store: &crate::store::Store| {
+            let pool = store.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>("SELECT title FROM documents WHERE id = ?")
+                    .bind(DOC.to_string())
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        for (seq, content, expected) in [
+            (5, json!({"name": "First"}), Some("First".to_string())),
+            (6, json!({"body": "no name here"}), None),
+        ] {
+            let mut doc = envelope(DOC, None, content, seq);
+            doc.title = Some("From the server".into());
+            let change = upsert_change(SCOPE_CURATED, doc.clone());
+            apply_with_envelope(&t.store, DOC, Some(&doc), |snap| {
+                apply_change(snap, &change, ME, &APPEND)
+            })
+            .await;
+            assert_eq!(title(&t.store).await, expected, "seq {seq}");
+        }
+    }
+
+    #[test]
+    fn title_of_reads_a_string_at_the_pointer_and_nothing_else() {
+        let content = json!({"title": "T", "meta": {"name": "N", "n": 3}, "a/b": "slash"});
+        let long = json!({"title": "x".repeat(200)});
+        assert_eq!(title_of(&content, None), None);
+        assert_eq!(title_of(&content, Some("")), None, "the whole document");
+        assert_eq!(title_of(&content, Some("/meta/name")).as_deref(), Some("N"));
+        assert_eq!(title_of(&content, Some("/meta/n")), None);
+        assert_eq!(title_of(&content, Some("/missing")), None);
+        assert_eq!(title_of(&content, Some("/a~1b")).as_deref(), Some("slash"));
+        assert_eq!(
+            title_of(&long, Some("/title")).map(|title| title.chars().count()),
+            Some(TITLE_MAX_CHARS)
+        );
+    }
+
+    #[test]
+    fn json_pointers_follow_rfc_6901() {
+        for valid in ["", "/", "/title", "/a/0/b", "/a~0b", "/a~1b"] {
+            assert!(is_json_pointer(valid), "{valid}");
+        }
+        for invalid in ["title", "a/b", "/a~", "/a~2", "~0"] {
+            assert!(!is_json_pointer(invalid), "{invalid}");
+        }
     }
 
     #[tokio::test]

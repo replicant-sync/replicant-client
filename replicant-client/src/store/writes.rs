@@ -43,7 +43,7 @@ impl Store {
         .bind(owner.to_string())
         .bind(content.to_string())
         .bind(content_hash(content))
-        .bind(title_of(content, None))
+        .bind(title_of(content, self.title_pointer.as_deref()))
         .bind(&now)
         .bind(&now)
         .execute(&mut *conn)
@@ -128,12 +128,12 @@ impl Store {
         let snap = load_snapshot(&mut *conn, doc_id).await?;
         check_writable(&snap, read_user_id(&mut *conn).await?)?;
         sqlx::query(
-            "UPDATE documents SET content = ?, hash = ?, title = COALESCE(?, title), updated_at = ? \
+            "UPDATE documents SET content = ?, hash = ?, title = ?, updated_at = ? \
              WHERE id = ?",
         )
         .bind(content.to_string())
         .bind(content_hash(&content))
-        .bind(title_of(&content, None))
+        .bind(title_of(&content, self.title_pointer.as_deref()))
         .bind(now_rfc3339())
         .bind(doc_id.to_string())
         .execute(&mut *conn)
@@ -308,6 +308,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(snapshot(&t.store, doc_id).await.content, json!({"n": 1300}));
+    }
+
+    #[tokio::test]
+    async fn a_local_edit_sets_the_title_from_the_pointer_and_clears_it_when_the_value_goes() {
+        let mut t = temp_store().await;
+        t.store.title_pointer = Some("/name".into());
+        let doc_id = t
+            .store
+            .create_document(None, json!({"name": "Scale"}))
+            .await
+            .unwrap();
+        let title = |store: &Store| {
+            let pool = store.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>("SELECT title FROM documents WHERE id = ?")
+                    .bind(doc_id.to_string())
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(title(&t.store).await.as_deref(), Some("Scale"));
+        t.store
+            .update_document(doc_id, json!({"name": 7}))
+            .await
+            .unwrap();
+        assert_eq!(title(&t.store).await, None);
     }
 
     #[tokio::test]

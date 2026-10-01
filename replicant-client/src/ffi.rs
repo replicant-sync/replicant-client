@@ -84,7 +84,8 @@ pub enum SyncResult {
     ErrorSerialization = -4,
     /// A newer build migrated the database; this build cannot open it.
     ErrorNewerSchema = -5,
-    /// An engine is open on this data dir with a different server, host or list merge config.
+    /// An engine is open on this data dir with a different server, host, list merge config or
+    /// title pointer.
     /// A programming error: every binary on a data dir must pass the same config. Never fall
     /// back to a temporary library.
     ErrorConfigMismatch = -6,
@@ -143,6 +144,13 @@ pub struct ReplicantConfig {
     /// policies `append`, `atomic`, `full`. `*` matches one key or index; the rule with the most
     /// literal segments wins, a tie goes to the first listed.
     pub list_merge_rules_json: *const c_char,
+    /// May be null (`""` counts as null). An RFC 6901 JSON Pointer, e.g. "/title", to the string
+    /// in each document's content that is its `title`: in reads, callbacks, kept copies and the
+    /// `title:` search field. Null: the library assigns no titles. Anything else that is not a
+    /// JSON Pointer is refused (`ErrorInvalidInput`). Every handle on a data dir must pass the
+    /// same pointer (`ErrorConfigMismatch`); opening a database whose titles came from another
+    /// pointer recomputes every title and the search index once.
+    pub title_pointer: *const c_char,
 }
 
 /// Merge policy for a list changed on both sides. `ReplicantListMerge_Full` is refused for now.
@@ -260,8 +268,8 @@ pub struct ReplicantState {
 
 /// The ABI 1.0 struct sizes: later versions append fields and keep accepting these.
 // A field added after 1.0 is read through a raw pointer, and only when `struct_size` covers it.
-const CONFIG_SIZE_V1_0: usize = std::mem::offset_of!(ReplicantConfig, list_merge_rules_json)
-    + std::mem::size_of::<*const c_char>();
+const CONFIG_SIZE_V1_0: usize =
+    std::mem::offset_of!(ReplicantConfig, title_pointer) + std::mem::size_of::<*const c_char>();
 const STATE_SIZE_V1_0: usize =
     std::mem::offset_of!(ReplicantState, halt_reason) + std::mem::size_of::<ReplicantHaltReason>();
 
@@ -434,9 +442,11 @@ pub unsafe extern "C" fn replicant_create(
         else {
             return SyncResult::ErrorInvalidInput;
         };
-        let (Some(list_merge), Ok(fallback_email)) =
-            (list_merge_arg(config), nullable_str_arg(config.email))
-        else {
+        let (Some(list_merge), Ok(fallback_email), Ok(title_pointer)) = (
+            list_merge_arg(config),
+            nullable_str_arg(config.email),
+            nullable_str_arg(config.title_pointer),
+        ) else {
             return SyncResult::ErrorInvalidInput;
         };
         let host_config = HostConfig {
@@ -449,6 +459,9 @@ pub unsafe extern "C" fn replicant_create(
             host_app: host_app.to_string(),
             host_version: host_version.to_string(),
             list_merge,
+            title_pointer: title_pointer
+                .filter(|pointer| !pointer.is_empty())
+                .map(str::to_string),
         };
         match host::attach(host_config) {
             Ok(handle) => {
@@ -687,8 +700,8 @@ pub unsafe extern "C" fn replicant_delete_document(
 /// - `id` (string): the document's id.
 /// - `owner_id` (string or null): the owning user; null only for a legacy document with none.
 /// - `author_id` (string or null): the author the server reports; null until it has synced.
-/// - `title` (string or null): the content's `title` string, cut to 128 characters, else
-///   the title the server sent.
+/// - `title` (string or null): the string at `ReplicantConfig.title_pointer` in the content,
+///   cut to 128 characters; null without a pointer or when that value is not a string.
 /// - `content`: the host's own JSON value, as last written or synced.
 /// - `read_only` (bool): the server marked it read-only (a publication); writes are refused.
 /// - `visibility` (string): `public` (curated or read-only) or `private`.
@@ -932,7 +945,8 @@ pub unsafe extern "C" fn replicant_configure_search(
     })
 }
 
-/// FTS5 query (`music`, `tun*`, `"a phrase"`, `a AND b`, `title:word`); `limit` 0 means 100. A
+/// FTS5 query (`music`, `tun*`, `"a phrase"`, `a AND b`, `title:word`, where `title` is the
+/// document's title from `ReplicantConfig.title_pointer`); `limit` 0 means 100. A
 /// query FTS5 cannot parse is `ErrorInvalidInput`. The result is a JSON array of document
 /// objects (see `replicant_get_document`), best match first.
 ///
@@ -986,7 +1000,7 @@ pub unsafe extern "C" fn replicant_rebuild_search_index(handle: *mut Replicant) 
 struct KeptCopyJson<'a> {
     recovered_id: i64,
     doc_id: Uuid,
-    title: Option<&'a str>,
+    title: Option<String>,
     reason: &'a str,
     recovered_at: i64,
     content: &'a Value,
@@ -996,7 +1010,7 @@ struct KeptCopyJson<'a> {
 /// Kept copies (local content sync set aside), newest first, as a JSON array of objects:
 /// - `recovered_id` (integer): the copy's id, for `replicant_dismiss_recovered` and the restores.
 /// - `doc_id` (string): the document the copy was kept from (it may since have been deleted).
-/// - `title` (string or null): the kept content's `title`, when it is a string.
+/// - `title` (string or null): the kept content's title, derived as a document's is.
 /// - `reason` (string): `conflict`, `field_conflict`, `delete_wins`, `delete_superseded`,
 ///   `delete_refused`, `delete_publication`, `became_publication`, `create_rejected` or
 ///   `unmigratable` (set aside while upgrading the database).
@@ -1030,7 +1044,7 @@ pub unsafe extern "C" fn replicant_list_recovered(
                     .map(|copy| KeptCopyJson {
                         recovered_id: copy.id,
                         doc_id: copy.doc_id,
-                        title: copy.content.get("title").and_then(Value::as_str),
+                        title: store.title_of(&copy.content),
                         reason: &copy.reason,
                         recovered_at: copy.recovered_at,
                         content: &copy.content,
@@ -1598,6 +1612,8 @@ mod tests {
     fn this_version_s_structs_are_the_abi_1_0_sizes() {
         assert_eq!(std::mem::size_of::<ReplicantConfig>(), CONFIG_SIZE_V1_0);
         assert_eq!(std::mem::size_of::<ReplicantState>(), STATE_SIZE_V1_0);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!((CONFIG_SIZE_V1_0, STATE_SIZE_V1_0), (80, 16));
     }
 
     #[test]
@@ -1657,6 +1673,7 @@ mod tests {
             host_version: strings[5].as_ptr(),
             list_merge: 0,
             list_merge_rules_json: ptr::null(),
+            title_pointer: ptr::null(),
         };
         let mut handle = ptr::null_mut();
         assert_eq!(

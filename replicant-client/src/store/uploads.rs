@@ -39,7 +39,15 @@ impl Store {
             rules::BuildResult::NeedsServerCopy => BuildOutcome::NeedsServerCopy,
             rules::BuildResult::Nothing => BuildOutcome::Nothing,
             rules::BuildResult::SettleLocally(ops) => {
-                apply_ops(&mut tx, &self.writer(LogOrigin::Server), &snap, &ops, None).await?;
+                apply_ops(
+                    &mut tx,
+                    &self.writer(LogOrigin::Server),
+                    &snap,
+                    &ops,
+                    None,
+                    self.title_pointer.as_deref(),
+                )
+                .await?;
                 BuildOutcome::SettledLocally {
                     rows_remain: !snap.project(&ops).rows.is_empty(),
                 }
@@ -88,7 +96,15 @@ impl Store {
         ) {
             rules::SettleResult::Ops(ops) => {
                 let writer = self.writer(LogOrigin::Server);
-                let notices = apply_ops(&mut tx, &writer, &snap, &ops, reply.as_ref().ok()).await?;
+                let notices = apply_ops(
+                    &mut tx,
+                    &writer,
+                    &snap,
+                    &ops,
+                    reply.as_ref().ok(),
+                    self.title_pointer.as_deref(),
+                )
+                .await?;
                 let rows_remain = !snap.project(&ops).rows.is_empty();
                 (
                     SettleOutcome::Done {
@@ -146,6 +162,7 @@ impl Store {
             &snap,
             &ops,
             envelope,
+            self.title_pointer.as_deref(),
         )
         .await?;
         tx.commit().await?;

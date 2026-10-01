@@ -81,12 +81,13 @@ public:
         std::string host_version;  ///< e.g. "2.0.1 CLAP"
         ReplicantListMerge list_merge = ReplicantListMerge_Append; ///< When no rule matches.
         std::string list_merge_rules_json; ///< e.g. [{"path":"/pitches","policy":"append"}]; may be empty.
+        std::string title_pointer; ///< JSON Pointer to each document's title, e.g. "/title"; empty: no titles.
     };
 
     /** Opens the data dir (migrating it after an upgrade). Throws SyncException; its result()
         is ReplicantSyncResult_ErrorNewerSchema when a newer build migrated the database, and
         ReplicantSyncResult_ErrorInvalidInput for a list merge config the engine refuses
-        (ReplicantListMerge_Full, a malformed rule). It is also ErrorInvalidInput when the
+        (ReplicantListMerge_Full, a malformed rule) or a title_pointer that is not a JSON Pointer. It is also ErrorInvalidInput when the
         library's ABI major differs from this header's or its minor is older: the library and
         header were packaged from different versions. Call state() next. */
     explicit Client(const Config& config)
@@ -105,6 +106,7 @@ public:
         c_config.host_version = config.host_version.c_str();
         c_config.list_merge = static_cast<int32_t>(config.list_merge);
         c_config.list_merge_rules_json = config.list_merge_rules_json.empty() ? nullptr : config.list_merge_rules_json.c_str();
+        c_config.title_pointer = config.title_pointer.empty() ? nullptr : config.title_pointer.c_str();
         Replicant* raw_handle = nullptr;
         check(replicant_create(&c_config, &raw_handle));
         m_handle.reset(raw_handle);

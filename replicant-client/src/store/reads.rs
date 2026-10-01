@@ -17,7 +17,7 @@ pub(crate) const UPDATE_FTS_ENTRY: &str = "INSERT INTO documents_fts (document_i
      SELECT d.id, COALESCE(d.title, ''), COALESCE((SELECT GROUP_CONCAT(json_extract(d.content, \
      sc.json_path), ' ') FROM search_config sc WHERE json_extract(d.content, sc.json_path) IS NOT NULL), '') \
      FROM documents d WHERE d.id = ? AND d.deleted_at IS NULL";
-const REBUILD_FTS_INDEX: &str = "INSERT INTO documents_fts (document_id, title, body) \
+pub(crate) const REBUILD_FTS_INDEX: &str = "INSERT INTO documents_fts (document_id, title, body) \
      SELECT d.id, COALESCE(d.title, ''), COALESCE((SELECT GROUP_CONCAT(json_extract(d.content, \
      sc.json_path), ' ') FROM search_config sc WHERE json_extract(d.content, sc.json_path) IS NOT NULL), '') \
      FROM documents d WHERE d.deleted_at IS NULL";
@@ -220,7 +220,8 @@ mod tests {
 
     #[tokio::test]
     async fn get_document_returns_the_host_view_and_hides_a_pending_delete() {
-        let t = temp_store().await;
+        let mut t = temp_store().await;
+        t.store.title_pointer = Some("/title".into());
         let doc_id = t
             .store
             .create_document(None, json!({"title": "Mine", "n": 1}))

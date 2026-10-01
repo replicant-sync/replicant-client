@@ -44,6 +44,7 @@ fn config(data_dir: &Path, server_url: &str) -> HostConfig {
         host_app: "Test Host".into(),
         host_version: "1.0".into(),
         list_merge: ListMergeConfig::default(),
+        title_pointer: Some("/title".into()),
     }
 }
 

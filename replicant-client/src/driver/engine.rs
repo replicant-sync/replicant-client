@@ -25,7 +25,9 @@ use crate::engine::machine::{
 };
 use crate::engine::types::ServerError;
 use crate::store::change_log::{ChangeLogReader, ChangeOrigin, DocChange, LogRead};
-use crate::store::{now_unix, DocNotice, IdentityCheck, Store, StoreError, StoreResult};
+use crate::store::{
+    is_json_pointer, now_unix, DocNotice, IdentityCheck, Store, StoreError, StoreResult,
+};
 use crate::transport::connection::{Connection, Received};
 use crate::transport::socket::SocketEvent;
 use crate::transport::wire::{socket_url, user_agent, JoinAuth};
@@ -61,6 +63,8 @@ pub struct EngineConfig {
     pub jitter_seed: u64,
     /// How lists that both this device and another changed are merged. Local to this device.
     pub list_merge: ListMergeConfig,
+    /// JSON Pointer to each document's title in its content; `None`: documents have no title.
+    pub title_pointer: Option<String>,
 }
 
 /// Idempotent, so a full command queue loses nothing.
@@ -220,8 +224,16 @@ impl Owner {
     ) -> Result<(Owner, Controls), EngineError> {
         config.list_merge.validate().map_err(EngineError::Config)?;
         socket_url(&config.server_url, Uuid::nil()).map_err(EngineError::Config)?;
+        if let Some(pointer) = config.title_pointer.as_deref() {
+            if !is_json_pointer(pointer) {
+                return Err(EngineError::Config(format!(
+                    "title pointer is not a JSON Pointer: {pointer}"
+                )));
+            }
+        }
         let mut store = retry_open(|| Store::open(db_path)).await?;
         store.list_merge = config.list_merge.clone();
+        store.title_pointer = config.title_pointer.clone();
         let store = Arc::new(store);
         match Self::prepare(store.clone(), config, events).await {
             Ok(opened) => Ok(opened),
@@ -238,6 +250,9 @@ impl Owner {
         events: mpsc::UnboundedSender<EngineEvent>,
     ) -> Result<(Owner, Controls), EngineError> {
         let client_id = store.ensure_user_config(&config.server_url).await?;
+        if store.apply_title_pointer().await? {
+            info!(pointer = ?store.title_pointer, "recomputed every title for a new title pointer");
+        }
         let url = socket_url(&config.server_url, client_id).map_err(EngineError::Config)?;
         let me = store.user_id().await?;
         let scopes = store.subscribed_scopes().await?;

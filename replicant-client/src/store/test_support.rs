@@ -90,6 +90,7 @@ pub(crate) async fn apply_with_envelope(
         &snap,
         &ops,
         envelope,
+        store.title_pointer.as_deref(),
     )
     .await
     .unwrap();

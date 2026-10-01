@@ -23,7 +23,7 @@ use crate::driver::engine::{Command, CredentialLoader, Engine, EngineConfig, Eng
 use crate::engine::list_merge::ListMergeConfig;
 use crate::engine::machine::EngineState;
 use crate::secret_store;
-use crate::store::Store;
+use crate::store::{is_json_pointer, Store};
 use crate::transport::wire::JoinAuth;
 use fanout::{EventQueue, FanOut};
 
@@ -52,6 +52,8 @@ pub struct HostConfig {
     pub host_version: String,
     /// How lists both sides changed are merged; one policy per engine.
     pub list_merge: ListMergeConfig,
+    /// JSON Pointer to each document's title; `None`: no titles. One per engine.
+    pub title_pointer: Option<String>,
 }
 
 impl HostConfig {
@@ -62,6 +64,7 @@ impl HostConfig {
             && self.host_app == other.host_app
             && self.host_version == other.host_version
             && self.list_merge == other.list_merge
+            && self.title_pointer == other.title_pointer
     }
 }
 
@@ -112,6 +115,7 @@ impl Shared {
             credentials: credential_loader(data_dir, config.fallback_email.clone()),
             jitter_seed: rand::random(),
             list_merge: config.list_merge.clone(),
+            title_pointer: config.title_pointer.clone(),
         };
         let engine = runtime
             .block_on(Engine::start(&key, engine_config, events_tx))
@@ -164,6 +168,13 @@ impl Shared {
 /// from inside a tokio runtime.
 pub fn attach(config: HostConfig) -> Result<Handle, OpenError> {
     config.list_merge.validate().map_err(OpenError::Config)?;
+    if let Some(pointer) = config.title_pointer.as_deref() {
+        if !is_json_pointer(pointer) {
+            return Err(OpenError::Config(format!(
+                "title pointer is not a JSON Pointer: {pointer}"
+            )));
+        }
+    }
     if Path::new(&config.database_file).file_name() != Some(OsStr::new(&config.database_file)) {
         return Err(OpenError::Config(format!(
             "database_file must be a file name: {}",

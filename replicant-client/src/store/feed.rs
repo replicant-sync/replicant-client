@@ -43,7 +43,17 @@ impl Store {
         for change in changes {
             let snap = load_snapshot(&mut tx, change.doc_id).await?;
             let ops = apply_change(&snap, change, me, &self.list_merge);
-            notices.extend(apply_ops(&mut tx, &writer, &snap, &ops, change.doc.as_ref()).await?);
+            notices.extend(
+                apply_ops(
+                    &mut tx,
+                    &writer,
+                    &snap,
+                    &ops,
+                    change.doc.as_ref(),
+                    self.title_pointer.as_deref(),
+                )
+                .await?,
+            );
         }
         advance_cursor(&mut tx, scope, new_cursor).await?;
         tx.commit().await?;
@@ -64,7 +74,17 @@ impl Store {
         for doc in docs {
             let snap = load_snapshot(&mut tx, doc.doc_id).await?;
             let ops = apply_snapshot_doc(&snap, scope, doc, me, &self.list_merge);
-            notices.extend(apply_ops(&mut tx, &writer, &snap, &ops, Some(doc)).await?);
+            notices.extend(
+                apply_ops(
+                    &mut tx,
+                    &writer,
+                    &snap,
+                    &ops,
+                    Some(doc),
+                    self.title_pointer.as_deref(),
+                )
+                .await?,
+            );
         }
         tx.commit().await?;
         Ok(notices)
@@ -95,7 +115,15 @@ impl Store {
             }
             let snap = load_snapshot(&mut tx, doc_id).await?;
             let ops = sweep_doc(&snap, scope, snapshot_seq);
-            apply_ops(&mut tx, &writer, &snap, &ops, None).await?;
+            apply_ops(
+                &mut tx,
+                &writer,
+                &snap,
+                &ops,
+                None,
+                self.title_pointer.as_deref(),
+            )
+            .await?;
         }
         advance_cursor(&mut tx, scope, snapshot_seq).await?;
         tx.commit().await?;

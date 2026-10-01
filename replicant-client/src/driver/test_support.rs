@@ -109,6 +109,7 @@ pub(crate) fn config(server_url: &str, credentials: CredentialLoader) -> EngineC
         credentials,
         jitter_seed: 7,
         list_merge: ListMergeConfig::default(),
+        title_pointer: Some("/title".into()),
     }
 }
 
