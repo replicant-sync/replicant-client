@@ -462,7 +462,7 @@ fn damaged_credentials_at_attach_halt_until_a_sign_in_the_recheck_reads() {
     let (_server_runtime, server) = live_server();
     let dir = tempfile::tempdir().unwrap();
     sign_in(dir.path(), "k1");
-    // What a read racing a sign-in by another process can see: a new key, the old credentials.
+    // Credentials that no longer decrypt with the stored key, as after corruption.
     std::fs::write(dir.path().join("credentials.enc"), [7u8; 40]).unwrap();
     let handle = attach(config(dir.path(), &server.url)).unwrap();
     assert!(halted_not_enrolled(&handle), "{:?}", handle.state());
