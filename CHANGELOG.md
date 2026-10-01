@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 - 2026-10-01
 
 ### Breaking: protocol v2 and C API v2 (server 0.5.0 required)
 - One engine per data dir per process, shared by every handle; `replicant_create` takes a `ReplicantConfig` and never waits on the network.
@@ -12,6 +12,11 @@
 - Removed: the v1 client, `replicant-core`, `replicant-seed`, the JUCE wrapper; `replicant_store_credentials`, `replicant_load_credentials` and `REPLICANT_CREDENTIAL_MAX_LEN` (secrets never cross the C API: sign in with `replicant_enroll_claim`, sign out with `replicant_clear_credentials`, and read sign-in status from `replicant_get_state` and `replicant_get_user_id`).
 - The first open migrates a v1 database, after copying it to `<database>.v1-backup` (or `<database>.v1-backup-<unix seconds>` when that exists; a backup is never replaced, and a second is written only for a file restored from a backup); rows it cannot read are kept as `unmigratable` copies. After that, older builds cannot open it (`VersionMissing`): upgrade the app and every plugin format together and quit hosts before installing.
 - Titles: the library knows no content keys. `ReplicantConfig.title_pointer` (a JSON Pointer, e.g. `"/title"`) names the string that is a document's `title` in reads, callbacks, kept copies and the `title:` search field; without it every title is null. The server's title is no longer used. Every process on a data dir must pass the same pointer: the shared-engine check (`ErrorConfigMismatch`) covers handles in one process only, so a different pointer in another process is not detected. Each launch with a different pointer recomputes every title and the search index, and titles end up mixed while both run (migration 016 records the pointer used).
+
+### Tests and CI
+- The interop suite runs against a v2 Phoenix server (pinned at server 0.5.0) through `test/run_phoenix_interop_local.sh`: sync order, two devices, offline edits, merges, numbers, curated documents, auth, identity, two online processes on one data dir, and recovery from a connection that silently stops passing data. The harness uses its own throwaway database (`replicant_interop_v2`, set with `INTEROP_DB_NAME`) and never touches the server's `replicant_server_test`.
+- CI: an `interop` job runs this suite against a v2 server. A `release-link` job on Linux, macOS and Windows links a consumer binary with dead-strip and strip, then checks that it still carries `replicant-client-version=<version>` and resolves the bundled `sqlite3_*` symbols. The macOS job also counts the library's threads.
+- Removed: `.gitlab-ci.yml`.
 
 ## 0.6.4
 

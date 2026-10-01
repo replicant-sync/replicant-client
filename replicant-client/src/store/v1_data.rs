@@ -14,7 +14,7 @@ use super::{now_unix, StoreError, StoreResult};
 use crate::engine::hash::{canonicalise_numbers, content_hash};
 use crate::engine::types::{SCOPE_CURATED, SCOPE_OWN};
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(crate) struct Counts {
     synced: usize,
     hard_deleted: usize,
@@ -1250,6 +1250,35 @@ mod tests {
         let counts = super::migrate_v1_data(&raw).await.unwrap();
         raw.close().await;
         (Store::open(path).await.unwrap(), counts)
+    }
+
+    /// Runs 015 over a copy of the v1 database at `REPLICANT_MIGRATION_PROBE_DB` and prints
+    /// the counts and the resulting rows. Never point it at a live database.
+    #[tokio::test]
+    #[ignore = "probe: set REPLICANT_MIGRATION_PROBE_DB to a v1 database copy"]
+    async fn probe_a_v1_database_copy() {
+        let source = std::env::var("REPLICANT_MIGRATION_PROBE_DB").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe.sqlite3");
+        std::fs::copy(&source, &path).unwrap();
+        let pool = raw_pool(&path).await;
+        let (store, counts) = migrated_with_counts(pool, &path).await;
+        println!("COUNTS {counts:?}");
+        let raw = raw_pool(&path).await;
+        for sql in [
+            "SELECT 'documents', COUNT(*) FROM documents",
+            "SELECT 'soft_deleted', COUNT(*) FROM documents WHERE deleted_at IS NOT NULL",
+            "SELECT 'outbox', COUNT(*) FROM outbox",
+            "SELECT 'recovered:' || reason, COUNT(*) FROM recovered GROUP BY reason",
+            "SELECT 'null_shadow', COUNT(*) FROM documents WHERE server_content IS NULL",
+        ] {
+            for row in sqlx::query(sql).fetch_all(&raw).await.unwrap() {
+                use sqlx::Row;
+                println!("ROW {} {}", row.get::<String, _>(0), row.get::<i64, _>(1));
+            }
+        }
+        raw.close().await;
+        store.close().await;
     }
 
     #[tokio::test]

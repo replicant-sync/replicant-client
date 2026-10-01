@@ -64,10 +64,42 @@ fn live_thread_count() -> Option<usize> {
     }
 }
 
-#[cfg(not(any(windows, target_os = "linux")))]
+// `ps -M` is not runnable in sandboxed shells, so ask the kernel directly.
+#[cfg(target_os = "macos")]
 fn live_thread_count() -> Option<usize> {
-    // No cheap dependency-free thread enumeration here; the timing assertions
-    // still run, the thread-count ones are skipped.
+    extern "C" {
+        fn mach_task_self() -> u32;
+        fn task_threads(task: u32, threads: *mut *mut u32, count: *mut u32) -> i32;
+        fn mach_port_deallocate(task: u32, name: u32) -> i32;
+        fn vm_deallocate(task: u32, address: usize, size: usize) -> i32;
+    }
+    let mut threads: *mut u32 = std::ptr::null_mut();
+    let mut count: u32 = 0;
+    // SAFETY: task_threads fills `threads` with `count` port names that we release below.
+    unsafe {
+        let task = mach_task_self();
+        let status = task_threads(task, &mut threads, &mut count);
+        if status != 0 {
+            eprintln!(
+                "!! THREAD-COUNT ASSERTIONS SKIPPED: task_threads failed ({status}) — the \
+                 thread-lifetime guarantee is NOT checked on this run"
+            );
+            return None;
+        }
+        for i in 0..count as usize {
+            mach_port_deallocate(task, *threads.add(i));
+        }
+        vm_deallocate(
+            task,
+            threads as usize,
+            count as usize * std::mem::size_of::<u32>(),
+        );
+    }
+    Some(count as usize)
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn live_thread_count() -> Option<usize> {
     None
 }
 
