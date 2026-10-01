@@ -395,9 +395,11 @@ typedef struct ReplicantConfig {
    * May be null (`""` counts as null). An RFC 6901 JSON Pointer, e.g. "/title", to the string
    * in each document's content that is its `title`: in reads, callbacks, kept copies and the
    * `title:` search field. Null: the library assigns no titles. Anything else that is not a
-   * JSON Pointer is refused (`ErrorInvalidInput`). Every handle on a data dir must pass the
-   * same pointer (`ErrorConfigMismatch`); opening a database whose titles came from another
-   * pointer recomputes every title and the search index once.
+   * JSON Pointer is refused (`ErrorInvalidInput`). The shared-engine check
+   * (`ErrorConfigMismatch`) covers handles in one process. Every process on a data dir must
+   * pass the same pointer: a different pointer in another process is not detected, each launch
+   * with one recomputes every title and the search index, and titles end up mixed while both
+   * run.
    */
   const char *title_pointer;
 } ReplicantConfig;
