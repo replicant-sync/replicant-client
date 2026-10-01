@@ -340,10 +340,11 @@ typedef int32_t ReplicantSyncResult;
 #endif // __cplusplus
 
 /**
- * Opaque handle. Every call except `replicant_process_events` and the
- * `replicant_register_*_callback` calls is thread-safe; those run only on the thread the first
- * registration bound. Never call from an audio thread: every read and write is a SQLite
- * transaction.
+ * Opaque handle. Every call except `replicant_process_events`, the
+ * `replicant_register_*_callback` calls and the destroy calls is thread-safe; the first two run
+ * only on the thread the first registration bound, and a destroy must not overlap any other
+ * call on the handle (see `replicant_destroy`). Never call from an audio thread: every read and
+ * write is a SQLite transaction.
  */
 typedef struct Replicant Replicant;
 
@@ -509,9 +510,12 @@ ReplicantSyncResult replicant_create(const struct ReplicantConfig *config,
 
 /**
  * Detaches and frees the handle. Returns at once: when this was the engine's last handle, the
- * engine stops on a Replicant thread afterwards (never waiting on the network). Called from
- * inside one of this handle's callbacks, the free happens when `replicant_process_events`
- * returns.
+ * engine stops on a Replicant thread afterwards (never waiting on the network).
+ *
+ * A destroy must not overlap any other call on this handle, on any thread: the host ends every
+ * other use of the handle first. The one exception is a destroy from inside one of this
+ * handle's callbacks, which is deferred: the free happens when `replicant_process_events`
+ * returns. Other handles, including those on the same data dir, are unaffected.
  *
  * Unloading: library code can still run after this returns, and even after
  * `replicant_destroy_and_wait` returns true, because a DNS lookup the engine started finishes
@@ -527,9 +531,9 @@ void replicant_destroy(struct Replicant *handle);
 /**
  * `replicant_destroy`, then waits up to `timeout_ms` for the engine to stop and its runtime to
  * shut down. True when it has, or when other handles keep the engine running. It does not make
- * unloading safe (see `replicant_destroy`). While this handle's `replicant_process_events` is
- * running (from inside a callback, or on another thread) it cannot wait: it returns false at
- * once and the handle is freed when the pump returns.
+ * unloading safe (see `replicant_destroy`). The same overlap rule applies. Called from inside
+ * one of this handle's callbacks it cannot wait: it returns false at once and the handle is
+ * freed when `replicant_process_events` returns.
  *
  * # Safety
  * As `replicant_destroy`.
@@ -798,8 +802,9 @@ ReplicantSyncResult replicant_register_conflict_callback(struct Replicant *handl
 
 /**
  * Runs the callbacks for every queued event. Must be called on the thread of the handle's first
- * registration (a null one binds too): refused with `ErrorWrongThread` elsewhere and
- * `ErrorNoCallbacks` before any registration; nothing is lost either way. The thread cannot be changed later. A
+ * registration (a null one binds too): refused with `ErrorWrongThread` elsewhere, without
+ * disturbing a pump running on the bound thread, and `ErrorNoCallbacks` before any
+ * registration; nothing is lost either way. The thread cannot be changed later. A
  * `replicant_destroy` of this handle from inside a callback frees it when this call returns;
  * the rest of the batch is not delivered. A call from inside a callback returns
  * `ErrorInvalidInput`. No rebind: if the registering thread ends, register again on a new

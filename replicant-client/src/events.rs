@@ -281,13 +281,7 @@ impl Dispatcher {
         take: impl FnOnce() -> Vec<HostEvent>,
         stop: impl Fn() -> bool,
     ) -> Result<usize, DispatchError> {
-        match lock(&self.0).thread {
-            None => return Err(DispatchError::NoCallbacks),
-            Some(registered) if registered != thread::current().id() => {
-                return Err(DispatchError::WrongThread)
-            }
-            Some(_) => {}
-        }
+        self.may_process()?;
         let mut delivered = 0;
         for event in take() {
             if stop() {
@@ -298,6 +292,17 @@ impl Dispatcher {
             delivered += 1;
         }
         Ok(delivered)
+    }
+
+    /// Whether `process` may run on this thread. The bound thread never changes once set.
+    pub fn may_process(&self) -> Result<(), DispatchError> {
+        match lock(&self.0).thread {
+            None => Err(DispatchError::NoCallbacks),
+            Some(registered) if registered != thread::current().id() => {
+                Err(DispatchError::WrongThread)
+            }
+            Some(_) => Ok(()),
+        }
     }
 }
 

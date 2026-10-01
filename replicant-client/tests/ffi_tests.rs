@@ -534,6 +534,79 @@ fn process_events_on_another_thread_is_refused_and_keeps_the_events() {
     close(handle);
 }
 
+/// Holds the first callback until another thread has had its turn.
+struct Gate {
+    entered: std::sync::mpsc::Sender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    held: std::sync::atomic::AtomicBool,
+}
+
+extern "C" fn on_document_held(
+    _event_type: EventType,
+    _document_id: *const c_char,
+    _title: *const c_char,
+    _content: *const c_char,
+    _owner_id: *const c_char,
+    _author_id: *const c_char,
+    _visibility: *const c_char,
+    _read_only: bool,
+    _origin: EventOrigin,
+    context: *mut c_void,
+) {
+    let gate = unsafe { &*(context as *const Gate) };
+    if !gate.held.swap(true, Ordering::SeqCst) {
+        gate.entered.send(()).unwrap();
+        gate.release.lock().unwrap().recv().unwrap();
+    }
+}
+
+#[test]
+fn process_events_on_another_thread_during_a_pump_is_refused_as_wrong_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let handle = open(dir.path());
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let gate = Gate {
+        entered: entered_tx,
+        release: Mutex::new(release_rx),
+        held: std::sync::atomic::AtomicBool::new(false),
+    };
+    assert_eq!(
+        unsafe {
+            replicant_register_document_callback(
+                handle,
+                Some(on_document_held),
+                &gate as *const Gate as *mut c_void,
+                1,
+            )
+        },
+        SyncResult::Success
+    );
+    create_doc(handle, "{}");
+    let address = handle as usize;
+    let other = std::thread::spawn(move || {
+        entered_rx.recv().unwrap();
+        let result =
+            unsafe { replicant_process_events(address as *mut Replicant, ptr::null_mut()) };
+        release_tx.send(()).unwrap();
+        result
+    });
+    wait_until("the held callback", || {
+        assert_eq!(
+            unsafe { replicant_process_events(handle, ptr::null_mut()) },
+            SyncResult::Success
+        );
+        gate.held.load(Ordering::SeqCst)
+    });
+    assert_eq!(other.join().unwrap(), SyncResult::ErrorWrongThread);
+    assert_eq!(
+        unsafe { replicant_process_events(handle, ptr::null_mut()) },
+        SyncResult::Success,
+        "the pump is free again"
+    );
+    close(handle);
+}
+
 #[test]
 fn search_finds_configured_paths() {
     let dir = tempfile::tempdir().unwrap();

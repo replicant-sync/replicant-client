@@ -18,4 +18,4 @@ Register callbacks on a handle, then call `replicant_process_events` from the sa
 - **`DatabaseChanged`:** changes were trimmed before this engine read them, or this handle fell 4096 events behind (its document events were collapsed); reload every list.
 - **Conflicts** are raised only in the process that applied the rule; every process sees the kept copy in `replicant_list_recovered`, the source of truth. A `recovered_id` may already be dismissed or restored elsewhere (`ErrorNotFound`).
 - **State** for a status indicator comes from `replicant_get_state`, not from counting events; call it right after `replicant_create`. Parked documents come from `replicant_list_parked` and are not in `replicant_count_pending_sync`.
-- **Destroy** inside a callback is allowed: the handle is freed when `replicant_process_events` returns.
+- **Destroy** inside a callback is allowed: the handle is freed when `replicant_process_events` returns. Anywhere else a destroy must not overlap any other call on that handle, on any thread.
