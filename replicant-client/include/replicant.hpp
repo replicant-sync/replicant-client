@@ -308,7 +308,10 @@ private:
 // Enrollment and sign-out (no Client needed). The api key and secret never leave the library;
 // a Client's state() and get_user_id() say who is signed in.
 
-/** Asks the server to email a one-time enrollment code. Blocks for the HTTP round trip. */
+/** Asks the server to email a one-time enrollment code. Blocks for the HTTP round trip.
+    Returns ErrorInvalidInput for a bad email or a non-https base_url (localhost excepted) and
+    ErrorConnection when the server cannot be reached or refuses (429 included); see
+    replicant_enroll_request. */
 inline SyncResult request_enrollment(const std::string& base_url, const std::string& email)
 {
     return replicant_enroll_request(base_url.c_str(), email.c_str());

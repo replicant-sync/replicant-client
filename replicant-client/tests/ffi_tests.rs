@@ -951,6 +951,65 @@ fn claim_server(status: u16, hits: u64) -> (tokio::runtime::Runtime, wiremock::M
     (runtime, server, user_id)
 }
 
+fn enroll_request(base_url: &str, email: &str) -> SyncResult {
+    unsafe { replicant_enroll_request(c(base_url).as_ptr(), c(email).as_ptr()) }
+}
+
+#[test]
+fn enroll_request_refuses_bad_input_before_the_server_and_reports_refusals_as_connection() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let server_for = |status: u16| {
+        runtime.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/enroll/request"))
+                .respond_with(ResponseTemplate::new(status))
+                .mount(&server)
+                .await;
+            server
+        })
+    };
+    let accepting = server_for(202);
+    assert_eq!(
+        enroll_request(&accepting.uri(), "a@b.c"),
+        SyncResult::Success
+    );
+    assert_eq!(
+        enroll_request("http://example.com", "a@b.c"),
+        SyncResult::ErrorInvalidInput,
+        "plain http off localhost"
+    );
+    assert_eq!(
+        enroll_request("not a url", "a@b.c"),
+        SyncResult::ErrorInvalidInput
+    );
+    assert_eq!(
+        enroll_request(&accepting.uri(), ""),
+        SyncResult::ErrorInvalidInput
+    );
+    let too_long = format!("{}@b.c", "a".repeat(REPLICANT_EMAIL_MAX_LEN));
+    assert_eq!(
+        enroll_request(&accepting.uri(), &too_long),
+        SyncResult::ErrorInvalidInput
+    );
+    assert_eq!(
+        unsafe { replicant_enroll_request(ptr::null(), c("a@b.c").as_ptr()) },
+        SyncResult::ErrorInvalidInput
+    );
+    let received = runtime.block_on(accepting.received_requests()).unwrap();
+    assert_eq!(received.len(), 1, "refused input never reaches the server");
+    for status in [400, 429, 500] {
+        assert_eq!(
+            enroll_request(&server_for(status).uri(), "a@b.c"),
+            SyncResult::ErrorConnection,
+            "status {status}"
+        );
+    }
+}
+
 fn claim(server: &wiremock::MockServer, data_dir: &Path) -> (SyncResult, String) {
     let mut user_id = [0 as c_char; REPLICANT_USER_ID_LEN + 1];
     let result = unsafe {

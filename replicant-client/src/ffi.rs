@@ -78,7 +78,7 @@ fn guard(body: impl FnOnce() -> SyncResult) -> SyncResult {
 pub enum SyncResult {
     Success = 0,
     ErrorInvalidInput = -1,
-    /// Enrollment only: the server could not be reached.
+    /// Enrollment only: the server could not be reached, or answered with an unexpected status.
     ErrorConnection = -2,
     ErrorDatabase = -3,
     ErrorSerialization = -4,
@@ -1340,9 +1340,17 @@ pub extern "C" fn replicant_get_version() -> *const c_char {
 
 // ===== Enrollment and sign-out =====
 
-/// Requests an enrollment token be emailed to `email`. Needs no handle. Blocks the calling
-/// thread for the HTTP round trip (up to about 10 s to connect and 30 s for the request); never
-/// call it from an audio or UI thread.
+/// Asks the server to email an enrollment code to `email`. Needs no handle. Results:
+/// - `Success`: the server accepted the request (HTTP 202).
+/// - `ErrorInvalidInput`: a null or non-UTF-8 argument, an empty or over-long email, or a
+///   `base_url` that is not https (`http://localhost` and `http://127.0.0.1` excepted). The
+///   server is not contacted.
+/// - `ErrorConnection`: the server could not be reached, timed out, or answered with any status
+///   other than 202: a 4xx (429 when rate limited) or a 5xx. Retry later.
+/// - `ErrorUnknown`: the library could not start the request.
+///
+/// Blocks the calling thread for the HTTP round trip (up to about 10 s to connect and 30 s for
+/// the request); never call it from an audio or UI thread.
 ///
 /// # Safety
 /// `base_url` and `email` must be valid, non-null C strings.
@@ -1352,31 +1360,26 @@ pub unsafe extern "C" fn replicant_enroll_request(
     email: *const c_char,
 ) -> SyncResult {
     guard(|| {
-        if base_url.is_null() || email.is_null() {
+        let (Some(base_url), Some(email)) = (str_arg(base_url), str_arg(email)) else {
+            return SyncResult::ErrorInvalidInput;
+        };
+        if email.is_empty() || email.len() > REPLICANT_EMAIL_MAX_LEN {
             return SyncResult::ErrorInvalidInput;
         }
-
-        let base_url = match CStr::from_ptr(base_url).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return SyncResult::ErrorInvalidInput,
-        };
-        let email = match CStr::from_ptr(email).to_str() {
-            Ok(s) => s.to_string(),
-            Err(_) => return SyncResult::ErrorInvalidInput,
-        };
-
+        let (base_url, email) = (base_url.to_string(), email.to_string());
         let join_result = std::thread::spawn(move || {
             let runtime = Runtime::new().map_err(|_| SyncResult::ErrorUnknown)?;
-            match runtime.block_on(crate::enrollment::request(&base_url, &email)) {
-                Ok(()) => Ok(()),
-                Err(_) => Err(SyncResult::ErrorConnection),
-            }
+            runtime
+                .block_on(crate::enrollment::request(&base_url, &email))
+                .map_err(|error| match error {
+                    crate::enrollment::EnrollError::InsecureUrl => SyncResult::ErrorInvalidInput,
+                    _ => SyncResult::ErrorConnection,
+                })
         })
         .join();
-
         match join_result {
             Ok(Ok(())) => SyncResult::Success,
-            Ok(Err(err)) => err,
+            Ok(Err(result)) => result,
             Err(_) => SyncResult::ErrorUnknown,
         }
     })
@@ -1395,7 +1398,8 @@ pub unsafe extern "C" fn replicant_enroll_request(
 ///   contacted, so the code stays valid; if storing still fails after the claim, the code was
 ///   used: request a new one.
 /// - `ErrorTokenRejected`: the server refused the code (wrong or expired).
-/// - `ErrorConnection`: the server could not be reached or failed.
+/// - `ErrorConnection`: the server could not be reached, timed out, or answered with any status
+///   other than 200 or 401 (429 when rate limited). Retry later.
 /// - `ErrorSerialization`: the server's reply was not valid credentials.
 ///
 /// Blocks the calling thread for the HTTP round trip (up to about 10 s to connect and 30 s for

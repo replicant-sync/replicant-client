@@ -275,7 +275,7 @@ enum ReplicantSyncResult
   ReplicantSyncResult_Success = 0,
   ReplicantSyncResult_ErrorInvalidInput = -1,
   /**
-   * Enrollment only: the server could not be reached.
+   * Enrollment only: the server could not be reached, or answered with an unexpected status.
    */
   ReplicantSyncResult_ErrorConnection = -2,
   ReplicantSyncResult_ErrorDatabase = -3,
@@ -831,9 +831,17 @@ void replicant_string_free(char *s);
 const char *replicant_get_version(void);
 
 /**
- * Requests an enrollment token be emailed to `email`. Needs no handle. Blocks the calling
- * thread for the HTTP round trip (up to about 10 s to connect and 30 s for the request); never
- * call it from an audio or UI thread.
+ * Asks the server to email an enrollment code to `email`. Needs no handle. Results:
+ * - `Success`: the server accepted the request (HTTP 202).
+ * - `ErrorInvalidInput`: a null or non-UTF-8 argument, an empty or over-long email, or a
+ *   `base_url` that is not https (`http://localhost` and `http://127.0.0.1` excepted). The
+ *   server is not contacted.
+ * - `ErrorConnection`: the server could not be reached, timed out, or answered with any status
+ *   other than 202: a 4xx (429 when rate limited) or a 5xx. Retry later.
+ * - `ErrorUnknown`: the library could not start the request.
+ *
+ * Blocks the calling thread for the HTTP round trip (up to about 10 s to connect and 30 s for
+ * the request); never call it from an audio or UI thread.
  *
  * # Safety
  * `base_url` and `email` must be valid, non-null C strings.
@@ -854,7 +862,8 @@ ReplicantSyncResult replicant_enroll_request(const char *base_url, const char *e
  *   contacted, so the code stays valid; if storing still fails after the claim, the code was
  *   used: request a new one.
  * - `ErrorTokenRejected`: the server refused the code (wrong or expired).
- * - `ErrorConnection`: the server could not be reached or failed.
+ * - `ErrorConnection`: the server could not be reached, timed out, or answered with any status
+ *   other than 200 or 401 (429 when rate limited). Retry later.
  * - `ErrorSerialization`: the server's reply was not valid credentials.
  *
  * Blocks the calling thread for the HTTP round trip (up to about 10 s to connect and 30 s for
