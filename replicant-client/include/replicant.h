@@ -493,7 +493,7 @@ uint32_t replicant_abi_version(void);
 /**
  * Attaches to the engine for `config`'s data dir, starting it if this process has none yet.
  * Opens (and after an upgrade migrates) the database on this thread; never waits on the
- * network. On success `*out_handle` is set; otherwise it is null.
+ * network. On success `*out_handle` is set; on any failure, a null `config` included, it is null.
  *
  * The stored credentials are read before this returns, so `replicant_get_state` is already
  * true: `Halted`/`NotEnrolled` without credentials, else dialling (or, for a later handle, the

@@ -673,6 +673,44 @@ fn null_arguments_are_refused_without_crashing() {
 }
 
 #[test]
+fn a_failed_create_leaves_the_out_handle_null() {
+    let stale = ptr::NonNull::<Replicant>::dangling().as_ptr();
+    let mut handle = stale;
+    assert_eq!(
+        unsafe { replicant_create(ptr::null(), &mut handle) },
+        SyncResult::ErrorInvalidInput
+    );
+    assert!(handle.is_null(), "null config");
+    let dir = tempfile::tempdir().unwrap();
+    let refused: [fn(&mut ReplicantConfig); 3] = [
+        |config| config.struct_size = 4,
+        |config| config.data_dir = ptr::null(),
+        |config| config.list_merge = 7,
+    ];
+    for change in refused {
+        let strings = [c(dir.path().to_str().unwrap()), c(DB_FILE), c(OFFLINE)];
+        let mut config = ReplicantConfig {
+            struct_size: std::mem::size_of::<ReplicantConfig>() as u32,
+            data_dir: strings[0].as_ptr(),
+            database_file: strings[1].as_ptr(),
+            server_url: strings[2].as_ptr(),
+            email: ptr::null(),
+            host_app: strings[1].as_ptr(),
+            host_version: strings[1].as_ptr(),
+            list_merge: 0,
+            list_merge_rules_json: ptr::null(),
+        };
+        change(&mut config);
+        let mut handle = stale;
+        assert_eq!(
+            unsafe { replicant_create(&config, &mut handle) },
+            SyncResult::ErrorInvalidInput
+        );
+        assert!(handle.is_null());
+    }
+}
+
+#[test]
 fn registering_again_replaces_the_callback_and_null_removes_it() {
     let dir = tempfile::tempdir().unwrap();
     let handle = open(dir.path());

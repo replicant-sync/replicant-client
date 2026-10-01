@@ -382,7 +382,7 @@ unsafe fn write_json(out: *mut *mut c_char, value: &impl Serialize) -> SyncResul
 
 /// Attaches to the engine for `config`'s data dir, starting it if this process has none yet.
 /// Opens (and after an upgrade migrates) the database on this thread; never waits on the
-/// network. On success `*out_handle` is set; otherwise it is null.
+/// network. On success `*out_handle` is set; on any failure, a null `config` included, it is null.
 ///
 /// The stored credentials are read before this returns, so `replicant_get_state` is already
 /// true: `Halted`/`NotEnrolled` without credentials, else dialling (or, for a later handle, the
@@ -397,11 +397,13 @@ pub unsafe extern "C" fn replicant_create(
     config: *const ReplicantConfig,
     out_handle: *mut *mut Replicant,
 ) -> SyncResult {
+    if !out_handle.is_null() {
+        *out_handle = ptr::null_mut();
+    }
     guard(|| {
         if config.is_null() || out_handle.is_null() {
             return SyncResult::ErrorInvalidInput;
         }
-        *out_handle = ptr::null_mut();
         let config = &*config;
         if (config.struct_size as usize) < CONFIG_SIZE_V1_0 {
             return SyncResult::ErrorInvalidInput;
