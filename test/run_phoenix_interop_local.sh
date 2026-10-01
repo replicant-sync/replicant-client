@@ -22,6 +22,10 @@
 #   INTEROP_IMPORT_DOCS    JSON file of [{id, content}] to create for the user
 #   INTEROP_DB_NAME        throwaway database to drop and recreate (replicant_interop_v2)
 #   REPLICANT_SERVER_REF   server SHA to test
+#   REPLICANT_SERVER_DIR   server checkout to use. An existing one must be a
+#                          detached HEAD with no edits beyond the harness's own
+#                          (mix.exs, mix.lock, config/test.exs); otherwise refused.
+#   INTEROP_SERVER_PORT    port the server listens on (4000); must be free
 #
 # Requires: a running PostgreSQL, Elixir/mix, cargo, and curl.
 
@@ -33,8 +37,8 @@ CLIENT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CLIENT_CRATE="$CLIENT_ROOT/replicant-client"
 
 # --- Server pin --------------------------------------------------------------
-# replicant-server main: protocol v2 (#10) + hardening (#11), 0.5.0.
-SERVER_REF="${REPLICANT_SERVER_REF:-facd572}"
+# replicant-server main: protocol v2 (#10) + hardening (#11); tag v0.5.0.
+SERVER_REF="${REPLICANT_SERVER_REF:-facd5726e4635e621aaa90d6162ae7fa77bb7ae2}"
 
 # Where to prepare the server checkout. Locally we make a detached git worktree
 # from a sibling replicant-server clone; in CI (no local clone) we git-clone.
@@ -73,9 +77,13 @@ cleanup() {
         sleep 1
         kill -9 "$SERVER_PID" 2>/dev/null || true
     fi
-    local pids
-    pids="$(lsof -ti :"$SERVER_PORT" 2>/dev/null || true)"
-    [ -n "$pids" ] && kill -9 $pids 2>/dev/null || true
+    # mix execs into a BEAM child; stop only listeners we started (the port was
+    # verified free before launch), never whatever else holds the port.
+    if [ -n "$SERVER_PID" ]; then
+        local pids
+        pids="$(lsof -ti tcp:"$SERVER_PORT" -sTCP:LISTEN 2>/dev/null || true)"
+        [ -n "$pids" ] && kill -9 $pids 2>/dev/null || true
+    fi
     [ -n "$BOOT_SCRIPT" ] && rm -f "$BOOT_SCRIPT"
 }
 trap cleanup EXIT INT TERM
@@ -88,16 +96,32 @@ if ! PGPASSWORD="$DB_PASS" psql -U "$DB_USER" -h "$DB_HOST" -d postgres -c "SELE
     err "PostgreSQL not reachable as $DB_USER@$DB_HOST"; exit 1
 fi
 
-existing="$(lsof -ti :"$SERVER_PORT" 2>/dev/null || true)"
-[ -n "$existing" ] && { warn "Killing processes on port $SERVER_PORT: $existing"; kill -9 $existing 2>/dev/null || true; sleep 1; }
+existing="$(lsof -ti tcp:"$SERVER_PORT" -sTCP:LISTEN 2>/dev/null || true)"
+if [ -n "$existing" ]; then
+    err "Port $SERVER_PORT is already in use (PID: $(echo $existing)); not touching it. Set INTEROP_SERVER_PORT to a free port."
+    exit 1
+fi
 
 # --- Prepare pinned server checkout ------------------------------------------
 if [ -d "$SERVER_DIR/.git" ] || [ -f "$SERVER_DIR/.git" ]; then
     log "Reusing server checkout at $SERVER_DIR (pinning to $SERVER_REF)"
-    # Discard prior harness-injected mix.exs/mix.lock changes so checkout doesn't abort.
-    git -C "$SERVER_DIR" checkout --quiet -- mix.exs mix.lock 2>/dev/null || true
-    git -C "$SERVER_DIR" checkout --quiet --detach "$SERVER_REF" 2>/dev/null || \
-        git -C "$SERVER_DIR" checkout --quiet "$SERVER_REF"
+    # Only operate on a throwaway checkout: detached HEAD, no edits beyond the
+    # files this harness rewrites.
+    if git -C "$SERVER_DIR" symbolic-ref -q HEAD >/dev/null; then
+        err "$SERVER_DIR is on a branch; refusing to modify it. Point REPLICANT_SERVER_DIR at a detached/throwaway checkout."
+        exit 1
+    fi
+    foreign_edits="$(git -C "$SERVER_DIR" status --porcelain --untracked-files=no \
+        | grep -vE '^.. (mix\.exs|mix\.lock|config/test\.exs)$' || true)"
+    if [ -n "$foreign_edits" ]; then
+        err "$SERVER_DIR has uncommitted changes; refusing to modify it:"
+        echo "$foreign_edits"
+        exit 1
+    fi
+    git -C "$SERVER_DIR" cat-file -e "$SERVER_REF^{commit}" 2>/dev/null || \
+        git -C "$SERVER_DIR" fetch --quiet origin
+    git -C "$SERVER_DIR" checkout --quiet -- mix.exs mix.lock config/test.exs
+    git -C "$SERVER_DIR" checkout --quiet --detach "$SERVER_REF"
 elif [ -d "$SERVER_SRC/.git" ]; then
     log "Creating detached worktree at $SERVER_DIR from $SERVER_SRC @ $SERVER_REF"
     git -C "$SERVER_SRC" worktree prune
@@ -105,7 +129,7 @@ elif [ -d "$SERVER_SRC/.git" ]; then
 else
     log "Cloning $SERVER_CLONE_URL into $SERVER_DIR @ $SERVER_REF"
     git clone "$SERVER_CLONE_URL" "$SERVER_DIR"
-    git -C "$SERVER_DIR" checkout "$SERVER_REF"
+    git -C "$SERVER_DIR" checkout --quiet --detach "$SERVER_REF"
 fi
 
 # The stripped server ships no HTTP adapter dependency (its own channel tests run
@@ -224,7 +248,8 @@ done
 # TonalDBSyncIntegrationTest) run under this harness's boot/seed/teardown in
 # place of the cargo suites. It runs with the same seeded-credential env.
 # --include-ignored also runs two_process's offline test; the child_* tests are
-# skipped because they only do work when a two_process test spawns them.
+# skipped because they only do work when a two_process test spawns them, and
+# probe_* tests need REPLICANT_PROBE_DATA_DIR (run them explicitly).
 log "Running ${INTEROP_TEST_CMD:-interop suites} against clean DB"
 set +e
 ( cd "$CLIENT_CRATE" && \
@@ -236,7 +261,7 @@ set +e
   REPLICANT_LEGACY_API_KEY="$LEGACY_API_KEY" \
   REPLICANT_LEGACY_API_SECRET="$LEGACY_API_SECRET" \
   SYNC_SERVER_URL="ws://localhost:$SERVER_PORT/socket/websocket" \
-  bash -c "${INTEROP_TEST_CMD:-cargo test -p replicant-client --test interop --test v2_smoke --test two_process -- --include-ignored --skip child_ --test-threads=1 ${1:+\"$1\"}}" )
+  bash -c "${INTEROP_TEST_CMD:-cargo test -p replicant-client --test interop --test v2_smoke --test two_process -- --include-ignored --skip child_ --skip probe_ --test-threads=1 ${1:+\"$1\"}}" )
 test_exit=$?
 set -e
 

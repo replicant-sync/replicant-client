@@ -404,7 +404,7 @@ fn a_silently_dropped_connection_is_detected_and_recovered() {
 
 #[test]
 #[ignore = "probe: REPLICANT_PROBE_DATA_DIR holds a copy of a v1 library; run through the harness"]
-fn a_migrated_library_syncs_against_a_server_holding_its_synced_state() {
+fn probe_a_migrated_library_syncs_against_a_server_holding_its_synced_state() {
     let Ok(dir) = std::env::var("REPLICANT_PROBE_DATA_DIR") else {
         return;
     };
