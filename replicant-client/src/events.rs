@@ -58,7 +58,8 @@ impl From<Origin> for EventOrigin {
 
 /// `DocumentChanged` / `DocumentDeleted`. For a deletion only `document_id` is set; for a change
 /// `title`, `owner_id` and `author_id` may be null.
-/// `visibility` is `public` (curated or read-only) or `private`.
+/// `visibility` is `public` (curated or read-only) or `private`. `content` is the document's
+/// content, the host's own JSON. Every id is a lowercase hyphenated UUID.
 /// Strings are valid only during the call; copy what you keep.
 pub type ReplicantDocumentEventCallback = Option<
     extern "C" fn(
@@ -157,7 +158,7 @@ type ConnectionFn = extern "C" fn(
 /// A kept copy's reason is one of `conflict`, `field_conflict`, `delete_wins`,
 /// `delete_superseded`, `delete_refused`, `delete_publication`, `became_publication`,
 /// `create_rejected` or `unmigratable` (set aside while upgrading the database, with no event).
-/// `paths_json` is a JSON array of JSON Pointers for `field_conflict`, else null.
+/// `paths_json` is a JSON array of strings, each a JSON Pointer, for `field_conflict`; else null.
 /// Per engine: only the handles of the engine that applied the rule get this event; another
 /// process, or another copy of the library, sees just `DocumentChanged`.
 /// `replicant_list_recovered` is the durable record. `recovered_id` may already be dismissed or
@@ -313,7 +314,7 @@ impl Callbacks {
                 let id = text(&document.id.to_string());
                 let title = document.title.as_deref().map(text);
                 let content = text(&document.content.to_string());
-                let owner = document.user_id.map(|owner| text(&owner.to_string()));
+                let owner = document.owner_id.map(|owner| text(&owner.to_string()));
                 let author = document.author_id.map(|author| text(&author.to_string()));
                 let visibility = text(document.visibility);
                 if let Some((entry, filter)) = &self.document {
@@ -549,7 +550,7 @@ mod tests {
         let owner = Uuid::from_u128(0xA);
         let document = StoredDocument {
             id: doc_id,
-            user_id: Some(owner),
+            owner_id: Some(owner),
             author_id: None,
             title: Some("T".into()),
             content: json!({"title": "T"}),

@@ -21,6 +21,7 @@ The static library contains the bundled SQLite amalgamation (SQLite 3.46.0 today
 - Sign-in: `replicant_enroll_request` emails a code, `replicant_enroll_claim` exchanges it and stores the credentials itself (it returns only the user id). `replicant_clear_credentials` signs out. Both apply at once to open engines on that data dir in this process; engines in other processes pick up a sign-in within about 3 s and a sign-out within about a second. The api key and secret never cross the C API: a host tells whether it is signed in from `replicant_get_state` (`halt_reason` is `NotEnrolled` when signed out) and reads the user id with `replicant_get_user_id`.
 - `replicant_get_state` gives connection, sync phase and halt reason; `replicant_reconnect` retries.
 - Kept copies: `replicant_list_recovered`, `replicant_restore_document`, `replicant_restore_fields`, `replicant_dismiss_recovered`. Documents the server refused to change: `replicant_list_parked`.
+- JSON results: every key, type and null case is documented on `replicant_get_document` (documents), `replicant_list_recovered` and `replicant_list_parked`. A document's own id is `id`; other records name a document `doc_id`; `created_at` and `updated_at` are RFC 3339 in UTC, `recovered_at` is Unix seconds.
 - Events: see `EVENT_CALLBACKS.md`.
 - Plugins must never unload the library while the process runs: `replicant_destroy` returns at once and the engine stops afterwards.
 

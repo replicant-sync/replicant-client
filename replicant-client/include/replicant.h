@@ -407,7 +407,8 @@ typedef struct ReplicantState {
 /**
  * `DocumentChanged` / `DocumentDeleted`. For a deletion only `document_id` is set; for a change
  * `title`, `owner_id` and `author_id` may be null.
- * `visibility` is `public` (curated or read-only) or `private`.
+ * `visibility` is `public` (curated or read-only) or `private`. `content` is the document's
+ * content, the host's own JSON. Every id is a lowercase hyphenated UUID.
  * Strings are valid only during the call; copy what you keep.
  */
 typedef void (*ReplicantDocumentEventCallback)(ReplicantEventType event_type,
@@ -464,7 +465,7 @@ typedef void (*ReplicantConnectionEventCallback)(ReplicantEventType event_type,
  * A kept copy's reason is one of `conflict`, `field_conflict`, `delete_wins`,
  * `delete_superseded`, `delete_refused`, `delete_publication`, `became_publication`,
  * `create_rejected` or `unmigratable` (set aside while upgrading the database, with no event).
- * `paths_json` is a JSON array of JSON Pointers for `field_conflict`, else null.
+ * `paths_json` is a JSON array of strings, each a JSON Pointer, for `field_conflict`; else null.
  * Per engine: only the handles of the engine that applied the rule get this event; another
  * process, or another copy of the library, sees just `DocumentChanged`.
  * `replicant_list_recovered` is the durable record. `recovered_id` may already be dismissed or
@@ -579,9 +580,22 @@ ReplicantSyncResult replicant_update_document(struct Replicant *handle,
 ReplicantSyncResult replicant_delete_document(struct Replicant *handle, const char *document_id);
 
 /**
- * The document as JSON: `id`, `user_id` (owner), `author_id`, `title`, `content`, `read_only`,
- * `visibility` (`public`/`private`), `source_doc_id`, `derived_from`, `created_at`,
- * `updated_at`. `ErrorNotFound` when missing or deleted.
+ * The document as a JSON object. `ErrorNotFound` when missing or deleted.
+ *
+ * JSON naming in this API: a document's own id is `id`; any other record that refers to a
+ * document names it `doc_id`. Ids are lowercase hyphenated UUID strings. A document object has:
+ * - `id` (string): the document's id.
+ * - `owner_id` (string or null): the owning user; null only for a legacy document with none.
+ * - `author_id` (string or null): the author the server reports; null until it has synced.
+ * - `title` (string or null): the content's `title` string, cut to 128 characters, else
+ *   the title the server sent.
+ * - `content`: the host's own JSON value, as last written or synced.
+ * - `read_only` (bool): the server marked it read-only (a publication); writes are refused.
+ * - `visibility` (string): `public` (curated or read-only) or `private`.
+ * - `source_doc_id`, `derived_from` (string or null): ids of the documents it came from.
+ * - `created_at`, `updated_at` (string): RFC 3339 in UTC, e.g.
+ *   `2026-10-01T07:51:25.301096+00:00`. Times on this device: when the document was first
+ *   stored here, and when its content last changed here (a local edit or a synced change).
  *
  * # Safety
  * Valid handle, C string and out pointer; free the result with `replicant_string_free`.
@@ -591,7 +605,7 @@ ReplicantSyncResult replicant_get_document(struct Replicant *handle,
                                            char **out_json);
 
 /**
- * Every visible document as a JSON array (see `replicant_get_document`).
+ * Every visible document as a JSON array of document objects (see `replicant_get_document`).
  *
  * # Safety
  * Valid handle and out pointer; free the result with `replicant_string_free`.
@@ -599,7 +613,8 @@ ReplicantSyncResult replicant_get_document(struct Replicant *handle,
 ReplicantSyncResult replicant_get_all_documents(struct Replicant *handle, char **out_json);
 
 /**
- * Document ids as a JSON array; `include_deleted` adds documents whose delete is not yet sent.
+ * Document ids as a JSON array of strings; `include_deleted` adds documents whose delete is not
+ * yet sent.
  *
  * # Safety
  * Valid handle and out pointer; free the result with `replicant_string_free`.
@@ -665,7 +680,8 @@ ReplicantSyncResult replicant_configure_search(struct Replicant *handle, const c
 
 /**
  * FTS5 query (`music`, `tun*`, `"a phrase"`, `a AND b`, `title:word`); `limit` 0 means 100. A
- * query FTS5 cannot parse is `ErrorInvalidInput`.
+ * query FTS5 cannot parse is `ErrorInvalidInput`. The result is a JSON array of document
+ * objects (see `replicant_get_document`), best match first.
  *
  * # Safety
  * Valid handle, C string and out pointer; free the result with `replicant_string_free`.
@@ -682,20 +698,26 @@ ReplicantSyncResult replicant_search_documents(struct Replicant *handle,
 ReplicantSyncResult replicant_rebuild_search_index(struct Replicant *handle);
 
 /**
- * Kept copies (local content sync set aside), newest first, as a JSON array of
- * `{recovered_id, doc_id, title, reason, recovered_at, content, fields}`; `recovered_at` is in
- * Unix seconds. `reason` is
- * `conflict`, `field_conflict`, `delete_wins`, `delete_superseded`, `delete_refused`,
- * `delete_publication`, `became_publication`, `create_rejected` or `unmigratable` (set aside
- * while upgrading the database). `fields` is null for a whole-document copy, else `[{path, local_value, local_removed}]`.
+ * Kept copies (local content sync set aside), newest first, as a JSON array of objects:
+ * - `recovered_id` (integer): the copy's id, for `replicant_dismiss_recovered` and the restores.
+ * - `doc_id` (string): the document the copy was kept from (it may since have been deleted).
+ * - `title` (string or null): the kept content's `title`, when it is a string.
+ * - `reason` (string): `conflict`, `field_conflict`, `delete_wins`, `delete_superseded`,
+ *   `delete_refused`, `delete_publication`, `became_publication`, `create_rejected` or
+ *   `unmigratable` (set aside while upgrading the database).
+ * - `recovered_at` (integer): when it was kept, in Unix seconds.
+ * - `content`: the host's own JSON value, as it was locally when kept.
+ * - `fields` (array or null): null for a whole-document copy; else one object per conflicting
+ *   path: `path` (string, a JSON Pointer), `local_value` (any JSON; null when removed locally),
+ *   `local_removed` (bool: the local side removed the path).
+ *
  * Copies never expire: they stay until dismissed or restored. A copy that cannot be read is left
  * out (and logged).
  *
  * # Safety
  * Valid handle and out pointer; free the result with `replicant_string_free`.
  */
-ReplicantSyncResult replicant_list_recovered(struct Replicant *handle,
-                                             char **out_json);
+ReplicantSyncResult replicant_list_recovered(struct Replicant *handle, char **out_json);
 
 /**
  * Deletes a kept copy for good; `ErrorNotFound` when it is already gone.
@@ -735,9 +757,10 @@ ReplicantSyncResult replicant_restore_document(struct Replicant *handle,
 ReplicantSyncResult replicant_restore_fields(struct Replicant *handle, int64_t recovered_id);
 
 /**
- * Documents that stopped uploading until their next local edit, as a JSON array of
- * `{doc_id, code}` (`validation`, `forbidden`, `too_large`, `diverged`). Parked documents are
- * not counted in `replicant_count_pending_sync`; a new local edit un-parks one.
+ * Documents that stopped uploading until their next local edit, as a JSON array of objects:
+ * `doc_id` (string, the parked document) and `code` (string: `validation`, `forbidden`,
+ * `too_large` or `diverged`). Parked documents are not counted in
+ * `replicant_count_pending_sync`; a new local edit un-parks one.
  *
  * # Safety
  * Valid handle and out pointer; free the result with `replicant_string_free`.

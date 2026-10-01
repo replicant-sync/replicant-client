@@ -27,7 +27,7 @@ const REBUILD_FTS_INDEX: &str = "INSERT INTO documents_fts (document_id, title, 
 pub struct StoredDocument {
     pub id: Uuid,
     /// The owner; `None` for a legacy document that has none.
-    pub user_id: Option<Uuid>,
+    pub owner_id: Option<Uuid>,
     pub author_id: Option<Uuid>,
     pub title: Option<String>,
     pub content: Value,
@@ -66,7 +66,7 @@ fn parse_document(row: &SqliteRow) -> StoreResult<StoredDocument> {
     };
     Ok(StoredDocument {
         id: Uuid::parse_str(&row.try_get::<String, _>("id")?)?,
-        user_id: uuid("user_id")?,
+        owner_id: uuid("user_id")?,
         author_id: uuid("author_id")?,
         title: row.try_get("title")?,
         content: serde_json::from_str(&row.try_get::<String, _>("content")?)?,
@@ -233,7 +233,7 @@ mod tests {
             .unwrap()
             .expect("created");
         assert_eq!(read.id, doc_id);
-        assert_eq!(read.user_id, Some(ME));
+        assert_eq!(read.owner_id, Some(ME));
         assert_eq!(read.title.as_deref(), Some("Mine"));
         assert_eq!(read.content, json!({"title": "Mine", "n": 1}));
         assert!(!read.read_only);

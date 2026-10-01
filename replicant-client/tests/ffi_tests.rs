@@ -311,7 +311,35 @@ fn documents_round_trip_through_writes_and_reads() {
     let read_back = get_doc(handle, &first).unwrap();
     assert_eq!(read_back["content"]["n"], 2);
     assert_eq!(read_back["visibility"], "private");
-    assert!(read_back["user_id"].is_string());
+    assert!(read_back["owner_id"].is_string());
+    let mut keys: Vec<&str> = read_back
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "author_id",
+            "content",
+            "created_at",
+            "derived_from",
+            "id",
+            "owner_id",
+            "read_only",
+            "source_doc_id",
+            "title",
+            "updated_at",
+            "visibility"
+        ]
+    );
+    for stamp in ["created_at", "updated_at"] {
+        let text = read_back[stamp].as_str().unwrap();
+        let parsed = chrono::DateTime::parse_from_rfc3339(text).unwrap();
+        assert_eq!(parsed.offset().local_minus_utc(), 0, "{stamp} is UTC");
+    }
     let chosen = Uuid::new_v4().to_string();
     assert_eq!(
         unsafe { replicant_create_document_with_id(handle, c(&chosen).as_ptr(), c("{}").as_ptr()) },
