@@ -86,3 +86,86 @@ jobs:
     
     - name: Run security audit
       run: cargo audit
+
+  interop:
+    name: Interop (v2 server)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      SQLX_OFFLINE: true
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: dtolnay/rust-toolchain@stable
+
+    - uses: erlef/setup-beam@v1
+      with:
+        elixir-version: '1.17'
+        otp-version: '27'
+
+    # The harness clones replicant-server at the pinned SHA and drops and recreates
+    # its own replicant_interop_v2 database.
+    - name: Boot the v2 server and run the interop suite
+      env:
+        REPLICANT_SERVER_DIR: /tmp/replicant-server-interop
+      run: |
+        INTEROP_MIX_HOME="$HOME/.mix" INTEROP_HEX_HOME="$HOME/.hex" ./test/run_phoenix_interop_local.sh
+
+  release-link:
+    name: Release link probe (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      SQLX_OFFLINE: true
+      MACOSX_DEPLOYMENT_TARGET: '11.0'
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: dtolnay/rust-toolchain@stable
+
+    - run: cargo build -p replicant-client --release
+
+    - name: Link and check (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        cc -O2 -Ireplicant-client/target/include scripts/release_link_probe.c target/release/libreplicant_client.a \
+          -Wl,--gc-sections -s -lpthread -ldl -lm -o probe
+        ./probe
+        python3 scripts/check_replicant_versions.py probe
+
+    - name: Link and check (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        clang -O2 -mmacosx-version-min=11.0 -Ireplicant-client/target/include scripts/release_link_probe.c \
+          target/release/libreplicant_client.a -framework Security -framework Foundation -framework SystemConfiguration \
+          -Wl,-dead_strip -o probe 2> link.txt
+        cat link.txt
+        if grep -q "built for newer" link.txt; then exit 1; fi
+        strip -x probe
+        ./probe
+        python3 scripts/check_replicant_versions.py probe
+
+    - name: Link and check (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+        cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" && cl /O2 /Ireplicant-client\target\include scripts\release_link_probe.c target\release\replicant_client.lib ws2_32.lib userenv.lib bcrypt.lib ntdll.lib secur32.lib advapi32.lib crypt32.lib ole32.lib /link /OPT:REF /OPT:ICF /out:probe.exe"
+        if ($LASTEXITCODE -ne 0) { exit 1 }
+        .\probe.exe; if ($LASTEXITCODE -ne 0) { exit 1 }
+        python scripts\check_replicant_versions.py probe.exe
+        if ($LASTEXITCODE -ne 0) { exit 1 }
