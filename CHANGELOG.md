@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.0 - unreleased
+## 0.7.0 - 2026-10-01
 
 ### Breaking: protocol v2 and C API v2 (server 0.5.0 required)
 - One engine per data dir per process, shared by every handle; `replicant_create` takes a `ReplicantConfig` and never waits on the network.
