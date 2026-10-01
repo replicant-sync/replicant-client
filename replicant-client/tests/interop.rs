@@ -4,7 +4,7 @@
 mod support;
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use replicant_client::engine::machine::{ConnectionView, HaltReason, SyncView};
 use replicant_client::host::{self, Handle, HostEvent, Origin};
@@ -360,5 +360,44 @@ fn a_fresh_database_adopts_the_server_identity() {
         handle.block_on(handle.store().user_id()).unwrap(),
         seed.user_id
     );
+    close(handle);
+}
+
+#[test]
+#[ignore = "needs a v2 server: run through test/run_phoenix_interop_local.sh"]
+fn a_silently_dropped_connection_is_detected_and_recovered() {
+    let seed = Seed::from_env();
+    let proxy = Proxy::start(&seed.server_url);
+    let dir = signed_in_dir(&seed);
+    let (handle, _) = attach_synced(
+        dir.path(),
+        &Seed {
+            server_url: proxy.url.clone(),
+            ..Seed::from_env()
+        },
+    );
+
+    let started = Instant::now();
+    proxy.set(Flow::Drop);
+    let lost = wait_event(&handle, Duration::from_secs(75), |event| {
+        *event == HostEvent::ConnectionLost
+    });
+    let detected = started.elapsed();
+    println!("DETECTED_AFTER_MS {}", detected.as_millis());
+    assert!(lost.is_some(), "no ConnectionLost within {detected:?}");
+
+    let doc_id = create(&handle, json!({"title": "written while the link was dead"}));
+    proxy.set(Flow::Pass);
+    let recovery = Instant::now();
+    assert!(
+        wait_event(&handle, Duration::from_secs(90), |event| {
+            *event == HostEvent::SyncCompleted
+        })
+        .is_some(),
+        "no sync after the link came back"
+    );
+    println!("RECOVERED_AFTER_MS {}", recovery.elapsed().as_millis());
+    wait_uploaded(&handle);
+    assert!(content(&handle, doc_id).is_some());
     close(handle);
 }

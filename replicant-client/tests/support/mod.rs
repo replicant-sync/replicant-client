@@ -5,6 +5,10 @@ use replicant_client::engine::list_merge::ListMergeConfig;
 use replicant_client::host::{self, Handle, HostConfig, HostEvent};
 use replicant_client::secret_store::{self, Credentials};
 use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::runtime::Runtime;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 pub const OFFLINE_URL: &str = "ws://127.0.0.1:9/socket/websocket";
@@ -144,4 +148,83 @@ pub fn wait_uploaded(handle: &Handle) {
 
 pub fn close(handle: Handle) {
     assert!(handle.close().wait(CLOSE));
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum Flow {
+    Pass,
+    /// The server's bytes wait until the flow changes.
+    HoldReplies,
+    /// Bytes in both directions are read and discarded; every socket stays open, like a NAT
+    /// that silently forgot the flow.
+    Drop,
+}
+
+/// A TCP proxy in front of the server whose flow a test can change while connections stay open.
+pub struct Proxy {
+    /// The server URL to connect to through the proxy.
+    pub url: String,
+    flow: watch::Sender<Flow>,
+    _runtime: Runtime,
+}
+
+impl Proxy {
+    pub fn start(server_url: &str) -> Proxy {
+        let after_scheme = server_url.split_once("://").unwrap().1;
+        let (upstream, path) = after_scheme.split_at(after_scheme.find('/').unwrap());
+        let upstream = upstream.to_string();
+        let runtime = Runtime::new().unwrap();
+        let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
+        let url = format!("ws://{}{path}", listener.local_addr().unwrap());
+        let (flow, flow_rx) = watch::channel(Flow::Pass);
+        runtime.spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let Ok(server) = TcpStream::connect(&upstream).await else {
+                    continue;
+                };
+                let (mut client_read, mut client_write) = client.into_split();
+                let (mut server_read, mut server_write) = server.into_split();
+                let to_server = flow_rx.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    while let Ok(n @ 1..) = client_read.read(&mut buf).await {
+                        if *to_server.borrow() != Flow::Drop
+                            && server_write.write_all(&buf[..n]).await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+                let mut to_client = flow_rx.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    while let Ok(n @ 1..) = server_read.read(&mut buf).await {
+                        let Ok(flow) = to_client
+                            .wait_for(|flow| *flow != Flow::HoldReplies)
+                            .await
+                            .map(|flow| *flow)
+                        else {
+                            break;
+                        };
+                        if flow != Flow::Drop && client_write.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                    // A dead path does not relay the server closing its idle socket.
+                    if *to_client.borrow() == Flow::Drop {
+                        std::future::pending::<()>().await;
+                    }
+                });
+            }
+        });
+        Proxy {
+            url,
+            flow,
+            _runtime: runtime,
+        }
+    }
+
+    pub fn set(&self, flow: Flow) {
+        self.flow.send_replace(flow);
+    }
 }

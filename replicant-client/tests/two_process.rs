@@ -7,10 +7,6 @@ use replicant_client::host::{self, Handle, HostEvent, Origin};
 use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use support::*;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::runtime::Runtime;
-use tokio::sync::watch;
 use uuid::Uuid;
 
 fn unix_ms() -> u128 {
@@ -188,10 +184,9 @@ fn recovered_count(handle: &Handle) -> usize {
 #[ignore = "needs a v2 server: run through test/run_phoenix_interop_local.sh"]
 fn two_online_processes_editing_one_document_converge() {
     let seed = Seed::from_env();
-    let proxy = Runtime::new().unwrap();
-    let (proxy_url, replies_open) = gated_proxy(&proxy, &seed.server_url);
+    let proxy = Proxy::start(&seed.server_url);
     let via_proxy = Seed {
-        server_url: proxy_url.clone(),
+        server_url: proxy.url.clone(),
         ..Seed::from_env()
     };
     let dir = signed_in_dir(&seed);
@@ -203,19 +198,19 @@ fn two_online_processes_editing_one_document_converge() {
         "child_sets_b_once_a_is_sent",
         dir.path(),
         doc_id,
-        &proxy_url,
+        &proxy.url,
     );
     wait_for_file(&dir.path().join("child_ready"));
     // Both processes' replies wait from here: one engine sends the edit of `a`, the child then
     // edits `b`, and the other engine uploads both rows on the base the server has replaced.
-    replies_open.send_replace(false);
+    proxy.set(Flow::HoldReplies);
     let mut edited = content(&handle, doc_id).unwrap();
     edited["a"] = 1.into();
     update(&handle, doc_id, edited);
     let raced = wait_until(LIVE, || sent_rows(&handle, &outbox, doc_id) == 2);
     // Otherwise both engines sent the edit of `a` before the child's edit existed.
     println!("second upload sent on a stale base: {raced}");
-    replies_open.send_replace(true);
+    proxy.set(Flow::Pass);
     assert!(child.wait_with_output().unwrap().status.success());
 
     assert_eq!(
@@ -225,41 +220,6 @@ fn two_online_processes_editing_one_document_converge() {
     assert_eq!(recovered_count(&handle), 0, "a kept copy for a clean merge");
     handle.block_on(outbox.close());
     close(handle);
-}
-
-/// A TCP proxy to the server in `server_url` that holds the server's bytes while the returned
-/// flag is false. Returns the URL to connect to through it.
-fn gated_proxy(runtime: &Runtime, server_url: &str) -> (String, watch::Sender<bool>) {
-    let after_scheme = server_url.split_once("://").unwrap().1;
-    let (upstream, path) = after_scheme.split_at(after_scheme.find('/').unwrap());
-    let upstream = upstream.to_string();
-    let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
-    let url = format!("ws://{}{path}", listener.local_addr().unwrap());
-    let (open_tx, open_rx) = watch::channel(true);
-    runtime.spawn(async move {
-        while let Ok((client, _)) = listener.accept().await {
-            let Ok(server) = TcpStream::connect(&upstream).await else {
-                continue;
-            };
-            let (mut client_read, mut client_write) = client.into_split();
-            let (mut server_read, mut server_write) = server.into_split();
-            tokio::spawn(async move {
-                let _ = tokio::io::copy(&mut client_read, &mut server_write).await;
-            });
-            let mut open = open_rx.clone();
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 64 * 1024];
-                while let Ok(n @ 1..) = server_read.read(&mut buf).await {
-                    if open.wait_for(|open| *open).await.is_err()
-                        || client_write.write_all(&buf[..n]).await.is_err()
-                    {
-                        break;
-                    }
-                }
-            });
-        }
-    });
-    (url, open_tx)
 }
 
 #[test]
