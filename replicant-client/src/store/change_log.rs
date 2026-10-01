@@ -216,13 +216,10 @@ mod tests {
         let mut reader = ChangeLogReader::open(&t.store, T0).await.unwrap();
         let mine = t
             .store
-            .create_document(ME, None, json!({"a": 1}))
+            .create_document(None, json!({"a": 1}))
             .await
             .unwrap();
-        let theirs = other
-            .create_document(ME, None, json!({"b": 1}))
-            .await
-            .unwrap();
+        let theirs = other.create_document(None, json!({"b": 1})).await.unwrap();
         let from_server = Uuid::from_u128(0xD1);
         let push = upsert_change(
             SCOPE_OWN,
@@ -262,18 +259,18 @@ mod tests {
         let mut reader = ChangeLogReader::open(&t.store, T0).await.unwrap();
         let doc_id = t
             .store
-            .create_document(ME, None, json!({"n": 0}))
+            .create_document(None, json!({"n": 0}))
             .await
             .unwrap();
         t.store
-            .update_document(ME, doc_id, json!({"n": 1}))
+            .update_document(doc_id, json!({"n": 1}))
             .await
             .unwrap();
         t.store
-            .update_document(ME, doc_id, json!({"n": 2}))
+            .update_document(doc_id, json!({"n": 2}))
             .await
             .unwrap();
-        t.store.delete_document(ME, doc_id).await.unwrap();
+        t.store.delete_document(doc_id).await.unwrap();
         assert_eq!(
             reader.read(T0).await.unwrap(),
             LogRead::Docs(vec![DocChange {
@@ -313,7 +310,7 @@ mod tests {
         let mut reader = ChangeLogReader::open(&t.store, T0).await.unwrap();
         let good_id = t
             .store
-            .create_document(ME, None, json!({"a": 1}))
+            .create_document(None, json!({"a": 1}))
             .await
             .unwrap();
         // An undecodable row after the good one: `read` must fail without losing `good_id`.
@@ -354,10 +351,7 @@ mod tests {
         let mut reader = ChangeLogReader::open(&t.store, T0).await.unwrap();
         assert_eq!(reader.read(T0).await.unwrap(), LogRead::Docs(vec![]));
 
-        let doc_id = other
-            .create_document(ME, None, json!({"x": 1}))
-            .await
-            .unwrap();
+        let doc_id = other.create_document(None, json!({"x": 1})).await.unwrap();
         assert_eq!(
             reader.read(T0).await.unwrap(),
             LogRead::Docs(vec![DocChange {
@@ -375,7 +369,7 @@ mod tests {
         let mut suspended = ChangeLogReader::open(&t.store, T0).await.unwrap();
         let mut live = ChangeLogReader::open(&other, T0).await.unwrap();
         t.store
-            .create_document(ME, None, json!({"a": 1}))
+            .create_document(None, json!({"a": 1}))
             .await
             .unwrap();
 
@@ -406,10 +400,7 @@ mod tests {
             .await
             .unwrap();
 
-        let doc_id = other
-            .create_document(ME, None, json!({"a": 1}))
-            .await
-            .unwrap();
+        let doc_id = other.create_document(None, json!({"a": 1})).await.unwrap();
 
         // now_unix is far enough past `heartbeat_at` that `read` attempts the heartbeat save,
         // which fails because the table is gone; the doc change must still come back.
@@ -455,7 +446,7 @@ mod tests {
         let other = open_again(&t.path()).await;
         let closing = ChangeLogReader::open(&t.store, T0).await.unwrap();
         let mut live = ChangeLogReader::open(&other, T0).await.unwrap();
-        t.store.create_document(ME, None, json!({})).await.unwrap();
+        t.store.create_document(None, json!({})).await.unwrap();
         closing.close().await.unwrap();
 
         live.read(T0 + 10).await.unwrap();
@@ -469,7 +460,7 @@ mod tests {
         let mut reader = ChangeLogReader::open(&t.store, T0).await.unwrap();
         for i in 1..=10 {
             t.store
-                .create_document(ME, None, json!({"i": i}))
+                .create_document(None, json!({"i": i}))
                 .await
                 .unwrap();
             reader.read(T0 + i).await.unwrap();
@@ -493,10 +484,7 @@ mod tests {
             assert_eq!(idle.read(now).await.unwrap(), LogRead::Docs(vec![]));
         }
 
-        let doc_id = other
-            .create_document(ME, None, json!({"a": 1}))
-            .await
-            .unwrap();
+        let doc_id = other.create_document(None, json!({"a": 1})).await.unwrap();
         active.read(now + 1).await.unwrap();
 
         assert_eq!(

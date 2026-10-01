@@ -1,1718 +1,1400 @@
-//! C FFI interface for the sync client
-//!
-//! This module provides C-compatible functions for using the sync client from C/C++.
-//! The generated header file will be available after building.
+//! C API. A handle is one attachment to the engine for its data dir; every handle in the
+//! process on that data dir shares one engine (`host::attach`). No call waits on the network.
 
-use serde_json::Value;
-use std::cell::Cell;
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::c_char;
+use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Duration;
+
+use serde::Serialize;
+use serde_json::Value;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
-use crate::error_code::ReplicantErrorCode;
+use crate::engine::doc::FieldConflict;
+use crate::engine::list_merge::{ListMergeConfig, ListMergePolicy, PathPattern};
+use crate::engine::machine::{ConnectionView, EngineState, HaltReason, SyncView};
 use crate::events::{
-    ConflictEventCallback, ConnectionEventCallback, DocumentEventCallback, ErrorEventCallback,
-    EventDispatcher, EventOrigin, EventType, IdentityEventCallback, SyncEventCallback,
+    DispatchError, Dispatcher, EventType, ReplicantConflictEventCallback,
+    ReplicantConnectionEventCallback, ReplicantDocumentEventCallback, ReplicantErrorEventCallback,
+    ReplicantSyncEventCallback,
 };
-use crate::{Client as CoreClient, ClientDatabase};
+use crate::host::{self, Handle, HostConfig, OpenError};
+use crate::store::StoreError;
 
-/// Opaque handle to a Replicant client instance
+/// Opaque handle. Every call except `replicant_process_events`, the
+/// `replicant_register_*_callback` calls and the destroy calls is thread-safe; the first two run
+/// only on the thread the first registration bound, and a destroy must not overlap any other
+/// call on the handle (see `replicant_destroy`). Never call from an audio thread: every read and
+/// write is a SQLite transaction.
 pub struct Replicant {
-    engine: Arc<std::sync::Mutex<Option<Arc<CoreClient>>>>,
-    database: Arc<ClientDatabase>,
-    runtime: Runtime,
-    pub(crate) event_dispatcher: Arc<EventDispatcher>,
-    /// The background task `replicant_create` spawns to build the sync engine.
-    /// Kept so shutdown can wait for it instead of cancelling it: cancelling it
-    /// mid-`establish()` is what orphaned a sqlite worker thread in DEV-1118.
-    init_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
-    /// Identifies this instance's runtime threads, so shutdown can tell that it
-    /// was called from inside its own runtime (where joining would deadlock).
-    instance_id: u64,
+    handle: Handle,
+    dispatcher: Dispatcher,
+    /// `PUMP_*`: whether `replicant_process_events` is running callbacks, and whether a
+    /// callback asked to destroy the handle meanwhile.
+    pump: AtomicU8,
 }
 
-/// `begin_teardown` hands the handle to its thread as an address, which erases
-/// the `Send` bound the compiler would otherwise check. Keep checking it here,
-/// so that adding a `!Send` field to `Replicant` fails to build instead of
-/// silently moving something across threads.
-const _: fn() = || {
-    fn assert_send<T: Send>() {}
-    assert_send::<Replicant>();
-};
+const PUMP_IDLE: u8 = 0;
+const PUMP_DISPATCHING: u8 = 1;
+const PUMP_DESTROY_REQUESTED: u8 = 2;
 
-static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+/// The C ABI version is MAJOR.MINOR. A breaking change bumps the major; an addition (a function,
+/// a struct field at the end, an enum value) bumps the minor. A host needs the library's major
+/// equal to the header's, and its minor at least the minor that added what the host uses.
+/// Hosts treat unknown enum values as unknown: an unknown `ReplicantEventType` is ignored, an
+/// unknown `ReplicantHaltReason` is `Other`, an unknown error code is 0 (`Unknown`).
+pub const REPLICANT_ABI_VERSION_MAJOR: u32 = 1;
+/// See `REPLICANT_ABI_VERSION_MAJOR`.
+pub const REPLICANT_ABI_VERSION_MINOR: u32 = 0;
 
-thread_local! {
-    /// `instance_id` of the Replicant whose tokio runtime owns this thread, or
-    /// 0 for any other thread.
-    static RUNTIME_OWNER: Cell<u64> = const { Cell::new(0) };
+/// The library's ABI version, packed: `(major << 16) | minor`.
+#[no_mangle]
+pub extern "C" fn replicant_abi_version() -> u32 {
+    (REPLICANT_ABI_VERSION_MAJOR << 16) | REPLICANT_ABI_VERSION_MINOR
 }
 
-/// A teardown started by `replicant_destroy`, and whether the caller is allowed
-/// to wait for it.
-enum Teardown {
-    /// Running on its own thread, which this caller may join.
-    Waitable(std::thread::JoinHandle<()>),
-    /// Running, but not joinable from this caller — or never started at all.
-    /// Either way nothing may block on it.
-    Detached,
+/// Longest email, in bytes.
+pub const REPLICANT_EMAIL_MAX_LEN: usize = 254;
+/// A user id's length; its buffer needs one more for the NUL.
+pub const REPLICANT_USER_ID_LEN: usize = 36;
+/// A document id's length; its buffer needs one more for the NUL.
+pub const REPLICANT_DOCUMENT_ID_LEN: usize = 36;
+
+/// Every entry point's body runs in here: a panic becomes `ErrorUnknown` instead of unwinding
+/// into C, which would abort the host (a DAW).
+fn guard(body: impl FnOnce() -> SyncResult) -> SyncResult {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or_else(|_| {
+        tracing::error!("a replicant call panicked");
+        SyncResult::ErrorUnknown
+    })
 }
 
-impl Replicant {
-    /// Closes everything this handle owns and joins every thread it started,
-    /// then frees it. Always runs on the dedicated thread `begin_teardown`
-    /// spawns, so that dropping the runtime is never done from inside that
-    /// runtime, and so that no FFI caller is held up by it.
-    ///
-    /// Deliberately unbounded. Nothing waits on this thread unless a caller
-    /// asks to, so there is no host to hang — and every bound one could impose
-    /// here would mean *abandoning* a pool mid-close, which is the very thing
-    /// this exists to prevent. It finishes when sqlite lets it finish (each step
-    /// is bounded in practice by sqlite's 5s busy timeout per contended
-    /// statement).
-    ///
-    /// Order matters, and every pool close is unconditional — nothing that could
-    /// stall may stand between this function and a `Pool::close()`, because
-    /// `Pool::close()` is the only thing that joins a sqlite worker thread
-    /// (dropping the runtime joins tokio's threads and no others):
-    ///
-    /// 1. Close the handle's own pool, awaited. First, so that a hang anywhere
-    ///    later cannot keep it open. It is independent of the sync engine's pool,
-    ///    so closing it early disturbs nothing. `Pool::close()` resolves only
-    ///    when the pool's size reaches zero, i.e. every connection — including
-    ///    ones still being established — is done.
-    /// 2. Wait for the background init task. Its `ClientDatabase::new` may have
-    ///    a sqlx worker thread sitting inside `establish()` retrying on
-    ///    SQLITE_BUSY; cancelling the task (which is what dropping the runtime
-    ///    does) abandons that thread *and* the pool handle that could have
-    ///    closed it. Awaiting the task means that pool always exists to close.
-    ///    Bounded in practice by the socket connect timeout and sqlite's busy
-    ///    timeout, both of which are finite.
-    /// 3. Close the sync engine's pool (and release its socket best-effort — see
-    ///    `Client::shutdown`, which closes the pool before touching the socket
-    ///    for the same reason).
-    /// 4. Drop the runtime. A plain drop joins the runtime's worker and
-    ///    blocking threads (`shutdown_background`/`shutdown_timeout` would
-    ///    deliberately not), so on return no tokio thread of ours is left.
-    fn shutdown(self) {
-        let Replicant {
-            engine,
-            database,
-            runtime,
-            event_dispatcher,
-            init_task,
-            instance_id,
-        } = self;
-
-        let started = Instant::now();
-
-        // Poisoning must never be read as "nothing to close". Every other FFI
-        // function holds these guards across a `block_on` with `unwrap()`, so a
-        // single panicking operation poisons the mutex — and skipping the close
-        // would leave behind exactly the threads this exists to join.
-        let init_task = init_task
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-
-        // 1. The handle's own pool, before anything that could stall.
-        runtime.block_on(database.close());
-        drop(database);
-
-        // 2. Background init: let it finish so nothing is abandoned mid-connect.
-        if let Some(handle) = init_task {
-            if let Err(e) = runtime.block_on(handle) {
-                tracing::warn!("FFI: background init ended abnormally during shutdown: {e}");
-            }
-        }
-
-        // 3. The sync engine's own pool, then its socket.
-        let client = engine
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        if let Some(client) = client {
-            runtime.block_on(client.shutdown());
-            drop(client);
-        }
-        drop(engine);
-        drop(event_dispatcher);
-
-        // 4. Joins the runtime's worker and blocking threads.
-        drop(runtime);
-
-        tracing::info!(
-            "FFI: Replicant {} shut down in {:?} ({} sqlite worker thread(s) started \
-             by this process)",
-            instance_id,
-            started.elapsed(),
-            crate::database::sqlite_workers_started()
-        );
-    }
-
-    /// Runs `fut` on this instance's runtime, marking the calling thread as one
-    /// of that runtime's own for the duration.
-    ///
-    /// Every FFI function that drives async work goes through here. The mark is
-    /// what makes a *re-entrant* destroy — one issued from a callback dispatched
-    /// while an FFI call is still on this thread's stack — take the `Detached`
-    /// path instead of waiting for a teardown that cannot finish until this
-    /// frame returns. (Freeing the handle from inside a call that is still using
-    /// it is a use-after-free no library can undo; the mark keeps it from also
-    /// being a deadlock.)
-    fn block_on<F: std::future::Future>(&self, fut: F) -> F::Output {
-        struct Restore(u64);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                RUNTIME_OWNER.with(|owner| owner.set(self.0));
-            }
-        }
-
-        let _restore = Restore(RUNTIME_OWNER.with(|owner| owner.replace(self.instance_id)));
-        self.runtime.block_on(fut)
-    }
-
-    /// Hands the handle to a dedicated thread that tears it down, and reports
-    /// whether this caller may wait for that thread.
-    ///
-    /// The teardown never runs on the caller's thread: dropping a tokio runtime
-    /// from inside itself panics, and joining a runtime's threads from one of
-    /// them deadlocks. A caller that *is* one of this instance's runtime threads
-    /// (a destroy from inside a Replicant callback, say) therefore gets
-    /// `Detached` — the teardown still happens, it just cannot be waited for
-    /// from there — rather than a deadlock or a panic across the FFI boundary.
-    fn begin_teardown(handle: Box<Replicant>) -> Teardown {
-        let instance_id = handle.instance_id;
-        let called_from_own_runtime = RUNTIME_OWNER.with(|owner| owner.get()) == instance_id;
-
-        // Handed over as an address, not as a `Box`, so that a failed spawn
-        // leaks the handle instead of dropping it on the caller's thread. That
-        // drop would block the caller joining the runtime — against this
-        // function's whole contract — and would panic outright if the caller is
-        // itself a runtime thread. A leak is the lesser evil: the memory stays
-        // valid for whatever is still running in it.
-        let raw = Box::into_raw(handle) as usize;
-
-        let worker = std::thread::Builder::new()
-            .name("replicant-shutdown".to_string())
-            .spawn(move || {
-                // SAFETY: `raw` came from `Box::into_raw` just above and is
-                // handed to exactly one thread, which is the only owner now.
-                unsafe { Box::from_raw(raw as *mut Replicant) }.shutdown()
-            });
-
-        match worker {
-            Err(e) => {
-                tracing::error!(
-                    "FFI: could not spawn the shutdown thread ({e}); \
-                     Replicant {instance_id} was leaked deliberately and its \
-                     threads will outlive this handle"
-                );
-                Teardown::Detached
-            }
-            Ok(_) if called_from_own_runtime => {
-                tracing::warn!(
-                    "FFI: Replicant {} was destroyed from its own runtime thread; \
-                     its teardown cannot be waited for from there.",
-                    instance_id
-                );
-                Teardown::Detached
-            }
-            Ok(worker) => Teardown::Waitable(worker),
-        }
-    }
-}
-
-/// Waits up to `timeout` for a teardown thread, without ever joining one that
-/// cannot be joined from here. Returns whether it finished.
-fn wait_for_teardown(teardown: Teardown, timeout: Duration) -> bool {
-    let worker = match teardown {
-        Teardown::Waitable(worker) => worker,
-        Teardown::Detached => return false,
-    };
-
-    let deadline = Instant::now() + timeout;
-    while !worker.is_finished() {
-        if Instant::now() >= deadline {
-            // The thread keeps running: abandoning the teardown is what leaves
-            // threads in an unloadable module, so it is never cut short.
-            tracing::warn!(
-                "FFI: teardown did not finish within {:?} and is still running \
-                 ({} sqlite worker thread(s) started by this process)",
-                timeout,
-                crate::database::sqlite_workers_started()
-            );
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-
-    // A panic in the teardown thread means the teardown did NOT complete: say so
-    // rather than reporting a clean shutdown.
-    match worker.join() {
-        Ok(()) => true,
-        Err(_) => {
-            tracing::error!(
-                "FFI: the teardown thread panicked; pools may not have been closed and \
-                 Replicant threads may still be running"
-            );
-            false
-        }
-    }
-}
-
-/// Result codes for C API functions
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// cbindgen:prefix-with-name
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncResult {
     Success = 0,
     ErrorInvalidInput = -1,
+    /// Enrollment only: the server could not be reached, or answered with an unexpected status.
     ErrorConnection = -2,
     ErrorDatabase = -3,
     ErrorSerialization = -4,
+    /// A newer build migrated the database; this build cannot open it.
+    ErrorNewerSchema = -5,
+    /// An engine is open on this data dir with a different server, host, list merge config or
+    /// title pointer.
+    /// A programming error: every binary on a data dir must pass the same config. Never fall
+    /// back to a temporary library.
+    ErrorConfigMismatch = -6,
+    ErrorNotFound = -7,
+    /// Another account's document, or a read-only publication.
+    ErrorNotWritable = -8,
+    /// The id exists here or was deleted. An import should skip the id, not count a failure.
+    ErrorAlreadyExists = -9,
+    /// Migrating a v1 library failed. Show "Your library needs attention"; never fall back to a
+    /// temporary library. Either the backup itself failed: no backup was written and the
+    /// database is unchanged. Or the migration failed after the backup: the documents are
+    /// unchanged but 0.6 builds cannot open the database; restoring the backup
+    /// (`<database>.v1-backup`, or `<database>.v1-backup-<unix seconds>` when that name was
+    /// taken) is the way back.
+    ErrorMigrationFailed = -10,
+    /// Another process kept the database locked; try `replicant_create` again shortly.
+    ErrorBusy = -11,
+    /// `replicant_process_events` or a `replicant_register_*_callback` call came from another
+    /// thread than the one the handle's first registration bound.
+    ErrorWrongThread = -12,
+    /// `replicant_process_events` was called before any callback was registered.
+    ErrorNoCallbacks = -13,
+    /// The kept copy's document was deleted: `replicant_restore_document` re-creates the copy.
+    ErrorDocumentGone = -14,
+    /// An output buffer is smaller than the value plus its NUL; see the `REPLICANT_*_LEN` limits.
+    ErrorBufferTooSmall = -15,
+    /// The server refused the enrollment code (wrong or expired): ask for a new one.
+    ErrorTokenRejected = -16,
     ErrorUnknown = -99,
 }
 
-/// Document structure for C API
+/// Every string is UTF-8 and copied by `replicant_create`.
 #[repr(C)]
-pub struct Document {
-    pub id: *mut c_char,
-    pub title: *mut c_char,
-    pub content: *mut c_char,
-    pub sync_revision: i64,
+pub struct ReplicantConfig {
+    /// `sizeof(ReplicantConfig)`. Smaller than the ABI 1.0 struct is refused
+    /// (`ErrorInvalidInput`); the library reads only the fields it knows.
+    pub struct_size: u32,
+    /// Holds the database file and the stored credentials.
+    pub data_dir: *const c_char,
+    /// File name inside `data_dir`, e.g. "tonaldb.sqlite3"; a path separator or `..` is refused.
+    pub database_file: *const c_char,
+    pub server_url: *const c_char,
+    /// May be null (`""` counts as null). Signs joins when the stored credentials carry no email.
+    /// Credentials stored by 0.6 carry none: with a null email here the engine reports
+    /// `NotEnrolled`, so a host upgrading from 0.6 must pass the user's email. Not part of the
+    /// shared-engine check: a later handle on an open data dir never gets `ErrorConfigMismatch`
+    /// for a different email, and the email of the handle that started the engine is the one used.
+    pub email: *const c_char,
+    /// Named in the User-Agent, e.g. "Entonal Studio" and "2.0.1 CLAP".
+    pub host_app: *const c_char,
+    pub host_version: *const c_char,
+    /// A `ReplicantListMerge`: how a list both sides changed is merged when no rule matches.
+    /// An `int32_t` so that a value from C outside the enum is refused, not undefined.
+    pub list_merge: i32,
+    /// May be null. A JSON array of `{"path": "/pitches", "policy": "atomic"}`;
+    /// policies `append`, `atomic`, `full`. `*` matches one key or index; the rule with the most
+    /// literal segments wins, a tie goes to the first listed.
+    pub list_merge_rules_json: *const c_char,
+    /// May be null (`""` counts as null). An RFC 6901 JSON Pointer, e.g. "/title", to the string
+    /// in each document's content that is its `title`: in reads, callbacks, kept copies and the
+    /// `title:` search field. Null: the library assigns no titles. Anything else that is not a
+    /// JSON Pointer is refused (`ErrorInvalidInput`). The shared-engine check
+    /// (`ErrorConfigMismatch`) covers handles in one process. Every process on a data dir must
+    /// pass the same pointer: a different pointer in another process is not detected, each launch
+    /// with one recomputes every title and the search index, and titles end up mixed while both
+    /// run.
+    pub title_pointer: *const c_char,
 }
 
-/// Create a new sync engine instance
-///
-/// # Arguments
-/// * `database_url` - SQLite database URL (e.g., "sqlite:client.db?mode=rwc")
-/// * `server_url` - WebSocket server URL (e.g., "ws://localhost:8080/ws")
-/// * `email` - User email address
-/// * `api_key` - Application API key (rpa_ prefix)
-/// * `api_secret` - Application API secret (rps_ prefix)
-///
-/// # Returns
-/// * Pointer to SyncEngine on success, null on failure
-///
-/// # Events
-/// Connection and initial sync run in the background. ConnectionSucceeded is
-/// emitted once per successful connect (at start-up or on a later reconnect),
-/// after the engine uses that connection. SyncStarted and SyncCompleted then
-/// bracket the full sync that follows; SyncCompleted means the server answered.
-/// An offline start emits neither until the server is reached. An engine with
-/// no API key, or whose database has never adopted an identity (no `user_id`
-/// on this or an earlier run), never connects, so it emits neither.
-///
-/// # Safety
-/// Caller must ensure all pointers are valid, non-null C strings
-#[no_mangle]
-pub unsafe extern "C" fn replicant_create(
-    database_url: *const c_char,
-    server_url: *const c_char,
-    email: *const c_char,
-    api_key: *const c_char,
-    api_secret: *const c_char,
-    user_id: *const c_char,
-) -> *mut Replicant {
-    if database_url.is_null()
-        || server_url.is_null()
-        || email.is_null()
-        || api_key.is_null()
-        || api_secret.is_null()
-    {
-        return ptr::null_mut();
-    }
+/// Merge policy for a list changed on both sides. `ReplicantListMerge_Full` is refused for now.
+/// cbindgen:prefix-with-name
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicantListMerge {
+    /// Element by element while positions line up on both sides; otherwise the server's list is
+    /// kept and the local one set aside.
+    Append = 0,
+    /// Any change on both sides keeps the server's list and sets the local one aside.
+    Atomic = 1,
+    Full = 2,
+}
 
-    // Canonical user id from stored credentials; null means no enrolled
-    // identity (offline/local-only). A non-null id must be a real UUID.
-    let canonical_user_id = if user_id.is_null() {
+#[derive(serde::Deserialize)]
+struct ListMergeRule {
+    path: String,
+    policy: String,
+}
+
+/// `value` is a `ReplicantListMerge`.
+fn list_merge_policy(value: i32) -> Option<ListMergePolicy> {
+    match value {
+        0 => Some(ListMergePolicy::Append),
+        1 => Some(ListMergePolicy::Atomic),
+        2 => Some(ListMergePolicy::Full),
+        _ => None,
+    }
+}
+
+fn list_merge_policy_named(name: &str) -> Option<ListMergePolicy> {
+    match name {
+        "append" => Some(ListMergePolicy::Append),
+        "atomic" => Some(ListMergePolicy::Atomic),
+        "full" => Some(ListMergePolicy::Full),
+        _ => None,
+    }
+}
+
+/// `None` for an unknown policy or unparsable rules; `Engine::start` validates the rest.
+unsafe fn list_merge_arg(config: &ReplicantConfig) -> Option<ListMergeConfig> {
+    let default = list_merge_policy(config.list_merge)?;
+    let rules = if config.list_merge_rules_json.is_null() {
+        Vec::new()
+    } else {
+        let rules: Vec<ListMergeRule> =
+            serde_json::from_str(str_arg(config.list_merge_rules_json)?).ok()?;
+        rules
+            .into_iter()
+            .map(|rule| {
+                Some((
+                    PathPattern(rule.path),
+                    list_merge_policy_named(&rule.policy)?,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()?
+    };
+    Some(ListMergeConfig { default, rules })
+}
+
+/// cbindgen:prefix-with-name
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicantConnection {
+    /// Never reported: `replicant_create` returns after the engine left it.
+    Idle = 0,
+    Disconnected = 1,
+    Connecting = 2,
+    Connected = 3,
+    /// Not retrying on its own; see `halt_reason`.
+    Halted = 4,
+    Stopped = 5,
+}
+
+/// cbindgen:prefix-with-name
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicantSync {
+    Idle = 0,
+    CatchingUp = 1,
+    Live = 2,
+}
+
+/// cbindgen:prefix-with-name
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicantHaltReason {
+    None = 0,
+    /// No stored credentials, or stored ones that can never be read (key missing, not
+    /// decryptable): sign in.
+    NotEnrolled = 1,
+    /// The server refused the credentials: sign in again.
+    AuthInvalid = 2,
+    /// The server needs a newer client.
+    UpdateRequired = 3,
+    /// The server disabled the account. A different account signed in on this data dir, in any
+    /// process, is picked up within about 3 s; the same account stays halted.
+    AccountDisabled = 4,
+    /// This data dir belongs to another account.
+    IdentityDrift = 5,
+    Other = 6,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicantState {
+    /// Set to `sizeof(ReplicantState)` before `replicant_get_state`; smaller than the ABI 1.0
+    /// struct is refused. The library writes only the fields it knows and sets this to their
+    /// size, so a host from a later version can tell which of its fields were filled.
+    pub struct_size: u32,
+    pub connection: ReplicantConnection,
+    pub sync: ReplicantSync,
+    pub halt_reason: ReplicantHaltReason,
+}
+
+/// The ABI 1.0 struct sizes: later versions append fields and keep accepting these.
+// A field added after 1.0 is read through a raw pointer, and only when `struct_size` covers it.
+const CONFIG_SIZE_V1_0: usize =
+    std::mem::offset_of!(ReplicantConfig, title_pointer) + std::mem::size_of::<*const c_char>();
+const STATE_SIZE_V1_0: usize =
+    std::mem::offset_of!(ReplicantState, halt_reason) + std::mem::size_of::<ReplicantHaltReason>();
+
+impl From<&EngineState> for ReplicantState {
+    fn from(state: &EngineState) -> Self {
+        let (connection, halt_reason) = match &state.connection {
+            ConnectionView::Idle => (ReplicantConnection::Idle, ReplicantHaltReason::None),
+            ConnectionView::Disconnected => {
+                (ReplicantConnection::Disconnected, ReplicantHaltReason::None)
+            }
+            ConnectionView::Connecting => {
+                (ReplicantConnection::Connecting, ReplicantHaltReason::None)
+            }
+            ConnectionView::Connected => {
+                (ReplicantConnection::Connected, ReplicantHaltReason::None)
+            }
+            ConnectionView::Stopped => (ReplicantConnection::Stopped, ReplicantHaltReason::None),
+            ConnectionView::Halted(reason) => (
+                ReplicantConnection::Halted,
+                match reason {
+                    HaltReason::NotEnrolled => ReplicantHaltReason::NotEnrolled,
+                    HaltReason::AuthInvalid => ReplicantHaltReason::AuthInvalid,
+                    HaltReason::UpdateRequired => ReplicantHaltReason::UpdateRequired,
+                    HaltReason::AccountDisabled => ReplicantHaltReason::AccountDisabled,
+                    HaltReason::Other(code) if code == "identity_drift" => {
+                        ReplicantHaltReason::IdentityDrift
+                    }
+                    HaltReason::Other(_) => ReplicantHaltReason::Other,
+                },
+            ),
+        };
+        let sync = match state.sync {
+            SyncView::Idle => ReplicantSync::Idle,
+            SyncView::CatchingUp => ReplicantSync::CatchingUp,
+            SyncView::Live => ReplicantSync::Live,
+        };
+        ReplicantState {
+            struct_size: std::mem::size_of::<ReplicantState>() as u32,
+            connection,
+            sync,
+            halt_reason,
+        }
+    }
+}
+
+unsafe fn str_arg<'a>(value: *const c_char) -> Option<&'a str> {
+    if value.is_null() {
         None
     } else {
-        match CStr::from_ptr(user_id)
-            .to_str()
-            .ok()
-            .and_then(|s| Uuid::parse_str(s).ok())
-        {
-            Some(id) if !id.is_nil() => Some(id),
-            _ => return ptr::null_mut(),
-        }
-    };
-
-    let database_url = match CStr::from_ptr(database_url).to_str() {
-        Ok(s) => s,
-        Err(_) => return ptr::null_mut(),
-    };
-
-    let server_url = match CStr::from_ptr(server_url).to_str() {
-        Ok(s) => s,
-        Err(_) => return ptr::null_mut(),
-    };
-
-    let email = match CStr::from_ptr(email).to_str() {
-        Ok(s) => s,
-        Err(_) => return ptr::null_mut(),
-    };
-
-    let api_key = match CStr::from_ptr(api_key).to_str() {
-        Ok(s) => s,
-        Err(_) => return ptr::null_mut(),
-    };
-
-    let api_secret = match CStr::from_ptr(api_secret).to_str() {
-        Ok(s) => s,
-        Err(_) => return ptr::null_mut(),
-    };
-
-    let instance_id = NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
-
-    // Equivalent to `Runtime::new()`, plus named threads and an owner marker so
-    // shutdown can recognise its own runtime threads (see `destroy_blocking`).
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_name(format!("replicant-{instance_id}"))
-        .on_thread_start(move || RUNTIME_OWNER.with(|owner| owner.set(instance_id)))
-        .on_thread_stop(|| RUNTIME_OWNER.with(|owner| owner.set(0)))
-        .build()
-    {
-        Ok(rt) => rt,
-        Err(_) => return ptr::null_mut(),
-    };
-
-    let database = match runtime.block_on(async { ClientDatabase::new(database_url).await }) {
-        Ok(db) => Arc::new(db),
-        Err(_) => return ptr::null_mut(),
-    };
-
-    // Failing here hands no handle back, so nothing will ever call
-    // `replicant_destroy` for this pool: close it on the way out, or its sqlite
-    // worker threads outlive a `replicant_create` the caller believes did
-    // nothing. Contended creation (migrations blocked on SQLITE_BUSY) is
-    // exactly when this path is taken.
-    let close_and_fail = |runtime: Runtime, database: Arc<ClientDatabase>| -> *mut Replicant {
-        runtime.block_on(database.close());
-        drop(database);
-        drop(runtime);
-        ptr::null_mut()
-    };
-
-    // Run migrations
-    if runtime
-        .block_on(async { database.run_migrations().await })
-        .is_err()
-    {
-        return close_and_fail(runtime, database);
+        CStr::from_ptr(value).to_str().ok()
     }
-
-    // Ensure user config exists so offline operations work immediately
-    if runtime
-        .block_on(async {
-            database
-                .ensure_user_config_with_identifier(server_url, email)
-                .await
-        })
-        .is_err()
-    {
-        return close_and_fail(runtime, database);
-    }
-
-    let event_dispatcher = Arc::new(EventDispatcher::new());
-    let engine = Arc::new(std::sync::Mutex::new(None));
-
-    // Spawn background task to create sync engine (connect + initial sync)
-    let engine_slot = engine.clone();
-    let event_dispatcher_clone = event_dispatcher.clone();
-    let database_url = database_url.to_string();
-    let server_url = server_url.to_string();
-    let email = email.to_string();
-    let api_key = api_key.to_string();
-    let api_secret = api_secret.to_string();
-    let init_task = runtime.spawn(async move {
-        match CoreClient::open(
-            &database_url,
-            &server_url,
-            &email,
-            &api_key,
-            &api_secret,
-            canonical_user_id,
-            Some(event_dispatcher_clone.clone()),
-        )
-        .await
-        {
-            Ok(client) => {
-                let client = Arc::new(client);
-                // Never panic here: the client is already built, and unwinding
-                // out of this task would drop it — and its pool — un-closed,
-                // leaving a sqlx worker thread per connection running in this
-                // module. A poisoned mutex is recovered instead, so shutdown
-                // still finds the client and can close it.
-                // The slot must be empty: this task is its only writer, and
-                // teardown waits for this task before taking the slot. If that
-                // ever stopped holding, the assignment would drop a live client
-                // — and its pool — un-closed, which is the hazard itself.
-                match engine_slot.lock() {
-                    Ok(mut slot) => {
-                        debug_assert!(slot.is_none(), "engine slot was already occupied");
-                        *slot = Some(client.clone());
-                    }
-                    Err(poisoned) => {
-                        tracing::warn!(
-                            "FFI: engine slot mutex was poisoned; storing the client anyway \
-                             so its pool can still be closed"
-                        );
-                        let mut slot = poisoned.into_inner();
-                        debug_assert!(slot.is_none(), "engine slot was already occupied");
-                        *slot = Some(client.clone());
-                    }
-                }
-                // Started only once it is in the slot, so a consumer reacting to
-                // ConnectionSucceeded or SyncCompleted already uses this client,
-                // and documents written through the offline path meanwhile are
-                // uploaded by its initial sync.
-                client.start().await;
-            }
-            Err(e) => {
-                // The pool this init opened is already closed:
-                // `open` closes it on every failure path, which
-                // is what joins its sqlite worker threads. Nothing is left to
-                // clean up here, and the slot stays `None`.
-                event_dispatcher_clone.emit_sync_error(
-                    ReplicantErrorCode::Unknown,
-                    &format!("Background init failed: {}", e),
-                );
-            }
-        }
-    });
-
-    Box::into_raw(Box::new(Replicant {
-        engine,
-        database,
-        runtime,
-        event_dispatcher,
-        init_task: std::sync::Mutex::new(Some(init_task)),
-        instance_id,
-    }))
 }
 
-/// Destroy a sync engine instance and free memory
+/// Null is `None`; a non-null string that is not UTF-8 is refused.
+unsafe fn nullable_str_arg<'a>(value: *const c_char) -> Result<Option<&'a str>, SyncResult> {
+    if value.is_null() {
+        Ok(None)
+    } else {
+        str_arg(value)
+            .map(Some)
+            .ok_or(SyncResult::ErrorInvalidInput)
+    }
+}
+
+unsafe fn uuid_arg(value: *const c_char) -> Option<Uuid> {
+    str_arg(value).and_then(|text| Uuid::parse_str(text).ok())
+}
+
+unsafe fn json_arg(value: *const c_char) -> Result<Value, SyncResult> {
+    let text = str_arg(value).ok_or(SyncResult::ErrorInvalidInput)?;
+    serde_json::from_str(text).map_err(|_| SyncResult::ErrorSerialization)
+}
+
+fn store_result(error: &StoreError) -> SyncResult {
+    match error {
+        StoreError::NotFound(_) | StoreError::NoKeptCopy(_) => SyncResult::ErrorNotFound,
+        StoreError::NoFieldConflict(_) => SyncResult::ErrorInvalidInput,
+        StoreError::NotWritable(_) => SyncResult::ErrorNotWritable,
+        StoreError::DocumentGone(_) => SyncResult::ErrorDocumentGone,
+        StoreError::AlreadyExists(_) => SyncResult::ErrorAlreadyExists,
+        StoreError::Json(_) => SyncResult::ErrorSerialization,
+        StoreError::BadSearchQuery(_) => SyncResult::ErrorInvalidInput,
+        _ => SyncResult::ErrorDatabase,
+    }
+}
+
+/// Writes the 36-character id and a NUL; `out` must hold 37 bytes.
+unsafe fn write_id(out: *mut c_char, id: Uuid) {
+    let text = id.to_string();
+    ptr::copy_nonoverlapping(text.as_ptr(), out as *mut u8, text.len());
+    out.add(text.len()).write(0);
+}
+
+/// Nulls a caller's out pointer first, so it is null after any failure.
+unsafe fn clear_out(out: *mut *mut c_char) {
+    if !out.is_null() {
+        *out = ptr::null_mut();
+    }
+}
+
+fn registered(result: Result<(), DispatchError>) -> SyncResult {
+    match result {
+        Ok(()) => SyncResult::Success,
+        Err(_) => SyncResult::ErrorWrongThread,
+    }
+}
+
+fn dispatch_result(error: DispatchError) -> SyncResult {
+    match error {
+        DispatchError::WrongThread => SyncResult::ErrorWrongThread,
+        DispatchError::NoCallbacks => SyncResult::ErrorNoCallbacks,
+    }
+}
+
+/// Hands `value` to the caller as JSON; free it with `replicant_string_free`.
+unsafe fn write_json(out: *mut *mut c_char, value: &impl Serialize) -> SyncResult {
+    match serde_json::to_string(value)
+        .ok()
+        .and_then(|json| CString::new(json).ok())
+    {
+        Some(json) => {
+            *out = json.into_raw();
+            SyncResult::Success
+        }
+        None => SyncResult::ErrorSerialization,
+    }
+}
+
+/// Attaches to the engine for `config`'s data dir, starting it if this process has none yet.
+/// Opens (and after an upgrade migrates) the database on this thread; never waits on the
+/// network. On success `*out_handle` is set; on any failure, a null `config` included, it is null.
 ///
-/// NON-BLOCKING, fire-and-forget: it returns immediately and the teardown —
-/// closing both sqlite pools and joining this instance's threads — finishes on
-/// a Replicant-owned thread afterwards. The handle is invalid the moment this
-/// returns; no further call may use it.
-///
-/// This is safe to call on a UI or audio-host thread (plugin scans, project
-/// close) precisely because it does not wait. The consequence is that threads
-/// Replicant started can still be running Replicant code for a short time after
-/// it returns — normally milliseconds, longer if sqlite is contended.
-///
-/// THEREFORE: any caller that can be UNLOADED FROM MEMORY — every plugin —
-/// MUST make sure its own binary is never unmapped, or one of those threads
-/// will be executing code at an address that no longer exists (the DEV-1118
-/// crash: an execute access violation on an unmapped image). Pin the module
-/// once, at load:
-///
-///   * Windows: `GetModuleHandleExW` with `GET_MODULE_HANDLE_EX_FLAG_PIN`
-///     (plus `GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS`) on an address in your
-///     own module.
-///   * macOS / Linux: `dlopen` your own image with `RTLD_NOLOAD | RTLD_NODELETE`.
-///
-/// Pinning is the primary defence, not a workaround. A host process that only
-/// ever exits (a standalone app) does not need it; anything a host can unload
-/// does.
-///
-/// UPGRADING FROM 0.6.2 OR EARLIER WITHOUT PINNING IS A REGRESSION. The old
-/// destroy dropped the handle, which joined the tokio runtime's threads before
-/// returning and left only sqlx's workers running; this one returns with the
-/// background init, both pools, the runtime's threads and the sqlx workers all
-/// still live. The total time any thread of ours is alive goes down — the pools
-/// are now actually closed, so nothing lingers for the life of the process — but
-/// the exposure *at the moment destroy returns* goes up.
-///
-/// A second instance may be created immediately; it shares nothing with the one
-/// being torn down. Note only that the outgoing instance may still be writing to
-/// the same database file for a moment, so an immediate re-create against it can
-/// see sqlite contention (and `replicant_create` returns NULL if that outlasts
-/// sqlite's 5s busy timeout). `replicant_destroy_and_wait` avoids the overlap.
-///
-/// Callers that *can* afford to wait — standalone apps shutting down, tests —
-/// should use `replicant_destroy_and_wait` instead, which reports whether the
-/// teardown actually finished.
+/// The stored credentials are read before this returns, so `replicant_get_state` is already
+/// true: `Halted`/`NotEnrolled` without usable credentials (none stored, or ones that can never
+/// be read), else dialling (or, for a later handle, the shared engine's current state). An
+/// engine that starts without usable credentials also sends one fatal `not_enrolled` error, to
+/// the handle that started it; a later handle on that engine is not sent it again and reads
+/// `replicant_get_state` instead.
 ///
 /// # Safety
-/// Caller must ensure engine pointer was created by replicant_create and hasn't been freed.
-/// As with any free function, no other call on this handle may be in progress on
-/// any thread — which includes destroying it from inside a Replicant callback
-/// while the call that dispatched that callback is still on the stack.
+/// `config` and `out_handle` must be valid; the config's strings valid C strings (`email` may be null).
 #[no_mangle]
-pub unsafe extern "C" fn replicant_destroy(engine: *mut Replicant) {
-    if engine.is_null() {
-        return;
+pub unsafe extern "C" fn replicant_create(
+    config: *const ReplicantConfig,
+    out_handle: *mut *mut Replicant,
+) -> SyncResult {
+    if !out_handle.is_null() {
+        *out_handle = ptr::null_mut();
     }
+    guard(|| {
+        if config.is_null() || out_handle.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let config = &*config;
+        if (config.struct_size as usize) < CONFIG_SIZE_V1_0 {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let (
+            Some(data_dir),
+            Some(database_file),
+            Some(server_url),
+            Some(host_app),
+            Some(host_version),
+        ) = (
+            str_arg(config.data_dir),
+            str_arg(config.database_file),
+            str_arg(config.server_url),
+            str_arg(config.host_app),
+            str_arg(config.host_version),
+        )
+        else {
+            return SyncResult::ErrorInvalidInput;
+        };
+        let (Some(list_merge), Ok(fallback_email), Ok(title_pointer)) = (
+            list_merge_arg(config),
+            nullable_str_arg(config.email),
+            nullable_str_arg(config.title_pointer),
+        ) else {
+            return SyncResult::ErrorInvalidInput;
+        };
+        let host_config = HostConfig {
+            data_dir: PathBuf::from(data_dir),
+            database_file: database_file.to_string(),
+            server_url: server_url.to_string(),
+            fallback_email: fallback_email
+                .filter(|email| !email.is_empty())
+                .map(str::to_string),
+            host_app: host_app.to_string(),
+            host_version: host_version.to_string(),
+            list_merge,
+            title_pointer: title_pointer
+                .filter(|pointer| !pointer.is_empty())
+                .map(str::to_string),
+        };
+        match host::attach(host_config) {
+            Ok(handle) => {
+                *out_handle = Box::into_raw(Box::new(Replicant {
+                    handle,
+                    dispatcher: Dispatcher::default(),
+                    pump: AtomicU8::new(PUMP_IDLE),
+                }));
+                SyncResult::Success
+            }
+            Err(OpenError::NewerSchema) => SyncResult::ErrorNewerSchema,
+            Err(OpenError::MigrationFailed(message)) => {
+                tracing::error!(%message, "replicant_create: v1 migration failed");
+                SyncResult::ErrorMigrationFailed
+            }
+            Err(OpenError::Busy) => SyncResult::ErrorBusy,
+            Err(OpenError::ConfigMismatch(_)) => SyncResult::ErrorConfigMismatch,
+            Err(OpenError::Config(message)) => {
+                tracing::warn!(%message, "replicant_create: invalid config");
+                SyncResult::ErrorInvalidInput
+            }
+            Err(error) => {
+                tracing::warn!(%error, "replicant_create failed");
+                SyncResult::ErrorDatabase
+            }
+        }
+    })
+}
 
-    let handle = Box::from_raw(engine);
+/// `replicant_process_events` is running this handle's callbacks: it frees the handle when
+/// it returns. True when the free was handed over.
+unsafe fn defer_to_the_pump(handle: *mut Replicant) -> bool {
+    (*handle)
+        .pump
+        .compare_exchange(
+            PUMP_DISPATCHING,
+            PUMP_DESTROY_REQUESTED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_ok()
+}
 
-    // Nothing may unwind into C. A panic here (a poisoned lock, a failing
-    // thread spawn) would otherwise cross the FFI boundary, which is UB.
-    // Dropping the returned Teardown detaches the thread; it does not stop it.
+unsafe fn free(handle: *mut Replicant) {
+    let replicant = Box::from_raw(handle);
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        let _ = Replicant::begin_teardown(handle);
+        let Replicant { handle, .. } = *replicant;
+        drop(handle.close());
     }))
     .is_err()
     {
-        tracing::error!("FFI: replicant_destroy panicked; the handle was leaked deliberately");
+        tracing::error!("replicant_destroy panicked");
     }
 }
 
-/// Destroy a sync engine instance and wait for its teardown to finish.
+/// Detaches and frees the handle. Returns at once: when this was the engine's last handle, the
+/// engine stops on a Replicant thread afterwards (never waiting on the network).
 ///
-/// Same as `replicant_destroy` (the handle is invalid either way, whatever this
-/// returns) but BLOCKS for up to `timeout_ms` waiting for Replicant to close
-/// its sqlite pools and join its threads.
+/// A destroy must not overlap any other call on this handle, on any thread: the host ends every
+/// other use of the handle first. The one exception is a destroy from inside one of this
+/// handle's callbacks, which is deferred: the free happens when `replicant_process_events`
+/// returns. Other handles, including those on the same data dir, are unaffected.
 ///
-/// Returns `true` when the teardown completed: no REPLICANT-OWNED thread — its
-/// tokio runtime, its sqlite workers — is running any more. That is the claim,
-/// and it is narrower than "this module has no threads in it": libraries linked
-/// into Replicant (the WebSocket and TLS stacks in particular) may keep threads
-/// of their own that Replicant neither owns nor can join, so a module that has
-/// ever connected should still be pinned rather than unloaded.
-///
-/// Returns `false` if the wait ran out, or if the caller cannot wait (destroy
-/// from inside a Replicant callback on a Replicant runtime thread) — the teardown
-/// then carries on in the background.
-///
-/// `timeout_ms` of 0 does not wait at all; it reports whether the teardown had
-/// already finished. Pass a large value (`UINT32_MAX`) to wait in effect
-/// indefinitely.
-///
-/// Intended for standalone applications and tests. A plugin should call
-/// `replicant_destroy` and pin its module instead of blocking a host thread.
+/// Unloading: library code can still run after this returns, and even after
+/// `replicant_destroy_and_wait` returns true, because a DNS lookup the engine started finishes
+/// on its own thread, bounded only by the OS resolver. Never unload this library while the
+/// process runs: a plugin pins its module (`RTLD_NODELETE`, or
+/// `GET_MODULE_HANDLE_EX_FLAG_PIN` on Windows).
 ///
 /// # Safety
-/// Caller must ensure engine pointer was created by replicant_create and hasn't been freed
+/// `handle` must come from `replicant_create` and not be used again.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_destroy(handle: *mut Replicant) {
+    if handle.is_null() || defer_to_the_pump(handle) {
+        return;
+    }
+    free(handle);
+}
+
+/// `replicant_destroy`, then waits up to `timeout_ms` for the engine to stop and its runtime to
+/// shut down. True when it has, or when other handles keep the engine running. It does not make
+/// unloading safe (see `replicant_destroy`). The same overlap rule applies. Called from inside
+/// one of this handle's callbacks it cannot wait: it returns false at once and the handle is
+/// freed when `replicant_process_events` returns.
+///
+/// # Safety
+/// As `replicant_destroy`.
 #[no_mangle]
 pub unsafe extern "C" fn replicant_destroy_and_wait(
-    engine: *mut Replicant,
+    handle: *mut Replicant,
     timeout_ms: u32,
 ) -> bool {
-    if engine.is_null() {
+    if handle.is_null() {
         return true;
     }
-
-    let handle = Box::from_raw(engine);
-
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        let teardown = Replicant::begin_teardown(handle);
-        wait_for_teardown(teardown, Duration::from_millis(u64::from(timeout_ms)))
-    })) {
-        Ok(finished) => finished,
-        Err(_) => {
-            tracing::error!(
-                "FFI: replicant_destroy_and_wait panicked; the handle was leaked deliberately"
-            );
-            false
-        }
+    if defer_to_the_pump(handle) {
+        return false;
     }
+    let replicant = Box::from_raw(handle);
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let Replicant { handle, .. } = *replicant;
+        handle
+            .close()
+            .wait(Duration::from_millis(u64::from(timeout_ms)))
+    }))
+    .unwrap_or(false)
 }
 
-/// Create a new document
-///
-/// # Arguments
-/// * `engine` - Sync engine instance
-/// * `content_json` - Document content as JSON string (should include any title as part of the JSON)
-/// * `out_document_id` - Output buffer for document ID (must be at least 37 chars)
-///
-/// # Returns
-/// * CSyncResult indicating success or failure
+/// Creates a document owned by the signed-in (or provisional) user; writes its id into
+/// `out_document_id` (`REPLICANT_DOCUMENT_ID_LEN + 1` bytes).
 ///
 /// # Safety
-/// Caller must ensure engine is valid, content_json is a valid C string, and out_document_id has space for 37 bytes
+/// Valid handle, C string, and a `REPLICANT_DOCUMENT_ID_LEN + 1`-byte buffer.
 #[no_mangle]
 pub unsafe extern "C" fn replicant_create_document(
-    engine: *mut Replicant,
+    handle: *mut Replicant,
     content_json: *const c_char,
     out_document_id: *mut c_char,
 ) -> SyncResult {
-    if engine.is_null() || content_json.is_null() || out_document_id.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let engine = &mut *engine;
-
-    let content_json = match CStr::from_ptr(content_json).to_str() {
-        Ok(s) => s,
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-
-    let content: Value = match serde_json::from_str(content_json) {
-        Ok(c) => c,
-        Err(_) => return SyncResult::ErrorSerialization,
-    };
-
-    let engine_guard = engine.engine.lock().unwrap();
-    let doc_id = if let Some(ref sync_engine) = *engine_guard {
-        // Online mode - use sync engine
-        match engine.block_on(async { sync_engine.create_document(content.clone()).await }) {
-            Ok(doc) => {
-                // Emit event to FFI event dispatcher
-                engine
-                    .event_dispatcher
-                    .emit_document_created_with_attribution(
-                        &doc.id,
-                        &content,
-                        doc.user_id.as_ref(),
-                        doc.author_name.as_deref(),
-                        doc.visibility.as_deref(),
-                        EventOrigin::Local,
-                    );
-                doc.id
-            }
-            Err(_) => return SyncResult::ErrorConnection,
+    guard(|| {
+        if handle.is_null() || out_document_id.is_null() {
+            return SyncResult::ErrorInvalidInput;
         }
-    } else {
-        drop(engine_guard);
-        // Offline mode - create locally
-        let doc_id = Uuid::new_v4();
-        let user_id = match engine.block_on(async { engine.database.get_user_id().await }) {
-            Ok(id) => id,
-            Err(_) => return SyncResult::ErrorDatabase,
+        let content = match json_arg(content_json) {
+            Ok(content) => content,
+            Err(result) => return result,
         };
-
-        let doc = replicant_core::models::Document {
-            id: doc_id,
-            user_id: Some(user_id),
-            content: content.clone(),
-            sync_revision: 1,
-            content_hash: None,
-            title: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            deleted_at: None,
-            author_name: None,
-            visibility: None,
-            provenance: None,
-        };
-
-        if engine
-            .block_on(async { engine.database.save_document(&doc).await })
-            .is_err()
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant
+            .handle
+            .block_on(store.create_document(None, content))
         {
-            return SyncResult::ErrorDatabase;
+            Ok(doc_id) => {
+                replicant.handle.notify_outbox();
+                write_id(out_document_id, doc_id);
+                SyncResult::Success
+            }
+            Err(error) => store_result(&error),
         }
-
-        // Emit event for offline document creation
-        engine
-            .event_dispatcher
-            .emit_document_created_with_attribution(
-                &doc_id,
-                &content,
-                doc.user_id.as_ref(),
-                doc.author_name.as_deref(),
-                doc.visibility.as_deref(),
-                EventOrigin::Local,
-            );
-
-        doc_id
-    };
-
-    // Copy document ID to output buffer
-    let id_string = doc_id.to_string();
-    let id_bytes = id_string.as_bytes();
-    if id_bytes.len() >= 36 {
-        unsafe {
-            ptr::copy_nonoverlapping(id_bytes.as_ptr(), out_document_id as *mut u8, 36);
-            out_document_id.add(36).write(0); // null terminator
-        }
-    }
-
-    SyncResult::Success
+    })
 }
 
-/// Create a new document with a specified ID
-///
-/// # Arguments
-/// * `engine` - Sync engine instance
-/// * `document_id` - UUID string to use as the document ID
-/// * `content_json` - Document content as JSON string
-///
-/// # Returns
-/// * `SyncResult::Success` - Document created successfully
-/// * `SyncResult::ErrorInvalidInput` - Invalid UUID format or null pointers
-/// * `SyncResult::ErrorSerialization` - Invalid JSON content
-/// * `SyncResult::ErrorDatabase` - Database operation failed
-/// * `SyncResult::ErrorConnection` - Sync to server failed (document saved locally)
-///
-/// # Note
-/// If a document with the specified ID already exists, it will be overwritten (upsert behavior).
-/// Use this for ID preservation during data migration or import scenarios.
+/// Creates a document with a chosen id. Refused (`ErrorAlreadyExists`) when the id exists here
+/// or was deleted.
 ///
 /// # Safety
-/// Caller must ensure engine is valid, document_id and content_json are valid C strings
+/// Valid handle and C strings.
 #[no_mangle]
 pub unsafe extern "C" fn replicant_create_document_with_id(
-    engine: *mut Replicant,
+    handle: *mut Replicant,
     document_id: *const c_char,
     content_json: *const c_char,
 ) -> SyncResult {
-    if engine.is_null() || document_id.is_null() || content_json.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let engine = &mut *engine;
-
-    let document_id_str = match CStr::from_ptr(document_id).to_str() {
-        Ok(s) => s,
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-
-    let doc_id = match Uuid::parse_str(document_id_str) {
-        Ok(id) => id,
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-
-    let content_json = match CStr::from_ptr(content_json).to_str() {
-        Ok(s) => s,
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-
-    let content: Value = match serde_json::from_str(content_json) {
-        Ok(c) => c,
-        Err(_) => return SyncResult::ErrorSerialization,
-    };
-
-    let engine_guard = engine.engine.lock().unwrap();
-    if let Some(ref sync_engine) = *engine_guard {
-        // Online mode - use sync engine
-        match engine.block_on(async {
-            sync_engine
-                .create_document_with_id(doc_id, content.clone())
-                .await
-        }) {
-            Ok(doc) => {
-                engine
-                    .event_dispatcher
-                    .emit_document_created_with_attribution(
-                        &doc.id,
-                        &content,
-                        doc.user_id.as_ref(),
-                        doc.author_name.as_deref(),
-                        doc.visibility.as_deref(),
-                        EventOrigin::Local,
-                    );
-            }
-            Err(_) => return SyncResult::ErrorConnection,
-        }
-    } else {
-        drop(engine_guard);
-        // Offline mode - create locally
-        let user_id = match engine.block_on(async { engine.database.get_user_id().await }) {
-            Ok(id) => id,
-            Err(_) => return SyncResult::ErrorDatabase,
+    guard(|| {
+        let (false, Some(doc_id)) = (handle.is_null(), uuid_arg(document_id)) else {
+            return SyncResult::ErrorInvalidInput;
         };
-
-        let doc = replicant_core::models::Document {
-            id: doc_id,
-            user_id: Some(user_id),
-            content: content.clone(),
-            sync_revision: 1,
-            content_hash: None,
-            title: None,
-            created_at: chrono::Utc::now(),
-            updated_at: chrono::Utc::now(),
-            deleted_at: None,
-            author_name: None,
-            visibility: None,
-            provenance: None,
+        let content = match json_arg(content_json) {
+            Ok(content) => content,
+            Err(result) => return result,
         };
-
-        if engine
-            .block_on(async { engine.database.save_document(&doc).await })
-            .is_err()
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant
+            .handle
+            .block_on(store.create_document(Some(doc_id), content))
         {
-            return SyncResult::ErrorDatabase;
+            Ok(_) => {
+                replicant.handle.notify_outbox();
+                SyncResult::Success
+            }
+            Err(error) => store_result(&error),
         }
-
-        engine
-            .event_dispatcher
-            .emit_document_created_with_attribution(
-                &doc_id,
-                &content,
-                doc.user_id.as_ref(),
-                doc.author_name.as_deref(),
-                doc.visibility.as_deref(),
-                EventOrigin::Local,
-            );
-    }
-
-    SyncResult::Success
+    })
 }
 
-/// Update an existing document
-///
-/// # Arguments
-/// * `engine` - Sync engine instance
-/// * `document_id` - Document ID to update
-/// * `content_json` - New document content as JSON string
-///
-/// # Returns
-/// * CSyncResult indicating success or failure
-///
 /// # Safety
-/// Caller must ensure engine is valid and both document_id and content_json are valid C strings
+/// Valid handle and C strings.
 #[no_mangle]
 pub unsafe extern "C" fn replicant_update_document(
-    engine: *mut Replicant,
+    handle: *mut Replicant,
     document_id: *const c_char,
     content_json: *const c_char,
 ) -> SyncResult {
-    if engine.is_null() || document_id.is_null() || content_json.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let engine = &mut *engine;
-
-    let document_id = match CStr::from_ptr(document_id).to_str() {
-        Ok(s) => s,
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-
-    let doc_uuid = match Uuid::parse_str(document_id) {
-        Ok(id) => id,
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-
-    let content_json = match CStr::from_ptr(content_json).to_str() {
-        Ok(s) => s,
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-
-    let content: Value = match serde_json::from_str(content_json) {
-        Ok(c) => c,
-        Err(_) => return SyncResult::ErrorSerialization,
-    };
-
-    let engine_guard = engine.engine.lock().unwrap();
-    if let Some(ref sync_engine) = *engine_guard {
-        // Online mode
-        match engine.block_on(async { sync_engine.update_document(doc_uuid, content).await }) {
-            Ok(_) => SyncResult::Success,
-            Err(_) => SyncResult::ErrorConnection,
-        }
-    } else {
-        drop(engine_guard);
-        // Offline mode - update locally
-        let doc = match engine.block_on(async { engine.database.get_document(&doc_uuid).await }) {
-            Ok(d) => d,
-            Err(_) => return SyncResult::ErrorDatabase,
+    guard(|| {
+        let (false, Some(doc_id)) = (handle.is_null(), uuid_arg(document_id)) else {
+            return SyncResult::ErrorInvalidInput;
         };
-
-        let mut updated_doc = doc;
-        updated_doc.content = content;
-        updated_doc.sync_revision += 1;
-        updated_doc.content_hash = None; // Will be recalculated on server
-        updated_doc.updated_at = chrono::Utc::now();
-
-        match engine.block_on(async { engine.database.save_document(&updated_doc).await }) {
-            Ok(_) => {
-                // Emit event for offline document update
-                engine
-                    .event_dispatcher
-                    .emit_document_updated_with_attribution(
-                        &doc_uuid,
-                        &updated_doc.content,
-                        updated_doc.user_id.as_ref(),
-                        updated_doc.author_name.as_deref(),
-                        updated_doc.visibility.as_deref(),
-                        EventOrigin::Local,
-                    );
+        let content = match json_arg(content_json) {
+            Ok(content) => content,
+            Err(result) => return result,
+        };
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant
+            .handle
+            .block_on(store.update_document(doc_id, content))
+        {
+            Ok(()) => {
+                replicant.handle.notify_outbox();
                 SyncResult::Success
             }
-            Err(_) => SyncResult::ErrorDatabase,
+            Err(error) => store_result(&error),
         }
-    }
+    })
 }
 
-/// Delete a document
-///
-/// # Arguments
-/// * `engine` - Sync engine instance
-/// * `document_id` - Document ID to delete
-///
-/// # Returns
-/// * CSyncResult indicating success or failure
-///
 /// # Safety
-/// Caller must ensure engine is valid and document_id is a valid C string
+/// Valid handle and C string.
 #[no_mangle]
 pub unsafe extern "C" fn replicant_delete_document(
-    engine: *mut Replicant,
+    handle: *mut Replicant,
     document_id: *const c_char,
 ) -> SyncResult {
-    if engine.is_null() || document_id.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let engine = &mut *engine;
-
-    let document_id = match CStr::from_ptr(document_id).to_str() {
-        Ok(s) => s,
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-
-    let doc_uuid = match Uuid::parse_str(document_id) {
-        Ok(id) => id,
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-
-    let engine_guard = engine.engine.lock().unwrap();
-    if let Some(ref sync_engine) = *engine_guard {
-        // Online mode
-        match engine.block_on(async { sync_engine.delete_document(doc_uuid).await }) {
-            Ok(_) => SyncResult::Success,
-            Err(_) => SyncResult::ErrorConnection,
-        }
-    } else {
-        drop(engine_guard);
-        // Offline mode
-        match engine.block_on(async { engine.database.delete_document(&doc_uuid).await }) {
-            Ok(_) => {
-                // Emit event for offline document deletion
-                engine
-                    .event_dispatcher
-                    .emit_document_deleted(&doc_uuid, EventOrigin::Local);
+    guard(|| {
+        let (false, Some(doc_id)) = (handle.is_null(), uuid_arg(document_id)) else {
+            return SyncResult::ErrorInvalidInput;
+        };
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant.handle.block_on(store.delete_document(doc_id)) {
+            Ok(()) => {
+                replicant.handle.notify_outbox();
                 SyncResult::Success
             }
-            Err(_) => SyncResult::ErrorDatabase,
+            Err(error) => store_result(&error),
         }
-    }
+    })
 }
 
-/// Free a C string allocated by this library
+/// The document as a JSON object. `ErrorNotFound` when missing or deleted.
+///
+/// JSON naming in this API: a document's own id is `id`; any other record that refers to a
+/// document names it `doc_id`. Ids are lowercase hyphenated UUID strings. A document object has:
+/// - `id` (string): the document's id.
+/// - `owner_id` (string or null): the owning user; null only for a legacy document with none.
+/// - `author_id` (string or null): the author the server reports; null until it has synced.
+/// - `title` (string or null): the string at `ReplicantConfig.title_pointer` in the content,
+///   cut to 128 characters; null without a pointer or when that value is not a string.
+/// - `content`: the host's own JSON value, as last written or synced.
+/// - `read_only` (bool): the server marked it read-only (a publication); writes are refused.
+/// - `visibility` (string): `public` (curated or read-only) or `private`.
+/// - `source_doc_id`, `derived_from` (string or null): ids of the documents it came from.
+/// - `created_at`, `updated_at` (string): RFC 3339 in UTC, e.g.
+///   `2026-10-01T07:51:25.301096+00:00`. Times on this device: when the document was first
+///   stored here, and when its content last changed here (a local edit or a synced change).
 ///
 /// # Safety
-/// Caller must ensure the string was allocated by this library and hasn't been freed
+/// Valid handle, C string and out pointer; free the result with `replicant_string_free`.
 #[no_mangle]
-pub unsafe extern "C" fn replicant_string_free(s: *mut c_char) {
-    if !s.is_null() {
-        let _ = CString::from_raw(s);
-    }
+pub unsafe extern "C" fn replicant_get_document(
+    handle: *mut Replicant,
+    document_id: *const c_char,
+    out_json: *mut *mut c_char,
+) -> SyncResult {
+    guard(|| {
+        clear_out(out_json);
+        let (false, false, Some(doc_id)) =
+            (handle.is_null(), out_json.is_null(), uuid_arg(document_id))
+        else {
+            return SyncResult::ErrorInvalidInput;
+        };
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant.handle.block_on(store.get_document(doc_id)) {
+            Ok(Some(document)) => write_json(out_json, &document),
+            Ok(None) => SyncResult::ErrorNotFound,
+            Err(error) => store_result(&error),
+        }
+    })
 }
 
-/// Get the engine's own frozen user UUID
-///
-/// # Arguments
-/// * `engine` - Sync engine instance
-/// * `out_user_id` - Output pointer for user UUID string (caller must free with replicant_string_free)
-///
-/// # Returns
-/// * SyncResult::Success if the user ID was retrieved
-/// * SyncResult::ErrorInvalidInput if engine or out_user_id is null
-/// * SyncResult::ErrorDatabase if the user ID could not be read
+/// Every visible document as a JSON array of document objects (see `replicant_get_document`).
 ///
 /// # Safety
-/// Caller must ensure engine is valid and out_user_id is a valid pointer
+/// Valid handle and out pointer; free the result with `replicant_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_get_all_documents(
+    handle: *mut Replicant,
+    out_json: *mut *mut c_char,
+) -> SyncResult {
+    guard(|| {
+        clear_out(out_json);
+        if handle.is_null() || out_json.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant.handle.block_on(store.list_documents()) {
+            Ok(documents) => write_json(out_json, &documents),
+            Err(error) => store_result(&error),
+        }
+    })
+}
+
+/// Document ids as a JSON array of strings; `include_deleted` adds documents whose delete is not
+/// yet sent.
+///
+/// # Safety
+/// Valid handle and out pointer; free the result with `replicant_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_get_all_document_ids(
+    handle: *mut Replicant,
+    include_deleted: bool,
+    out_json: *mut *mut c_char,
+) -> SyncResult {
+    guard(|| {
+        clear_out(out_json);
+        if handle.is_null() || out_json.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant
+            .handle
+            .block_on(store.document_ids(include_deleted))
+        {
+            Ok(ids) => write_json(out_json, &ids),
+            Err(error) => store_result(&error),
+        }
+    })
+}
+
+/// # Safety
+/// Valid handle and out pointer.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_count_documents(
+    handle: *mut Replicant,
+    out_count: *mut u64,
+) -> SyncResult {
+    guard(|| {
+        if handle.is_null() || out_count.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant.handle.block_on(store.count_documents()) {
+            Ok(count) => {
+                *out_count = count;
+                SyncResult::Success
+            }
+            Err(error) => store_result(&error),
+        }
+    })
+}
+
+/// Documents with changes the server has not acknowledged, except parked ones
+/// (`replicant_list_parked`).
+///
+/// # Safety
+/// Valid handle and out pointer.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_count_pending_sync(
+    handle: *mut Replicant,
+    out_count: *mut u64,
+) -> SyncResult {
+    guard(|| {
+        if handle.is_null() || out_count.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant.handle.block_on(store.count_pending_sync()) {
+            Ok(count) => {
+                *out_count = count;
+                SyncResult::Success
+            }
+            Err(error) => store_result(&error),
+        }
+    })
+}
+
+/// Whether the engine is connected now. `replicant_get_state` says more.
+///
+/// # Safety
+/// `handle` must be valid or null.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_is_connected(handle: *mut Replicant) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        !handle.is_null() && (*handle).handle.state().connection == ConnectionView::Connected
+    }))
+    .unwrap_or(false)
+}
+
+/// Connection, sync phase and halt reason, for a status indicator. Set
+/// `out_state->struct_size = sizeof(ReplicantState)` first. True from the moment
+/// `replicant_create` returns: with no usable stored credentials it is already
+/// `Halted`/`NotEnrolled`.
+///
+/// # Safety
+/// Valid handle and out pointer.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_get_state(
+    handle: *mut Replicant,
+    out_state: *mut ReplicantState,
+) -> SyncResult {
+    guard(|| {
+        if handle.is_null() || out_state.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        // Raw field writes: the host's struct may hold values that are not valid Rust enums.
+        let host_size = ptr::addr_of!((*out_state).struct_size).read() as usize;
+        if host_size < STATE_SIZE_V1_0 {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let state = ReplicantState::from(&(*handle).handle.state());
+        ptr::addr_of_mut!((*out_state).connection).write(state.connection);
+        ptr::addr_of_mut!((*out_state).sync).write(state.sync);
+        ptr::addr_of_mut!((*out_state).halt_reason).write(state.halt_reason);
+        ptr::addr_of_mut!((*out_state).struct_size).write(STATE_SIZE_V1_0 as u32);
+        SyncResult::Success
+    })
+}
+
+/// Leaves `Halted` or retries now. Safe to call repeatedly: the engine dials at most once a second.
+///
+/// # Safety
+/// Valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_reconnect(handle: *mut Replicant) -> SyncResult {
+    guard(|| {
+        if handle.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        (*handle).handle.reconnect();
+        SyncResult::Success
+    })
+}
+
+/// The data dir's user id (provisional until the first join).
+///
+/// # Safety
+/// Valid handle and out pointer; free the result with `replicant_string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn replicant_get_user_id(
-    engine: *mut Replicant,
+    handle: *mut Replicant,
     out_user_id: *mut *mut c_char,
 ) -> SyncResult {
-    if engine.is_null() || out_user_id.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let engine = &*engine;
-
-    let user_id = match engine.block_on(async { engine.database.get_user_id().await }) {
-        Ok(id) => id,
-        Err(_) => return SyncResult::ErrorDatabase,
-    };
-
-    match CString::new(user_id.to_string()) {
-        Ok(c_str) => {
-            *out_user_id = c_str.into_raw();
-            SyncResult::Success
+    guard(|| {
+        clear_out(out_user_id);
+        if handle.is_null() || out_user_id.is_null() {
+            return SyncResult::ErrorInvalidInput;
         }
-        Err(_) => SyncResult::ErrorSerialization,
-    }
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant.handle.block_on(store.user_id()) {
+            Ok(user_id) => match CString::new(user_id.to_string()) {
+                Ok(text) => {
+                    *out_user_id = text.into_raw();
+                    SyncResult::Success
+                }
+                Err(_) => SyncResult::ErrorSerialization,
+            },
+            Err(error) => store_result(&error),
+        }
+    })
 }
 
-/// Get library version string
+/// # Safety
+/// Valid handle and C string (a JSON array of JSON paths, e.g. `["$.body"]`).
 #[no_mangle]
-pub extern "C" fn replicant_get_version() -> *mut c_char {
-    let version = env!("CARGO_PKG_VERSION");
-    match CString::new(version) {
-        Ok(s) => s.into_raw(),
-        Err(_) => ptr::null_mut(),
-    }
+pub unsafe extern "C" fn replicant_configure_search(
+    handle: *mut Replicant,
+    paths_json: *const c_char,
+) -> SyncResult {
+    guard(|| {
+        if handle.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let paths: Vec<String> = match json_arg(paths_json).map(serde_json::from_value) {
+            Ok(Ok(paths)) => paths,
+            Ok(Err(_)) => return SyncResult::ErrorSerialization,
+            Err(result) => return result,
+        };
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant.handle.block_on(store.configure_search(&paths)) {
+            Ok(()) => SyncResult::Success,
+            Err(error) => store_result(&error),
+        }
+    })
 }
 
-/// Register a callback for document events (Created, Updated, Deleted)
-///
-/// # Arguments
-/// * `engine` - Sync engine instance
-/// * `callback` - C callback function to invoke for document events
-/// * `context` - User-defined context pointer passed to callback
-/// * `event_filter` - Optional filter: 0=Created, 1=Updated, 2=Deleted, -1=all document events
-///
-/// # Returns
-/// * SyncResult indicating success or failure
+/// FTS5 query (`music`, `tun*`, `"a phrase"`, `a AND b`, `title:word`, where `title` is the
+/// document's title from `ReplicantConfig.title_pointer`); `limit` 0 means 100. A
+/// query FTS5 cannot parse is `ErrorInvalidInput`. The result is a JSON array of document
+/// objects (see `replicant_get_document`), best match first.
 ///
 /// # Safety
-/// Caller must ensure engine is valid, callback is a valid function pointer, and context pointer outlives the callback registration
+/// Valid handle, C string and out pointer; free the result with `replicant_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_search_documents(
+    handle: *mut Replicant,
+    query: *const c_char,
+    limit: u32,
+    out_json: *mut *mut c_char,
+) -> SyncResult {
+    guard(|| {
+        clear_out(out_json);
+        let (false, false, Some(query)) = (handle.is_null(), out_json.is_null(), str_arg(query))
+        else {
+            return SyncResult::ErrorInvalidInput;
+        };
+        let limit = if limit == 0 { 100 } else { limit };
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant
+            .handle
+            .block_on(store.search_documents(query, limit))
+        {
+            Ok(documents) => write_json(out_json, &documents),
+            Err(error) => store_result(&error),
+        }
+    })
+}
+
+/// # Safety
+/// Valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_rebuild_search_index(handle: *mut Replicant) -> SyncResult {
+    guard(|| {
+        if handle.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant.handle.block_on(store.rebuild_search_index()) {
+            Ok(()) => SyncResult::Success,
+            Err(error) => store_result(&error),
+        }
+    })
+}
+
+/// One kept copy as the host lists it.
+#[derive(Serialize)]
+struct KeptCopyJson<'a> {
+    recovered_id: i64,
+    doc_id: Uuid,
+    title: Option<String>,
+    reason: &'a str,
+    recovered_at: i64,
+    content: &'a Value,
+    fields: &'a Option<Vec<FieldConflict>>,
+}
+
+/// Kept copies (local content sync set aside), newest first, as a JSON array of objects:
+/// - `recovered_id` (integer): the copy's id, for `replicant_dismiss_recovered` and the restores.
+/// - `doc_id` (string): the document the copy was kept from (it may since have been deleted).
+/// - `title` (string or null): the kept content's title, derived as a document's is.
+/// - `reason` (string): `conflict`, `field_conflict`, `delete_wins`, `delete_superseded`,
+///   `delete_refused`, `delete_publication`, `became_publication`, `create_rejected` or
+///   `unmigratable` (set aside while upgrading the database).
+/// - `recovered_at` (integer): when it was kept, in Unix seconds.
+/// - `content`: the host's own JSON value, as it was locally when kept.
+/// - `fields` (array or null): null for a whole-document copy; else one object per conflicting
+///   path: `path` (string, a JSON Pointer), `local_value` (any JSON; null when removed locally),
+///   `local_removed` (bool: the local side removed the path).
+///
+/// Copies never expire: they stay until dismissed or restored. A copy that cannot be read is left
+/// out (and logged).
+///
+/// # Safety
+/// Valid handle and out pointer; free the result with `replicant_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_list_recovered(
+    handle: *mut Replicant,
+    out_json: *mut *mut c_char,
+) -> SyncResult {
+    guard(|| {
+        clear_out(out_json);
+        if handle.is_null() || out_json.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant.handle.block_on(store.list_recovered()) {
+            Ok(copies) => {
+                let listed: Vec<KeptCopyJson> = copies
+                    .iter()
+                    .map(|copy| KeptCopyJson {
+                        recovered_id: copy.id,
+                        doc_id: copy.doc_id,
+                        title: store.title_of(&copy.content),
+                        reason: &copy.reason,
+                        recovered_at: copy.recovered_at,
+                        content: &copy.content,
+                        fields: &copy.fields,
+                    })
+                    .collect();
+                write_json(out_json, &listed)
+            }
+            Err(error) => store_result(&error),
+        }
+    })
+}
+
+/// Deletes a kept copy for good; `ErrorNotFound` when it is already gone.
+///
+/// # Safety
+/// Valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_dismiss_recovered(
+    handle: *mut Replicant,
+    recovered_id: i64,
+) -> SyncResult {
+    guard(|| {
+        if handle.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant
+            .handle
+            .block_on(store.dismiss_recovered(recovered_id))
+        {
+            Ok(true) => SyncResult::Success,
+            Ok(false) => SyncResult::ErrorNotFound,
+            Err(error) => store_result(&error),
+        }
+    })
+}
+
+/// Re-creates a kept copy's full content as a new document, with a new id written to
+/// `out_document_id` (`REPLICANT_DOCUMENT_ID_LEN + 1` bytes), and removes the copy. Works for
+/// any copy, a field copy too (the way out when its document is gone). `ErrorNotFound` when the
+/// copy is gone (another process may have dismissed or restored it).
+///
+/// # Safety
+/// Valid handle and a `REPLICANT_DOCUMENT_ID_LEN + 1`-byte buffer.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_restore_document(
+    handle: *mut Replicant,
+    recovered_id: i64,
+    out_document_id: *mut c_char,
+) -> SyncResult {
+    guard(|| {
+        if handle.is_null() || out_document_id.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant
+            .handle
+            .block_on(store.restore_document(recovered_id))
+        {
+            Ok(doc_id) => {
+                replicant.handle.notify_outbox();
+                write_id(out_document_id, doc_id);
+                SyncResult::Success
+            }
+            Err(error) => store_result(&error),
+        }
+    })
+}
+
+/// Writes a field copy's kept values back at their paths as a local edit (every other field
+/// keeps its current value) and removes the copy.
+///
+/// A list conflict is kept as the whole list, so restoring it puts that list back exactly.
+/// `ErrorNotFound`: the copy is gone. `ErrorInvalidInput`: it is a whole-document copy (its
+/// `fields` is null); it stays, and `replicant_restore_document` restores it.
+/// `ErrorDocumentGone`: its document was deleted, and `ErrorNotWritable`: it became read-only;
+/// the copy stays in both cases, and `replicant_restore_document` brings it back as a new
+/// document.
+///
+/// # Safety
+/// Valid handle.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_restore_fields(
+    handle: *mut Replicant,
+    recovered_id: i64,
+) -> SyncResult {
+    guard(|| {
+        if handle.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant
+            .handle
+            .block_on(store.restore_fields(recovered_id))
+        {
+            Ok(()) => {
+                replicant.handle.notify_outbox();
+                SyncResult::Success
+            }
+            Err(error) => store_result(&error),
+        }
+    })
+}
+
+/// Documents that stopped uploading until their next local edit, as a JSON array of objects:
+/// `doc_id` (string, the parked document) and `code` (string: `validation`, `forbidden`,
+/// `too_large` or `diverged`). Parked documents are not counted in
+/// `replicant_count_pending_sync`; a new local edit un-parks one.
+///
+/// # Safety
+/// Valid handle and out pointer; free the result with `replicant_string_free`.
+#[no_mangle]
+pub unsafe extern "C" fn replicant_list_parked(
+    handle: *mut Replicant,
+    out_json: *mut *mut c_char,
+) -> SyncResult {
+    guard(|| {
+        clear_out(out_json);
+        if handle.is_null() || out_json.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let replicant = &*handle;
+        let store = replicant.handle.store();
+        match replicant.handle.block_on(store.list_parked()) {
+            Ok(parked) => write_json(out_json, &parked),
+            Err(error) => store_result(&error),
+        }
+    })
+}
+
+/// `event_filter`: -1 every document event, 1 `DocumentChanged` only, 2 `DocumentDeleted` only.
+/// One callback per kind: registering again replaces the previous callback, filter and context;
+/// a null callback removes it (its events are then dropped when pumped). Once this returns, the
+/// old context is never called again, even for the rest of a batch being pumped. The first
+/// registration on a handle, of any kind and even a null one, binds its thread: later
+/// registrations and `replicant_process_events` must come from that thread
+/// (`ErrorWrongThread` otherwise).
+///
+/// # Safety
+/// Valid handle; `context` must outlive the handle.
 #[no_mangle]
 pub unsafe extern "C" fn replicant_register_document_callback(
-    engine: *mut Replicant,
-    callback: DocumentEventCallback,
+    handle: *mut Replicant,
+    callback: ReplicantDocumentEventCallback,
     context: *mut c_void,
     event_filter: i32,
 ) -> SyncResult {
-    if engine.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let engine = &*engine;
-
-    let filter = if event_filter >= 0 {
-        match event_filter {
-            0 => Some(EventType::DocumentCreated),
-            1 => Some(EventType::DocumentUpdated),
+    guard(|| {
+        if handle.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let filter = match event_filter {
+            -1 => None,
+            1 => Some(EventType::DocumentChanged),
             2 => Some(EventType::DocumentDeleted),
             _ => return SyncResult::ErrorInvalidInput,
-        }
-    } else {
-        None
-    };
-
-    match engine
-        .event_dispatcher
-        .register_document_callback(callback, context, filter)
-    {
-        Ok(_) => SyncResult::Success,
-        Err(_) => SyncResult::ErrorUnknown,
-    }
+        };
+        registered(
+            (*handle)
+                .dispatcher
+                .register_document(callback, context, filter),
+        )
+    })
 }
 
-/// Register a callback for sync events (Started, Completed)
-///
-/// # Arguments
-/// * `engine` - Sync engine instance
-/// * `callback` - C callback function to invoke for sync events
-/// * `context` - User-defined context pointer passed to callback
-///
-/// # Returns
-/// * SyncResult indicating success or failure
+/// `SyncStarted`, `SyncCompleted`, `DatabaseChanged` and `IdentityAdopted`. Replaces or removes
+/// as `replicant_register_document_callback` does.
 ///
 /// # Safety
-/// Caller must ensure engine is valid, callback is a valid function pointer, and context pointer outlives the callback registration
+/// Valid handle; `context` must outlive the handle.
 #[no_mangle]
 pub unsafe extern "C" fn replicant_register_sync_callback(
-    engine: *mut Replicant,
-    callback: SyncEventCallback,
+    handle: *mut Replicant,
+    callback: ReplicantSyncEventCallback,
     context: *mut c_void,
 ) -> SyncResult {
-    if engine.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let engine = &*engine;
-
-    match engine
-        .event_dispatcher
-        .register_sync_callback(callback, context)
-    {
-        Ok(_) => SyncResult::Success,
-        Err(_) => SyncResult::ErrorUnknown,
-    }
+    guard(|| {
+        if handle.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        registered((*handle).dispatcher.register_sync(callback, context))
+    })
 }
 
-/// Register a callback for error events (SyncError)
-///
-/// # Arguments
-/// * `engine` - Sync engine instance
-/// * `callback` - C callback function to invoke for error events
-/// * `context` - User-defined context pointer passed to callback
-///
-/// # Returns
-/// * SyncResult indicating success or failure
+/// Replaces or removes as `replicant_register_document_callback` does.
 ///
 /// # Safety
-/// Caller must ensure engine is valid, callback is a valid function pointer, and context pointer outlives the callback registration
+/// Valid handle; `context` must outlive the handle.
 #[no_mangle]
 pub unsafe extern "C" fn replicant_register_error_callback(
-    engine: *mut Replicant,
-    callback: ErrorEventCallback,
+    handle: *mut Replicant,
+    callback: ReplicantErrorEventCallback,
     context: *mut c_void,
 ) -> SyncResult {
-    if engine.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let engine = &*engine;
-
-    match engine
-        .event_dispatcher
-        .register_error_callback(callback, context)
-    {
-        Ok(_) => SyncResult::Success,
-        Err(_) => SyncResult::ErrorUnknown,
-    }
+    guard(|| {
+        if handle.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        registered((*handle).dispatcher.register_error(callback, context))
+    })
 }
 
-/// Register a callback for connection events (Lost, Attempted, Succeeded)
-///
-/// # Arguments
-/// * `engine` - Sync engine instance
-/// * `callback` - C callback function to invoke for connection events
-/// * `context` - User-defined context pointer passed to callback
-///
-/// # Returns
-/// * SyncResult indicating success or failure
+/// Replaces or removes as `replicant_register_document_callback` does.
 ///
 /// # Safety
-/// Caller must ensure engine is valid, callback is a valid function pointer, and context pointer outlives the callback registration
+/// Valid handle; `context` must outlive the handle.
 #[no_mangle]
 pub unsafe extern "C" fn replicant_register_connection_callback(
-    engine: *mut Replicant,
-    callback: ConnectionEventCallback,
+    handle: *mut Replicant,
+    callback: ReplicantConnectionEventCallback,
     context: *mut c_void,
 ) -> SyncResult {
-    if engine.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let engine = &*engine;
-
-    match engine
-        .event_dispatcher
-        .register_connection_callback(callback, context)
-    {
-        Ok(_) => SyncResult::Success,
-        Err(_) => SyncResult::ErrorUnknown,
-    }
+    guard(|| {
+        if handle.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        registered((*handle).dispatcher.register_connection(callback, context))
+    })
 }
 
-/// Register a callback for conflict events (ConflictDetected)
-///
-/// # Arguments
-/// * `engine` - Sync engine instance
-/// * `callback` - C callback function to invoke for conflict events
-/// * `context` - User-defined context pointer passed to callback
-///
-/// # Returns
-/// * SyncResult indicating success or failure
+/// Replaces or removes as `replicant_register_document_callback` does.
 ///
 /// # Safety
-/// Caller must ensure engine is valid, callback is a valid function pointer, and context pointer outlives the callback registration
+/// Valid handle; `context` must outlive the handle.
 #[no_mangle]
 pub unsafe extern "C" fn replicant_register_conflict_callback(
-    engine: *mut Replicant,
-    callback: ConflictEventCallback,
+    handle: *mut Replicant,
+    callback: ReplicantConflictEventCallback,
     context: *mut c_void,
 ) -> SyncResult {
-    if engine.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let engine = &*engine;
-
-    match engine
-        .event_dispatcher
-        .register_conflict_callback(callback, context)
-    {
-        Ok(_) => SyncResult::Success,
-        Err(_) => SyncResult::ErrorUnknown,
-    }
+    guard(|| {
+        if handle.is_null() {
+            return SyncResult::ErrorInvalidInput;
+        }
+        registered((*handle).dispatcher.register_conflict(callback, context))
+    })
 }
 
-/// Register a callback for IdentityChanged events
+/// Runs the callbacks for every queued event. Must be called on the thread of the handle's first
+/// registration (a null one binds too): refused with `ErrorWrongThread` elsewhere, without
+/// disturbing a pump running on the bound thread, and `ErrorNoCallbacks` before any
+/// registration; nothing is lost either way. The thread cannot be changed later. A
+/// `replicant_destroy` of this handle from inside a callback frees it when this call returns;
+/// the rest of the batch is not delivered. A call from inside a callback returns
+/// `ErrorInvalidInput`. No rebind: if the registering thread ends, register again on a new
+/// handle.
 ///
-/// # Arguments
-/// * `engine` - Sync engine instance
-/// * `callback` - Function to call when the server-authoritative id is adopted
-/// * `context` - User-defined context pointer passed to callback
-///
-/// # Returns
-/// * SyncResult indicating success or failure
-///
-/// # Safety
-/// Caller must ensure engine is valid, callback is a valid function pointer, and context pointer outlives the callback registration
-#[no_mangle]
-pub unsafe extern "C" fn replicant_register_identity_callback(
-    engine: *mut Replicant,
-    callback: IdentityEventCallback,
-    context: *mut c_void,
-) -> SyncResult {
-    if engine.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let engine = &*engine;
-
-    match engine
-        .event_dispatcher
-        .register_identity_callback(callback, context)
-    {
-        Ok(_) => SyncResult::Success,
-        Err(_) => SyncResult::ErrorUnknown,
-    }
-}
-
-/// Process all queued events on the current thread
-///
-/// # Arguments
-/// * `engine` - Sync engine instance
-/// * `out_processed_count` - Output pointer for number of events processed (optional)
-///
-/// # Returns
-/// * CSyncResult indicating success or failure
-///
-/// # Important
-/// This function MUST be called on the same thread where callbacks were registered.
-/// Events are queued from any thread but only processed on the callback thread.
+/// Callbacks must not throw or unwind. Inside a callback every call is allowed except
+/// `replicant_process_events` on the same handle; a `replicant_destroy` of it is deferred.
 ///
 /// # Safety
-/// Caller must ensure engine is valid and out_processed_count points to valid memory (if not null)
+/// Valid handle; `out_processed_count` may be null.
 #[no_mangle]
 pub unsafe extern "C" fn replicant_process_events(
-    engine: *mut Replicant,
+    handle: *mut Replicant,
     out_processed_count: *mut u32,
 ) -> SyncResult {
-    if engine.is_null() {
+    if handle.is_null() {
         return SyncResult::ErrorInvalidInput;
     }
-
-    let engine = &*engine;
-
-    match engine.event_dispatcher.process_events() {
-        Ok(count) => {
-            if !out_processed_count.is_null() {
-                out_processed_count.write(count as u32);
+    let replicant = &*handle;
+    // Checked before the pump flag, so a call from another thread never holds it.
+    if let Err(error) = replicant.dispatcher.may_process() {
+        return dispatch_result(error);
+    }
+    if replicant
+        .pump
+        .compare_exchange(
+            PUMP_IDLE,
+            PUMP_DISPATCHING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        return SyncResult::ErrorInvalidInput; // already pumping (a re-entrant call)
+    }
+    let result = guard(|| {
+        let destroy_requested = || replicant.pump.load(Ordering::SeqCst) == PUMP_DESTROY_REQUESTED;
+        match replicant
+            .dispatcher
+            .process(|| replicant.handle.take_events(), destroy_requested)
+        {
+            Ok(processed) => {
+                if !out_processed_count.is_null() {
+                    *out_processed_count = u32::try_from(processed).unwrap_or(u32::MAX);
+                }
+                SyncResult::Success
             }
-            SyncResult::Success
+            Err(error) => dispatch_result(error),
         }
-        Err(_) => SyncResult::ErrorUnknown,
-    }
-}
-
-/// Get a document by ID
-///
-/// # Arguments
-/// * `engine` - Sync engine instance
-/// * `document_id` - Document ID as UUID string
-/// * `out_content` - Output pointer for document JSON content (caller must free with replicant_string_free)
-///
-/// # Returns
-/// * SyncResult::Success if document found and content returned
-/// * SyncResult::ErrorInvalidInput if document not found or invalid ID
-///
-/// # Safety
-/// Caller must ensure engine is valid, document_id is a valid C string, and out_content is a valid pointer
-#[no_mangle]
-pub unsafe extern "C" fn replicant_get_document(
-    engine: *mut Replicant,
-    document_id: *const c_char,
-    out_content: *mut *mut c_char,
-) -> SyncResult {
-    if engine.is_null() || document_id.is_null() || out_content.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let engine = &*engine;
-
-    let document_id = match CStr::from_ptr(document_id).to_str() {
-        Ok(s) => s,
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-
-    let doc_uuid = match Uuid::parse_str(document_id) {
-        Ok(id) => id,
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-
-    let doc = match engine.block_on(async { engine.database.get_document(&doc_uuid).await }) {
-        Ok(d) => d,
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-
-    // Serialize document to JSON
-    let json = match serde_json::to_string(&doc) {
-        Ok(j) => j,
-        Err(_) => return SyncResult::ErrorSerialization,
-    };
-
-    match CString::new(json) {
-        Ok(c_str) => {
-            *out_content = c_str.into_raw();
-            SyncResult::Success
-        }
-        Err(_) => SyncResult::ErrorSerialization,
-    }
-}
-
-/// Get all documents as a JSON array
-///
-/// # Arguments
-/// * `engine` - Sync engine instance
-/// * `out_documents` - Output pointer for JSON array of documents (caller must free with replicant_string_free)
-///
-/// # Returns
-/// * SyncResult::Success with JSON array (empty array [] if no documents)
-///
-/// # Safety
-/// Caller must ensure engine is valid and out_documents is a valid pointer
-#[no_mangle]
-pub unsafe extern "C" fn replicant_get_all_documents(
-    engine: *mut Replicant,
-    out_documents: *mut *mut c_char,
-) -> SyncResult {
-    if engine.is_null() || out_documents.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let engine = &*engine;
-
-    let docs = match engine.block_on(async { engine.database.get_all_documents().await }) {
-        Ok(d) => d,
-        Err(_) => return SyncResult::ErrorDatabase,
-    };
-
-    // Serialize documents array to JSON
-    let json = match serde_json::to_string(&docs) {
-        Ok(j) => j,
-        Err(_) => return SyncResult::ErrorSerialization,
-    };
-
-    match CString::new(json) {
-        Ok(c_str) => {
-            *out_documents = c_str.into_raw();
-            SyncResult::Success
-        }
-        Err(_) => SyncResult::ErrorSerialization,
-    }
-}
-
-/// Get all document ids as a JSON array
-///
-/// # Arguments
-/// * `engine` - Sync engine instance
-/// * `include_deleted` - If true, include tombstoned (deleted) documents
-/// * `out_ids` - Output pointer for JSON array of id strings (caller must free with replicant_string_free)
-///
-/// # Returns
-/// * SyncResult::Success with JSON array (empty array [] if no documents)
-///
-/// # Safety
-/// Caller must ensure engine is valid and out_ids is a valid pointer
-#[no_mangle]
-pub unsafe extern "C" fn replicant_get_all_document_ids(
-    engine: *mut Replicant,
-    include_deleted: bool,
-    out_ids: *mut *mut c_char,
-) -> SyncResult {
-    if engine.is_null() || out_ids.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let engine = &*engine;
-
-    let ids = match engine
-        .block_on(async { engine.database.get_all_document_ids(include_deleted).await })
+    });
+    if replicant
+        .pump
+        .compare_exchange(
+            PUMP_DISPATCHING,
+            PUMP_IDLE,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        )
+        .is_err()
     {
-        Ok(d) => d,
-        Err(_) => return SyncResult::ErrorDatabase,
-    };
-
-    // Serialize ids array to JSON
-    let json = match serde_json::to_string(&ids) {
-        Ok(j) => j,
-        Err(_) => return SyncResult::ErrorSerialization,
-    };
-
-    match CString::new(json) {
-        Ok(c_str) => {
-            *out_ids = c_str.into_raw();
-            SyncResult::Success
-        }
-        Err(_) => SyncResult::ErrorSerialization,
+        free(handle);
     }
+    result
 }
 
-/// Get the count of local documents
-///
-/// # Arguments
-/// * `engine` - Sync engine instance
-/// * `out_count` - Output pointer for document count
-///
-/// # Returns
-/// * SyncResult::Success with count written to out_count
-///
 /// # Safety
-/// Caller must ensure engine is valid and out_count is a valid pointer
+/// `s` must come from this library and not be freed twice.
 #[no_mangle]
-pub unsafe extern "C" fn replicant_count_documents(
-    engine: *mut Replicant,
-    out_count: *mut u64,
-) -> SyncResult {
-    if engine.is_null() || out_count.is_null() {
-        return SyncResult::ErrorInvalidInput;
+pub unsafe extern "C" fn replicant_string_free(s: *mut c_char) {
+    if !s.is_null() {
+        drop(CString::from_raw(s));
     }
-
-    let engine = &*engine;
-
-    let count = match engine.block_on(async { engine.database.count_documents().await }) {
-        Ok(d) => d,
-        Err(_) => return SyncResult::ErrorDatabase,
-    };
-
-    *out_count = count as u64;
-    SyncResult::Success
 }
 
-/// Check if the sync engine is connected to the server
-///
-/// # Arguments
-/// * `engine` - Sync engine instance
-///
-/// # Returns
-/// * true if connected, false if disconnected or engine is null
-///
-/// # Safety
-/// Caller must ensure engine was created by replicant_create
+/// Found by `scripts/check_replicant_versions.py` in every binary that links this library.
+#[used]
+static VERSION_MARKER: &str = concat!("replicant-client-version=", env!("CARGO_PKG_VERSION"), "\0");
+
+/// This library's version, e.g. "0.7.0". Static: never free it.
 #[no_mangle]
-pub unsafe extern "C" fn replicant_is_connected(engine: *mut Replicant) -> bool {
-    if engine.is_null() {
-        return false;
-    }
-
-    let engine = &*engine;
-
-    let engine_guard = engine.engine.lock().unwrap();
-    match *engine_guard {
-        Some(ref sync_engine) => sync_engine.is_connected(),
-        None => false,
-    }
+pub extern "C" fn replicant_get_version() -> *const c_char {
+    VERSION_MARKER["replicant-client-version=".len()..]
+        .as_ptr()
+        .cast()
 }
 
-/// Get the count of documents pending sync to server
+// ===== Enrollment and sign-out =====
+
+/// Asks the server to email an enrollment code to `email`. Needs no handle. Results:
+/// - `Success`: the server accepted the request (HTTP 202).
+/// - `ErrorInvalidInput`: a null or non-UTF-8 argument, an empty or over-long email, or a
+///   `base_url` that is not https (`http://localhost` and `http://127.0.0.1` excepted). The
+///   server is not contacted.
+/// - `ErrorConnection`: the server could not be reached, timed out, or answered with any status
+///   other than 202: a 4xx (429 when rate limited) or a 5xx. Retry later.
+/// - `ErrorUnknown`: the library could not start the request.
 ///
-/// # Arguments
-/// * `engine` - Sync engine instance
-/// * `out_count` - Output pointer for pending document count
-///
-/// # Returns
-/// * SyncResult::Success with count written to out_count
-///
-/// # Safety
-/// Caller must ensure engine is valid and out_count is a valid pointer
-#[no_mangle]
-pub unsafe extern "C" fn replicant_count_pending_sync(
-    engine: *mut Replicant,
-    out_count: *mut u64,
-) -> SyncResult {
-    if engine.is_null() || out_count.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let engine = &*engine;
-
-    // If we have a sync engine, use it; otherwise check database directly
-    let engine_guard = engine.engine.lock().unwrap();
-    let count = if let Some(ref sync_engine) = *engine_guard {
-        match engine.block_on(async { sync_engine.count_pending_sync().await }) {
-            Ok(c) => c,
-            Err(_) => return SyncResult::ErrorDatabase,
-        }
-    } else {
-        drop(engine_guard);
-        // Offline mode - check pending documents in database
-        match engine.block_on(async { engine.database.get_pending_documents().await }) {
-            Ok(docs) => docs.len(),
-            Err(_) => return SyncResult::ErrorDatabase,
-        }
-    };
-
-    *out_count = count as u64;
-    SyncResult::Success
-}
-
-// ===== FTS (Full-Text Search) Functions =====
-
-/// Configure which JSON paths to index for full-text search
-///
-/// # Arguments
-/// * `engine` - Replicant client instance
-/// * `paths_json` - JSON array of JSON paths to index (e.g., '["$.body", "$.notes"]')
-///
-/// # Returns
-/// * SyncResult::Success if configuration succeeded
-/// * SyncResult::ErrorInvalidInput if paths_json is invalid
-/// * SyncResult::ErrorDatabase if index rebuild fails
-///
-/// # Note
-/// This replaces any existing configuration and rebuilds the search index.
-///
-/// # Safety
-/// Caller must ensure engine is valid and paths_json is a valid C string
-#[no_mangle]
-pub unsafe extern "C" fn replicant_configure_search(
-    engine: *mut Replicant,
-    paths_json: *const c_char,
-) -> SyncResult {
-    if engine.is_null() || paths_json.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let engine = &*engine;
-
-    let paths_json = match CStr::from_ptr(paths_json).to_str() {
-        Ok(s) => s,
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-
-    // Parse JSON array of paths
-    let paths: Vec<String> = match serde_json::from_str(paths_json) {
-        Ok(p) => p,
-        Err(_) => return SyncResult::ErrorSerialization,
-    };
-
-    match engine.block_on(async { engine.database.configure_search(&paths).await }) {
-        Ok(_) => SyncResult::Success,
-        Err(_) => SyncResult::ErrorDatabase,
-    }
-}
-
-/// Search documents using FTS5 full-text search
-///
-/// # Arguments
-/// * `engine` - Replicant client instance
-/// * `query` - FTS5 query string (e.g., "music", "tun*", "\"exact phrase\"")
-/// * `limit` - Maximum number of results (0 for default of 100)
-/// * `out_documents` - Output pointer for JSON array of matching documents
-///
-/// # Returns
-/// * SyncResult::Success with JSON array in out_documents
-/// * SyncResult::ErrorInvalidInput if query is invalid
-/// * SyncResult::ErrorDatabase if search fails
-///
-/// # FTS5 Query Syntax
-/// * Simple terms: "music" matches documents containing "music"
-/// * Prefix: "tun*" matches "tuning", "tune", etc.
-/// * Phrase: "\"equal temperament\"" matches exact phrase
-/// * Boolean: "music AND theory", "piano OR keyboard"
-/// * Column filter: "title:beethoven" searches only title field
-///
-/// # Safety
-/// Caller must ensure engine is valid, query is a valid C string,
-/// and out_documents is a valid pointer. Caller must free result with replicant_string_free.
-#[no_mangle]
-pub unsafe extern "C" fn replicant_search_documents(
-    engine: *mut Replicant,
-    query: *const c_char,
-    limit: u32,
-    out_documents: *mut *mut c_char,
-) -> SyncResult {
-    if engine.is_null() || query.is_null() || out_documents.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let engine = &*engine;
-
-    let query = match CStr::from_ptr(query).to_str() {
-        Ok(s) => s,
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-
-    let limit = if limit == 0 { 100 } else { limit as i64 };
-
-    let docs = match engine.block_on(async { engine.database.search_documents(query, limit).await })
-    {
-        Ok(d) => d,
-        Err(_) => return SyncResult::ErrorDatabase,
-    };
-
-    // Serialize documents array to JSON
-    let json = match serde_json::to_string(&docs) {
-        Ok(j) => j,
-        Err(_) => return SyncResult::ErrorSerialization,
-    };
-
-    match CString::new(json) {
-        Ok(c_str) => {
-            *out_documents = c_str.into_raw();
-            SyncResult::Success
-        }
-        Err(_) => SyncResult::ErrorSerialization,
-    }
-}
-
-/// Rebuild the full-text search index
-///
-/// # Arguments
-/// * `engine` - Replicant client instance
-///
-/// # Returns
-/// * SyncResult::Success if rebuild succeeded
-/// * SyncResult::ErrorDatabase if rebuild fails
-///
-/// # Note
-/// This is called automatically by replicant_configure_search, but can be
-/// called manually if needed (e.g., after bulk document imports).
-///
-/// # Safety
-/// Caller must ensure engine is valid
-#[no_mangle]
-pub unsafe extern "C" fn replicant_rebuild_search_index(engine: *mut Replicant) -> SyncResult {
-    if engine.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let engine = &*engine;
-
-    match engine.block_on(async { engine.database.rebuild_fts_index().await }) {
-        Ok(_) => SyncResult::Success,
-        Err(_) => SyncResult::ErrorDatabase,
-    }
-}
-
-// ============================================================================
-// Enrollment + credential storage
-// ============================================================================
-
-/// Copies `s` plus a NUL terminator into `out` iff it fits within `cap`
-/// bytes. Returns `false` — writing an empty C string when `cap > 0` — when
-/// it does not fit; never writes past `cap`. On a multi-buffer call that
-/// fails partway, earlier out buffers may already be populated — callers
-/// must not read any out buffer unless the call returned success. Bytes of
-/// `s` are copied verbatim, so an embedded NUL makes C readers see the
-/// string truncated at that NUL.
-///
-/// # Safety
-/// `out` must point to a writable buffer of at least `cap` bytes.
-unsafe fn write_cstr_buf(out: *mut c_char, cap: usize, s: &str) -> bool {
-    if cap == 0 {
-        return false;
-    }
-    let bytes = s.as_bytes();
-    if bytes.len() + 1 > cap {
-        out.write(0);
-        return false;
-    }
-    ptr::copy_nonoverlapping(bytes.as_ptr(), out as *mut u8, bytes.len());
-    out.add(bytes.len()).write(0);
-    true
-}
-
-/// Requests an enrollment token be emailed to `email`. Standalone HTTP call
-/// (no engine handle); runs on a dedicated thread with its own short-lived
-/// runtime so this is safe to call even from inside an async runtime context.
-///
-/// BLOCKING: waits for the HTTP round-trip (connect ~10s / request ~30s
-/// timeouts). TODO(#40): add a completion-callback async variant
-/// (`replicant_enroll_request_async`) so consumers don't block a caller thread.
+/// Blocks the calling thread for the HTTP round trip (up to about 10 s to connect and 30 s for
+/// the request); never call it from an audio or UI thread.
 ///
 /// # Safety
 /// `base_url` and `email` must be valid, non-null C strings.
@@ -1721,295 +1403,322 @@ pub unsafe extern "C" fn replicant_enroll_request(
     base_url: *const c_char,
     email: *const c_char,
 ) -> SyncResult {
-    if base_url.is_null() || email.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let base_url = match CStr::from_ptr(base_url).to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-    let email = match CStr::from_ptr(email).to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-
-    let join_result = std::thread::spawn(move || {
-        let runtime = Runtime::new().map_err(|_| SyncResult::ErrorUnknown)?;
-        match runtime.block_on(crate::enrollment::request(&base_url, &email)) {
-            Ok(()) => Ok(()),
-            Err(_) => Err(SyncResult::ErrorConnection),
+    guard(|| {
+        let (Some(base_url), Some(email)) = (str_arg(base_url), str_arg(email)) else {
+            return SyncResult::ErrorInvalidInput;
+        };
+        if email.is_empty() || email.len() > REPLICANT_EMAIL_MAX_LEN {
+            return SyncResult::ErrorInvalidInput;
+        }
+        let (base_url, email) = (base_url.to_string(), email.to_string());
+        let join_result = std::thread::spawn(move || {
+            let runtime = Runtime::new().map_err(|_| SyncResult::ErrorUnknown)?;
+            runtime
+                .block_on(crate::enrollment::request(&base_url, &email))
+                .map_err(|error| match error {
+                    crate::enrollment::EnrollError::InsecureUrl => SyncResult::ErrorInvalidInput,
+                    _ => SyncResult::ErrorConnection,
+                })
+        })
+        .join();
+        match join_result {
+            Ok(Ok(())) => SyncResult::Success,
+            Ok(Err(result)) => result,
+            Err(_) => SyncResult::ErrorUnknown,
         }
     })
-    .join();
-
-    match join_result {
-        Ok(Ok(())) => SyncResult::Success,
-        Ok(Err(err)) => err,
-        Err(_) => SyncResult::ErrorUnknown,
-    }
 }
 
-/// Exchanges an enrollment token for a per-user credential. On success writes
-/// the api_key, secret, and canonical user id (36-char UUID string) into the
-/// out buffers; each `*_cap` is the writable size of its buffer in bytes and
-/// the call fails (without overflowing) when a value does not fit.
+/// Exchanges an enrollment code for credentials and stores them in `data_dir` (encrypted at rest)
+/// with `email`; the api key and secret never leave the library. Writes the user id into
+/// `out_user_id` (`user_id_cap` bytes, at least `REPLICANT_USER_ID_LEN + 1`).
+/// Results:
+/// - `Success`: stored; this process's engines on `data_dir` sign in at once, and engines in
+///   other processes within about 3 s.
+/// - `ErrorInvalidInput`: a null or non-UTF-8 argument, an empty or over-long email, or a
+///   `base_url` that is not https (localhost excepted). The server is not contacted.
+/// - `ErrorBufferTooSmall`: `user_id_cap` is too small. The server is not contacted.
+/// - `ErrorDatabase`: `data_dir` cannot hold credentials. This is checked before the server is
+///   contacted, so the code stays valid; if storing still fails after the claim, the code was
+///   used: request a new one.
+/// - `ErrorTokenRejected`: the server refused the code (wrong or expired).
+/// - `ErrorConnection`: the server could not be reached, timed out, or answered with any status
+///   other than 200 or 401 (429 when rate limited). Retry later.
+/// - `ErrorSerialization`: the server's reply was not valid credentials.
 ///
-/// BLOCKING: waits for the HTTP round-trip (connect ~10s / request ~30s
-/// timeouts). TODO(#40): add a completion-callback async variant
-/// (`replicant_enroll_claim_async`) so consumers don't block a caller thread.
+/// Blocks the calling thread for the HTTP round trip (up to about 10 s to connect and 30 s for
+/// the request); never call it from an audio or UI thread.
 ///
 /// # Safety
-/// All string pointers must be valid, non-null C strings; each out pointer
-/// must reference a writable buffer of at least its stated capacity.
+/// All string pointers must be valid, non-null C strings; `out_user_id` must reference a
+/// writable buffer of at least `user_id_cap` bytes.
 #[no_mangle]
 pub unsafe extern "C" fn replicant_enroll_claim(
     base_url: *const c_char,
+    data_dir: *const c_char,
     email: *const c_char,
     token: *const c_char,
-    out_api_key: *mut c_char,
-    api_key_cap: usize,
-    out_secret: *mut c_char,
-    secret_cap: usize,
     out_user_id: *mut c_char,
     user_id_cap: usize,
 ) -> SyncResult {
-    if base_url.is_null()
-        || email.is_null()
-        || token.is_null()
-        || out_api_key.is_null()
-        || out_secret.is_null()
-        || out_user_id.is_null()
-    {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let base_url = match CStr::from_ptr(base_url).to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-    let email = match CStr::from_ptr(email).to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-    let token = match CStr::from_ptr(token).to_str() {
-        Ok(s) => s.to_string(),
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-
-    let join_result = std::thread::spawn(move || {
-        let runtime = Runtime::new().map_err(|_| SyncResult::ErrorUnknown)?;
-        runtime
-            .block_on(crate::enrollment::claim(&base_url, &email, &token))
-            .map_err(|e| match e {
-                crate::enrollment::EnrollError::InvalidToken => SyncResult::ErrorInvalidInput,
-                // A malformed/incomplete 200 is a bad response, not a transport
-                // failure — keep it distinct from network errors so callers can
-                // tell "your code is wrong" from "the server misbehaved".
-                crate::enrollment::EnrollError::InvalidResponse => SyncResult::ErrorSerialization,
-                _ => SyncResult::ErrorConnection,
-            })
+    guard(|| {
+        let (Some(base_url), Some(data_dir), Some(email), Some(token), false) = (
+            str_arg(base_url),
+            str_arg(data_dir),
+            str_arg(email),
+            str_arg(token),
+            out_user_id.is_null(),
+        ) else {
+            return SyncResult::ErrorInvalidInput;
+        };
+        if email.is_empty() || email.len() > REPLICANT_EMAIL_MAX_LEN {
+            return SyncResult::ErrorInvalidInput;
+        }
+        if user_id_cap < REPLICANT_USER_ID_LEN + 1 {
+            return SyncResult::ErrorBufferTooSmall;
+        }
+        if crate::secret_store::prepare(Path::new(data_dir)).is_err() {
+            return SyncResult::ErrorDatabase;
+        }
+        let (base_url, request_email, token) =
+            (base_url.to_string(), email.to_string(), token.to_string());
+        let join_result = std::thread::spawn(move || {
+            let runtime = Runtime::new().map_err(|_| SyncResult::ErrorUnknown)?;
+            runtime
+                .block_on(crate::enrollment::claim(&base_url, &request_email, &token))
+                .map_err(|error| match error {
+                    crate::enrollment::EnrollError::InvalidToken => SyncResult::ErrorTokenRejected,
+                    crate::enrollment::EnrollError::InsecureUrl => SyncResult::ErrorInvalidInput,
+                    crate::enrollment::EnrollError::InvalidResponse => {
+                        SyncResult::ErrorSerialization
+                    }
+                    crate::enrollment::EnrollError::Http(_) => SyncResult::ErrorConnection,
+                })
+        })
+        .join();
+        let mut credentials = match join_result {
+            Ok(Ok(credentials)) => credentials,
+            Ok(Err(result)) => return result,
+            Err(_) => return SyncResult::ErrorUnknown,
+        };
+        credentials.email = Some(email.to_string());
+        match crate::secret_store::store(Path::new(data_dir), &credentials) {
+            Ok(()) => {
+                host::credentials_changed(Path::new(data_dir));
+                write_id(out_user_id, credentials.user_id);
+                SyncResult::Success
+            }
+            Err(_) => SyncResult::ErrorDatabase,
+        }
     })
-    .join();
-
-    match join_result {
-        Ok(Ok(creds)) => {
-            if write_cstr_buf(out_api_key, api_key_cap, &creds.api_key)
-                && write_cstr_buf(out_secret, secret_cap, &creds.secret)
-                && write_cstr_buf(out_user_id, user_id_cap, &creds.user_id.to_string())
-            {
-                SyncResult::Success
-            } else {
-                SyncResult::ErrorInvalidInput
-            }
-        }
-        Ok(Err(err)) => err,
-        Err(_) => SyncResult::ErrorUnknown,
-    }
 }
 
-/// Loads stored credentials from `data_dir`. Returns Success and fills the
-/// out buffers (api_key, secret, canonical user id), or ErrorDatabase if none
-/// are stored / unreadable. Each `*_cap` is the writable size of its buffer;
-/// the call fails (without overflowing) when a value does not fit.
+/// Removes the stored credentials (sign-out) and tells this process's engines on `data_dir`:
+/// they halt as not enrolled and never join with the removed credentials. An engine in another
+/// process ends its live connection within about a second and never joins with the removed
+/// credentials.
 ///
 /// # Safety
-/// `data_dir` must be a valid, non-null C string; each out pointer must
-/// reference a writable buffer of at least its stated capacity.
-#[no_mangle]
-pub unsafe extern "C" fn replicant_load_credentials(
-    data_dir: *const c_char,
-    out_api_key: *mut c_char,
-    api_key_cap: usize,
-    out_secret: *mut c_char,
-    secret_cap: usize,
-    out_user_id: *mut c_char,
-    user_id_cap: usize,
-) -> SyncResult {
-    if data_dir.is_null() || out_api_key.is_null() || out_secret.is_null() || out_user_id.is_null()
-    {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let data_dir = match CStr::from_ptr(data_dir).to_str() {
-        Ok(s) => s,
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-
-    match crate::secret_store::load(std::path::Path::new(data_dir)) {
-        Ok(Some(creds)) => {
-            if write_cstr_buf(out_api_key, api_key_cap, &creds.api_key)
-                && write_cstr_buf(out_secret, secret_cap, &creds.secret)
-                && write_cstr_buf(out_user_id, user_id_cap, &creds.user_id.to_string())
-            {
-                SyncResult::Success
-            } else {
-                SyncResult::ErrorInvalidInput
-            }
-        }
-        Ok(None) | Err(_) => SyncResult::ErrorDatabase,
-    }
-}
-
-/// Stores credentials to `data_dir` (encrypted at rest). `user_id` is the
-/// canonical id delivered by enrollment claim (36-char UUID string); a nil or
-/// unparseable id is rejected — credentials are never stored without a real
-/// identity.
-///
-/// # Safety
-/// All pointers must be valid, non-null C strings.
-#[no_mangle]
-pub unsafe extern "C" fn replicant_store_credentials(
-    data_dir: *const c_char,
-    api_key: *const c_char,
-    secret: *const c_char,
-    user_id: *const c_char,
-) -> SyncResult {
-    if data_dir.is_null() || api_key.is_null() || secret.is_null() || user_id.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let data_dir = match CStr::from_ptr(data_dir).to_str() {
-        Ok(s) => s,
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-    let api_key = match CStr::from_ptr(api_key).to_str() {
-        Ok(s) => s,
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-    let secret = match CStr::from_ptr(secret).to_str() {
-        Ok(s) => s,
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-    let user_id = match CStr::from_ptr(user_id)
-        .to_str()
-        .ok()
-        .and_then(|s| Uuid::parse_str(s).ok())
-    {
-        Some(id) if !id.is_nil() => id,
-        _ => return SyncResult::ErrorInvalidInput,
-    };
-
-    let creds = crate::secret_store::Credentials {
-        api_key: api_key.to_string(),
-        secret: secret.to_string(),
-        user_id,
-    };
-
-    match crate::secret_store::store(std::path::Path::new(data_dir), &creds) {
-        Ok(()) => SyncResult::Success,
-        Err(_) => SyncResult::ErrorDatabase,
-    }
-}
-
-/// Clears any stored credentials in `data_dir`.
-///
-/// # Safety
-/// `data_dir` must be a valid, non-null C string.
+/// Valid C string.
 #[no_mangle]
 pub unsafe extern "C" fn replicant_clear_credentials(data_dir: *const c_char) -> SyncResult {
-    if data_dir.is_null() {
-        return SyncResult::ErrorInvalidInput;
-    }
-
-    let data_dir = match CStr::from_ptr(data_dir).to_str() {
-        Ok(s) => s,
-        Err(_) => return SyncResult::ErrorInvalidInput,
-    };
-
-    match crate::secret_store::clear(std::path::Path::new(data_dir)) {
-        Ok(()) => SyncResult::Success,
-        Err(_) => SyncResult::ErrorDatabase,
-    }
+    guard(|| {
+        let Some(data_dir) = str_arg(data_dir) else {
+            return SyncResult::ErrorInvalidInput;
+        };
+        match crate::secret_store::clear(Path::new(data_dir)) {
+            Ok(()) => {
+                host::credentials_changed(Path::new(data_dir));
+                SyncResult::Success
+            }
+            Err(_) => SyncResult::ErrorDatabase,
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn write_cstr_buf_refuses_oversized_strings() {
-        let mut small = [1i8; 8];
-        let fitted = unsafe {
-            write_cstr_buf(
-                small.as_mut_ptr() as *mut c_char,
-                small.len(),
-                "too-long-for-8",
-            )
-        };
-        assert!(!fitted);
-        assert_eq!(small[0], 0, "refused write must leave an empty C string");
-
-        let mut big = [1i8; 32];
-        let fitted = unsafe { write_cstr_buf(big.as_mut_ptr() as *mut c_char, big.len(), "fits") };
-        assert!(fitted);
-        assert_eq!(big[4], 0, "NUL terminator after the copied bytes");
-    }
-
-    #[test]
-    fn write_cstr_buf_exact_fit_boundary() {
-        // len + 1 == cap fits exactly; len == cap does not.
-        let mut buf = [1i8; 5];
-        assert!(unsafe { write_cstr_buf(buf.as_mut_ptr() as *mut c_char, buf.len(), "four") });
-        assert_eq!(buf[4], 0);
-        assert!(!unsafe { write_cstr_buf(buf.as_mut_ptr() as *mut c_char, buf.len(), "five!") });
-        assert_eq!(buf[0], 0, "refused write must leave an empty C string");
-    }
-
-    #[test]
-    fn write_cstr_buf_zero_capacity_is_refused() {
-        let mut buf = [1i8; 1];
-        assert!(!unsafe { write_cstr_buf(buf.as_mut_ptr() as *mut c_char, 0, "") });
-        assert_eq!(buf[0], 1, "zero-cap buffer must not be touched");
-    }
-
     #[tokio::test]
     async fn enroll_ffi_is_callable_from_within_a_runtime() {
-        // Pre-guard code panicked here ("Cannot start a runtime from within a
-        // runtime"); the OS-thread hop makes this safe. The insecure URL makes
-        // the call fail fast without any network traffic.
+        // The calls run on their own thread, so a caller inside a runtime is fine. The
+        // insecure URL makes them fail fast without any network traffic.
         let url = CString::new("http://example.com").unwrap();
         let email = CString::new("rt@test.com").unwrap();
         let result = unsafe { replicant_enroll_request(url.as_ptr(), email.as_ptr()) };
         assert_ne!(result, SyncResult::Success);
 
         let token = CString::new("TOK").unwrap();
-        let mut key = [0i8; 129];
-        let mut secret = [0i8; 129];
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = CString::new(dir.path().to_str().unwrap()).unwrap();
         let mut uid = [0i8; 37];
         let result = unsafe {
             replicant_enroll_claim(
                 url.as_ptr(),
+                data_dir.as_ptr(),
                 email.as_ptr(),
                 token.as_ptr(),
-                key.as_mut_ptr() as *mut c_char,
-                key.len(),
-                secret.as_mut_ptr() as *mut c_char,
-                secret.len(),
                 uid.as_mut_ptr() as *mut c_char,
                 uid.len(),
             )
         };
         assert_ne!(result, SyncResult::Success);
+    }
+
+    #[test]
+    fn state_names_every_halt_reason() {
+        let halted = |reason| {
+            ReplicantState::from(&EngineState {
+                connection: ConnectionView::Halted(reason),
+                sync: SyncView::Idle,
+            })
+            .halt_reason
+        };
+        assert_eq!(
+            halted(HaltReason::NotEnrolled),
+            ReplicantHaltReason::NotEnrolled
+        );
+        assert_eq!(
+            halted(HaltReason::AuthInvalid),
+            ReplicantHaltReason::AuthInvalid
+        );
+        assert_eq!(
+            halted(HaltReason::UpdateRequired),
+            ReplicantHaltReason::UpdateRequired
+        );
+        assert_eq!(
+            halted(HaltReason::AccountDisabled),
+            ReplicantHaltReason::AccountDisabled
+        );
+        assert_eq!(
+            halted(HaltReason::Other("identity_drift".into())),
+            ReplicantHaltReason::IdentityDrift
+        );
+        assert_eq!(
+            halted(HaltReason::Other("store_error".into())),
+            ReplicantHaltReason::Other
+        );
+        assert_eq!(
+            ReplicantState::from(&EngineState {
+                connection: ConnectionView::Connected,
+                sync: SyncView::Live,
+            }),
+            ReplicantState {
+                struct_size: std::mem::size_of::<ReplicantState>() as u32,
+                connection: ReplicantConnection::Connected,
+                sync: ReplicantSync::Live,
+                halt_reason: ReplicantHaltReason::None,
+            }
+        );
+    }
+
+    #[test]
+    fn this_version_s_structs_are_the_abi_1_0_sizes() {
+        assert_eq!(std::mem::size_of::<ReplicantConfig>(), CONFIG_SIZE_V1_0);
+        assert_eq!(std::mem::size_of::<ReplicantState>(), STATE_SIZE_V1_0);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!((CONFIG_SIZE_V1_0, STATE_SIZE_V1_0), (80, 16));
+    }
+
+    #[test]
+    fn a_panic_inside_an_entry_point_becomes_error_unknown() {
+        assert_eq!(guard(|| panic!("boom")), SyncResult::ErrorUnknown);
+    }
+
+    #[test]
+    fn the_version_marker_names_this_crate_version() {
+        assert_eq!(
+            VERSION_MARKER,
+            concat!("replicant-client-version=", env!("CARGO_PKG_VERSION"), "\0")
+        );
+        assert_eq!(
+            unsafe { CStr::from_ptr(replicant_get_version()) }
+                .to_str()
+                .unwrap(),
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+
+    #[test]
+    fn a_restored_document_is_uploaded_without_another_write() {
+        use crate::driver::test_server::ScriptedServer;
+        use crate::secret_store::{self, Credentials};
+        use crate::store::test_support::{exec, ME};
+
+        let server_runtime = Runtime::new().unwrap();
+        let server = server_runtime.block_on(ScriptedServer::start(ME));
+        let dir = tempfile::tempdir().unwrap();
+        secret_store::store(
+            dir.path(),
+            &Credentials {
+                api_key: "k1".into(),
+                secret: "rps_test".into(),
+                user_id: ME,
+                email: None,
+            },
+        )
+        .unwrap();
+        let strings = [
+            dir.path().to_str().unwrap(),
+            "replicant.sqlite3",
+            server.url.as_str(),
+            "a@b.c",
+            "Test Host",
+            "1.0",
+        ]
+        .map(|text| CString::new(text).unwrap());
+        let config = ReplicantConfig {
+            struct_size: std::mem::size_of::<ReplicantConfig>() as u32,
+            data_dir: strings[0].as_ptr(),
+            database_file: strings[1].as_ptr(),
+            server_url: strings[2].as_ptr(),
+            email: strings[3].as_ptr(),
+            host_app: strings[4].as_ptr(),
+            host_version: strings[5].as_ptr(),
+            list_merge: 0,
+            list_merge_rules_json: ptr::null(),
+            title_pointer: ptr::null(),
+        };
+        let mut handle = ptr::null_mut();
+        assert_eq!(
+            unsafe { replicant_create(&config, &mut handle) },
+            SyncResult::Success
+        );
+        let replicant = unsafe { &*handle };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while replicant.handle.state().sync != SyncView::Live {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "engine never went live"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        replicant.handle.block_on(exec(
+            &replicant.handle.store(),
+            "INSERT INTO recovered (doc_id, content, reason, recovered_at) \
+             VALUES ('00000000-0000-0000-0000-000000000001', '{\"title\":\"Kept\"}', 'delete_wins', 100)",
+        ));
+        let recovered_id = replicant
+            .handle
+            .block_on(replicant.handle.store().list_recovered())
+            .unwrap()[0]
+            .id;
+        let mut restored = [0 as c_char; 37];
+        assert_eq!(
+            unsafe { replicant_restore_document(handle, recovered_id, restored.as_mut_ptr()) },
+            SyncResult::Success
+        );
+        let doc_id: Uuid = unsafe { CStr::from_ptr(restored.as_ptr()) }
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while server.uploads_for(doc_id).is_empty() {
+            assert!(std::time::Instant::now() < deadline, "never uploaded");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(unsafe { replicant_destroy_and_wait(handle, 10_000) });
     }
 }

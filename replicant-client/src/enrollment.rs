@@ -2,6 +2,9 @@
 use crate::secret_store::Credentials;
 use std::time::Duration;
 
+/// Longest api key or secret, in bytes, accepted from the server.
+const MAX_CRED_LEN: usize = 128;
+
 #[derive(Debug, thiserror::Error)]
 pub enum EnrollError {
     #[error("invalid or expired token")]
@@ -14,7 +17,6 @@ pub enum EnrollError {
     InsecureUrl,
 }
 
-const MAX_CRED_LEN: usize = 128;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 

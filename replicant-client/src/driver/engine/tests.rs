@@ -8,17 +8,17 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use super::owner_support::{connection, harness, is_live, Harness};
-use super::{retry_migrate_once, twice, Command, Engine, EngineError, Queued};
+use super::{retry_open, twice, Command, Engine, EngineError, Queued, LOG_TICK};
 use crate::driver::test_server::{Mode, ScriptedServer};
 use crate::driver::test_support::{
-    config, credentials, eventually, jump, seeded_db, SwitchableCredentials, WAIT,
+    config, credentials, eventually, jump, no_credentials, seeded_db, SwitchableCredentials, WAIT,
 };
 use crate::engine::list_merge::{ListMergePolicy, PathPattern};
 use crate::engine::machine::{
     ConnectionView, HaltReason, Input, Lifecycle, SettleOutcome, TimerId,
 };
-use crate::store::test_support::{count, exec, ME};
-use crate::store::{Store, StoreError};
+use crate::store::test_support::{count, exec, v012_db, v1_doc, v1_queue_row, v1_user, ME};
+use crate::store::StoreError;
 use crate::transport::socket::SocketEvent;
 use crate::transport::wire::user_agent;
 
@@ -43,13 +43,13 @@ async fn effects_run_in_order_and_answers_are_fifo() {
     let first = h
         .controls
         .store
-        .create_document(ME, None, json!({"n": 1}))
+        .create_document(None, json!({"n": 1}))
         .await
         .unwrap();
     let second = h
         .controls
         .store
-        .create_document(ME, None, json!({"n": 2}))
+        .create_document(None, json!({"n": 2}))
         .await
         .unwrap();
     h.owner
@@ -108,7 +108,7 @@ async fn joined_is_fed_only_after_the_identity_check() {
     let doc_id = h
         .controls
         .store
-        .create_document(previous, None, json!({"n": 1}))
+        .create_document(None, json!({"n": 1}))
         .await
         .unwrap();
     h.live().await;
@@ -188,17 +188,19 @@ async fn halted_auth_invalid_does_not_redial_with_the_same_credentials() {
         connection(o) == ConnectionView::Halted(HaltReason::AuthInvalid)
     })
     .await;
-    jump(Duration::from_secs(301)).await;
-    h.turns(3).await;
+    for _ in 0..5 {
+        jump(Duration::from_millis(3100)).await;
+        h.turns(3).await;
+    }
     assert_eq!(
         server.stats.upgrades(),
         1,
-        "the 5 min check must not redial with credentials the server rejected"
+        "the 3 s check must not redial with credentials the server rejected"
     );
     assert!(h.owner.timers.is_scheduled(&TimerId::HaltRetry));
     keys.set("k2");
     server.accept_joins();
-    jump(Duration::from_secs(301)).await;
+    jump(Duration::from_millis(3100)).await;
     h.turn_until("live with new credentials", is_live).await;
     assert_eq!(server.join_keys(), vec!["k1".to_string(), "k2".to_string()]);
 }
@@ -256,6 +258,138 @@ async fn credentials_changed_while_a_join_is_outstanding_rejects_the_signer_not_
 }
 
 #[tokio::test]
+async fn sign_out_while_live_halts_and_never_joins_with_the_old_credentials() {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = harness(&server.url, keys.loader(), ME, true).await;
+    h.live().await;
+    keys.sign_out();
+    assert!(h
+        .controls
+        .commands
+        .try_send(Command::CredentialsChanged)
+        .is_ok());
+    h.turn_until("halted as not enrolled", |o| {
+        connection(o) == ConnectionView::Halted(HaltReason::NotEnrolled)
+    })
+    .await;
+    jump(Duration::from_secs(2)).await;
+    h.turn_until("the dial cooldown has passed", |o| {
+        !o.timers.is_scheduled(&TimerId::DialCooldown)
+    })
+    .await;
+    assert!(h.controls.commands.try_send(Command::Reconnect).is_ok());
+    h.turn_until("one more dial, halted before its join", |o| {
+        server.stats.upgrades() == 2
+            && connection(o) == ConnectionView::Halted(HaltReason::NotEnrolled)
+    })
+    .await;
+    assert_eq!(
+        server.join_keys(),
+        vec!["k1".to_string()],
+        "nothing joined after the sign-out"
+    );
+    keys.set("k2");
+    assert!(h
+        .controls
+        .commands
+        .try_send(Command::CredentialsChanged)
+        .is_ok());
+    h.turn_until("live with the new credentials", is_live).await;
+    assert_eq!(server.join_keys(), vec!["k1".to_string(), "k2".to_string()]);
+}
+
+#[tokio::test]
+async fn a_dial_after_the_stored_credentials_are_gone_halts_without_joining() {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = harness(&server.url, keys.loader(), ME, true).await;
+    h.live().await;
+    // Cleared by another process: this engine is never told.
+    keys.sign_out();
+    server.drop_connections();
+    h.turn_until("disconnected", |o| {
+        connection(o) == ConnectionView::Disconnected
+    })
+    .await;
+    jump(Duration::from_millis(2100)).await;
+    h.turn_until("halted at the next dial", |o| {
+        connection(o) == ConnectionView::Halted(HaltReason::NotEnrolled)
+    })
+    .await;
+    assert_eq!(server.join_keys(), vec!["k1".to_string()]);
+    assert_eq!(
+        server.stats.upgrades(),
+        2,
+        "the dial happened, the join did not"
+    );
+}
+
+#[tokio::test]
+async fn unreadable_credentials_are_retried_and_never_read_as_a_sign_out() {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = harness(&server.url, keys.loader(), ME, true).await;
+    h.live().await;
+    keys.set_unreadable(true);
+    server.drop_connections();
+    jump(Duration::from_millis(2100)).await;
+    h.turn_until("a dial abandoned before its join, backing off", |o| {
+        server.stats.upgrades() == 2 && connection(o) == ConnectionView::Disconnected
+    })
+    .await;
+    assert_eq!(server.join_keys(), vec!["k1".to_string()]);
+    keys.set_unreadable(false);
+    jump(Duration::from_secs(10)).await;
+    h.turn_until("live again with k1", is_live).await;
+    assert_eq!(server.join_keys(), vec!["k1".to_string(), "k1".to_string()]);
+}
+
+#[tokio::test]
+async fn a_sign_out_in_another_process_ends_a_live_connection_within_a_second() {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = harness(&server.url, keys.loader(), ME, true).await;
+    h.live().await;
+    // This engine is never told. The tick count at sign-out is unknown, so the halt must land
+    // within a second of ticks.
+    keys.sign_out();
+    for _ in 0..(1000 / LOG_TICK.as_millis()) {
+        jump(LOG_TICK).await;
+        h.turns(2).await;
+    }
+    assert_eq!(
+        connection(&h.owner),
+        ConnectionView::Halted(HaltReason::NotEnrolled)
+    );
+}
+
+#[tokio::test]
+async fn a_sign_in_in_another_process_is_picked_up_within_three_seconds() {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    keys.sign_out();
+    let mut h = harness(&server.url, keys.loader(), ME, true).await;
+    h.start().await;
+    assert_eq!(
+        connection(&h.owner),
+        ConnectionView::Halted(HaltReason::NotEnrolled)
+    );
+    // Stored by another process: this engine is never told.
+    keys.set("k1");
+    for _ in 0..(3250 / LOG_TICK.as_millis()) {
+        jump(LOG_TICK).await;
+        h.turns(2).await;
+    }
+    assert_ne!(
+        connection(&h.owner),
+        ConnectionView::Halted(HaltReason::NotEnrolled)
+    );
+    h.turn_until("live", is_live).await;
+    assert_eq!(server.join_keys(), vec!["k1".to_string()]);
+}
+
+#[tokio::test]
 async fn nothing_but_the_join_is_sent_while_connecting() {
     let server = ScriptedServer::start(ME).await;
     server.set_mode(Mode::SilentAfterUpgrade);
@@ -265,7 +399,7 @@ async fn nothing_but_the_join_is_sent_while_connecting() {
         .await;
     h.controls
         .store
-        .create_document(ME, None, json!({"n": 1}))
+        .create_document(None, json!({"n": 1}))
         .await
         .unwrap();
     h.controls.outbox.notify_one();
@@ -326,7 +460,7 @@ async fn stale_settle_after_reconnect_is_dropped() {
     let doc_id = h
         .controls
         .store
-        .create_document(ME, None, json!({"n": 1}))
+        .create_document(None, json!({"n": 1}))
         .await
         .unwrap();
     let settled = Input::Settled {
@@ -439,28 +573,43 @@ async fn twice_retries_a_failed_feed_effect_once_then_succeeds() {
     );
 }
 
-#[tokio::test]
-async fn migrate_error_is_retried_once() {
+#[tokio::test(start_paused = true)]
+async fn an_open_race_is_retried_until_the_fourth_attempt() {
     let attempts = Cell::new(0);
-    let opened = retry_migrate_once(|| {
+    let opened = retry_open(|| {
         attempts.set(attempts.get() + 1);
         let attempt = attempts.get();
         async move {
-            if attempt == 1 {
-                Err(StoreError::Migrate(MigrateError::VersionMissing(13)))
+            if attempt < 4 {
+                Err(StoreError::Migrate(MigrateError::Dirty(13)))
             } else {
                 Ok(attempt)
             }
         }
     })
     .await;
-    assert_eq!(opened.unwrap(), 2);
+    assert_eq!(opened.unwrap(), 4);
+    let failing: Result<u32, StoreError> =
+        retry_open(|| async { Err(StoreError::Migrate(MigrateError::Dirty(13))) }).await;
+    assert!(failing.is_err(), "four attempts, then the error");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_newer_schema_is_not_retried() {
+    let attempts = Cell::new(0);
+    let opened: Result<u32, StoreError> = retry_open(|| {
+        attempts.set(attempts.get() + 1);
+        async { Err(StoreError::Migrate(MigrateError::VersionMissing(99))) }
+    })
+    .await;
+    assert!(opened.unwrap_err().is_newer_schema());
+    assert_eq!(attempts.get(), 1);
 }
 
 #[tokio::test]
 async fn other_open_errors_are_not_retried() {
     let attempts = Cell::new(0);
-    let opened: Result<u32, StoreError> = retry_migrate_once(|| {
+    let opened: Result<u32, StoreError> = retry_open(|| {
         attempts.set(attempts.get() + 1);
         async { Err(StoreError::NoUserConfig) }
     })
@@ -470,21 +619,82 @@ async fn other_open_errors_are_not_retried() {
 }
 
 #[tokio::test]
-async fn start_without_a_user_config_row_fails() {
+async fn a_busy_open_is_retried() {
+    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::{ConnectOptions, Connection};
+
+    let dir = tempfile::tempdir().unwrap();
+    let options = SqliteConnectOptions::new()
+        .filename(dir.path().join("locked.sqlite3"))
+        .create_if_missing(true)
+        .busy_timeout(Duration::from_millis(1));
+    let mut lock_holder = options.connect().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut lock_holder)
+        .await
+        .unwrap();
+    let lock_holder = tokio::sync::Mutex::new(Some(lock_holder));
+    let attempts = Cell::new(0);
+    let busy_errors = Cell::new(0);
+    let opened = retry_open(|| {
+        attempts.set(attempts.get() + 1);
+        let (lock_holder, options, busy_errors) = (&lock_holder, &options, &busy_errors);
+        let release_lock = attempts.get() == 2;
+        async move {
+            if release_lock {
+                let mut released = lock_holder.lock().await.take().unwrap();
+                sqlx::query("ROLLBACK").execute(&mut released).await?;
+            }
+            let mut contender = options.connect().await?;
+            let locked = sqlx::query("BEGIN IMMEDIATE").execute(&mut contender).await;
+            contender.close().await?;
+            locked.map(|_| ()).map_err(|error| {
+                let error = StoreError::from(error);
+                assert!(error.is_busy(), "{error}");
+                busy_errors.set(busy_errors.get() + 1);
+                error
+            })
+        }
+    })
+    .await;
+    opened.unwrap();
+    assert_eq!(attempts.get(), 2);
+    assert_eq!(busy_errors.get(), 1);
+}
+
+#[tokio::test]
+async fn start_creates_the_user_config_row() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("replicant.sqlite3");
-    Store::open(&path).await.unwrap().close().await;
+    let (events_tx, _events) = mpsc::unbounded_channel();
+    let engine = Engine::start(
+        &path,
+        config("ws://127.0.0.1:9", no_credentials()),
+        events_tx,
+    )
+    .await
+    .unwrap();
+    engine.store().user_id().await.unwrap();
+    assert_eq!(
+        count(&engine.store(), "SELECT COUNT(*) FROM user_config").await,
+        1
+    );
+    engine.stop().await;
+}
+
+#[tokio::test]
+async fn a_bad_server_url_is_refused_before_the_database_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("replicant.sqlite3");
     let (events_tx, _events) = mpsc::unbounded_channel();
     let started = Engine::start(
         &path,
-        config("ws://127.0.0.1:9", credentials("k1")),
+        config("wss://sync.example.com/?vsn=1", no_credentials()),
         events_tx,
     )
     .await;
-    assert!(matches!(
-        started,
-        Err(EngineError::Store(StoreError::NoUserConfig))
-    ));
+    assert!(matches!(started, Err(EngineError::Config(_))));
+    assert!(!path.exists(), "nothing opened, nothing migrated");
 }
 
 #[tokio::test]
@@ -517,7 +727,7 @@ async fn a_new_users_empty_snapshot_still_unlocks_uploads() {
     let doc_id = h
         .controls
         .store
-        .create_document(ME, None, json!({"n": 1}))
+        .create_document(None, json!({"n": 1}))
         .await
         .unwrap();
     h.controls.outbox.notify_one();
@@ -536,7 +746,7 @@ async fn upload_is_marked_sent_before_it_is_sent() {
     let doc_id = h
         .controls
         .store
-        .create_document(ME, None, json!({"n": 1}))
+        .create_document(None, json!({"n": 1}))
         .await
         .unwrap();
     h.controls.outbox.notify_one();
@@ -568,7 +778,7 @@ async fn live_with_unsent_doc(server: &ScriptedServer) -> (Harness, Uuid) {
     let doc_id = h
         .controls
         .store
-        .create_document(ME, None, json!({"n": 1}))
+        .create_document(None, json!({"n": 1}))
         .await
         .unwrap();
     (h, doc_id)
@@ -652,4 +862,250 @@ async fn start_refuses_a_full_list_merge_policy() {
         }
         other => panic!("expected a config error, got {:?}", other.map(|_| ())),
     }
+}
+
+#[tokio::test]
+async fn two_engines_starting_on_one_v1_database_both_start_and_migrate_it_once() {
+    let (_dir, path, pool) = v012_db().await;
+    v1_user(&pool, ME, true).await;
+    let doc_id = Uuid::from_u128(0xD1).to_string();
+    v1_doc(&pool, &doc_id, Some(ME), json!({"n": 1}), "pending", None).await;
+    v1_queue_row(&pool, &doc_id, "update", Some(json!({"n": 0}))).await;
+    pool.close().await;
+    let (app_events, _app) = mpsc::unbounded_channel();
+    let (daw_events, _daw) = mpsc::unbounded_channel();
+    let (app, daw) = tokio::join!(
+        Engine::start(
+            &path,
+            config("ws://127.0.0.1:9", no_credentials()),
+            app_events
+        ),
+        Engine::start(
+            &path,
+            config("ws://127.0.0.1:9", no_credentials()),
+            daw_events
+        ),
+    );
+    let (app, daw) = (app.unwrap(), daw.unwrap());
+    assert_eq!(
+        count(&app.store(), "SELECT COUNT(*) FROM outbox").await,
+        1,
+        "one marker, not one per engine"
+    );
+    app.stop().await;
+    daw.stop().await;
+}
+
+#[tokio::test]
+async fn a_re_sign_in_after_auth_invalid_in_another_process_is_picked_up_within_three_seconds() {
+    let server = ScriptedServer::start(ME).await;
+    server.reject_join("auth_invalid");
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = harness(&server.url, keys.loader(), ME, true).await;
+    h.start().await;
+    h.turn_until("halted", |o| {
+        connection(o) == ConnectionView::Halted(HaltReason::AuthInvalid)
+    })
+    .await;
+    // The user signs out and in again in another process (Studio): this engine is never told.
+    keys.set("k2");
+    server.accept_joins();
+    for _ in 0..(3250 / LOG_TICK.as_millis()) {
+        jump(LOG_TICK).await;
+        h.turns(2).await;
+    }
+    assert_ne!(
+        connection(&h.owner),
+        ConnectionView::Halted(HaltReason::AuthInvalid),
+        "a cross-process re-sign-in after auth_invalid is not picked up within 3 s"
+    );
+}
+
+#[tokio::test]
+async fn a_sign_out_while_halted_auth_invalid_reports_not_enrolled() {
+    let server = ScriptedServer::start(ME).await;
+    server.reject_join("auth_invalid");
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = harness(&server.url, keys.loader(), ME, true).await;
+    h.start().await;
+    h.turn_until("halted", |o| {
+        connection(o) == ConnectionView::Halted(HaltReason::AuthInvalid)
+    })
+    .await;
+    // replicant_clear_credentials in this process.
+    keys.sign_out();
+    assert!(h
+        .controls
+        .commands
+        .try_send(Command::CredentialsChanged)
+        .is_ok());
+    h.turns(3).await;
+    assert_eq!(
+        connection(&h.owner),
+        ConnectionView::Halted(HaltReason::NotEnrolled),
+        "signed out, but the state still says the credentials were refused"
+    );
+}
+
+#[tokio::test]
+async fn a_sign_out_in_another_process_while_halted_auth_invalid_reports_not_enrolled_within_three_seconds(
+) {
+    let server = ScriptedServer::start(ME).await;
+    server.reject_join("auth_invalid");
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = harness(&server.url, keys.loader(), ME, true).await;
+    h.start().await;
+    h.turn_until("halted", |o| {
+        connection(o) == ConnectionView::Halted(HaltReason::AuthInvalid)
+    })
+    .await;
+    keys.sign_out();
+    jump(Duration::from_millis(3100)).await;
+    h.turns(3).await;
+    assert_eq!(
+        connection(&h.owner),
+        ConnectionView::Halted(HaltReason::NotEnrolled)
+    );
+}
+
+async fn halted_account_disabled(server: &ScriptedServer, keys: &SwitchableCredentials) -> Harness {
+    server.reject_join("account_disabled");
+    let mut h = harness(&server.url, keys.loader(), ME, true).await;
+    h.start().await;
+    h.turn_until("halted", |o| {
+        connection(o) == ConnectionView::Halted(HaltReason::AccountDisabled)
+    })
+    .await;
+    h
+}
+
+#[tokio::test]
+async fn another_account_signed_in_elsewhere_after_account_disabled_is_dialled_within_three_seconds(
+) {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = halted_account_disabled(&server, &keys).await;
+    keys.set("k2");
+    server.accept_joins();
+    jump(Duration::from_millis(3100)).await;
+    h.turn_until("live with the other account", is_live).await;
+    assert_eq!(server.join_keys(), vec!["k1".to_string(), "k2".to_string()]);
+}
+
+#[tokio::test]
+async fn a_disabled_account_is_never_redialled_by_the_recheck() {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = halted_account_disabled(&server, &keys).await;
+    for _ in 0..10 {
+        jump(Duration::from_millis(3100)).await;
+        h.turns(3).await;
+    }
+    assert_eq!(server.stats.upgrades(), 1);
+    assert_eq!(
+        connection(&h.owner),
+        ConnectionView::Halted(HaltReason::AccountDisabled)
+    );
+    assert!(h.owner.timers.is_scheduled(&TimerId::HaltRetry));
+}
+
+#[tokio::test]
+async fn a_sign_out_while_halted_account_disabled_reports_not_enrolled() {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = halted_account_disabled(&server, &keys).await;
+    keys.sign_out();
+    jump(Duration::from_millis(3100)).await;
+    h.turns(3).await;
+    assert_eq!(
+        connection(&h.owner),
+        ConnectionView::Halted(HaltReason::NotEnrolled)
+    );
+}
+
+#[tokio::test]
+async fn a_re_enabled_account_signed_in_again_elsewhere_with_the_same_keys_is_dialled_within_three_seconds(
+) {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = halted_account_disabled(&server, &keys).await;
+    keys.sign_out();
+    jump(Duration::from_millis(3100)).await;
+    h.turns(3).await;
+    assert_eq!(
+        connection(&h.owner),
+        ConnectionView::Halted(HaltReason::NotEnrolled)
+    );
+    server.accept_joins();
+    keys.set("k1");
+    jump(Duration::from_millis(3100)).await;
+    h.turn_until("live with the same keys", is_live).await;
+    assert_eq!(server.join_keys(), vec!["k1".to_string(), "k1".to_string()]);
+}
+
+#[tokio::test]
+async fn a_new_secret_for_the_same_key_stored_elsewhere_after_account_disabled_is_dialled() {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = halted_account_disabled(&server, &keys).await;
+    keys.set_with_secret("k1", "rps_rotated");
+    server.accept_joins();
+    jump(Duration::from_millis(3100)).await;
+    h.turn_until("live with the new secret", is_live).await;
+    assert_eq!(server.stats.upgrades(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_launches_on_one_v1_database_write_exactly_one_backup() {
+    for _ in 0..5 {
+        let (_dir, path, pool) = v012_db().await;
+        v1_user(&pool, ME, true).await;
+        let doc_id = Uuid::from_u128(0xD1).to_string();
+        v1_doc(&pool, &doc_id, Some(ME), json!({"n": 1}), "pending", None).await;
+        v1_queue_row(&pool, &doc_id, "update", Some(json!({"n": 0}))).await;
+        pool.close().await;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let start = || {
+            Engine::start(
+                &path,
+                config("ws://127.0.0.1:9", no_credentials()),
+                tx.clone(),
+            )
+        };
+        let (a, b, c, d) = tokio::join!(start(), start(), start(), start());
+        let engines: Vec<Engine> = [a, b, c, d].into_iter().map(Result::unwrap).collect();
+        let prefix = format!("{}.v1-backup", path.file_name().unwrap().to_string_lossy());
+        let backups: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name == &prefix || name.starts_with(&format!("{prefix}-")))
+            .collect();
+        assert_eq!(backups, vec![prefix]);
+        for engine in engines {
+            engine.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_sign_out_seen_at_the_join_lets_the_disabled_keys_be_dialled_once_stored_again() {
+    let server = ScriptedServer::start(ME).await;
+    let keys = SwitchableCredentials::new("k1");
+    let mut h = halted_account_disabled(&server, &keys).await;
+    keys.set("k2");
+    jump(Duration::from_millis(3100)).await;
+    h.turn_until("dialling with k2", |o| {
+        connection(o) == ConnectionView::Connecting
+    })
+    .await;
+    keys.sign_out();
+    h.turn_until("signed out at the join", |o| {
+        connection(o) == ConnectionView::Halted(HaltReason::NotEnrolled)
+    })
+    .await;
+    server.accept_joins();
+    keys.set("k1");
+    jump(Duration::from_millis(3100)).await;
+    h.turn_until("live with the re-enabled keys", is_live).await;
+    assert_eq!(server.join_keys(), vec!["k1".to_string(), "k1".to_string()]);
 }

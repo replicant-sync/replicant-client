@@ -4,6 +4,7 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::io;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,7 +25,9 @@ use crate::engine::machine::{
 };
 use crate::engine::types::ServerError;
 use crate::store::change_log::{ChangeLogReader, ChangeOrigin, DocChange, LogRead};
-use crate::store::{now_unix, DocNotice, IdentityCheck, Store, StoreError, StoreResult};
+use crate::store::{
+    is_json_pointer, now_unix, DocNotice, IdentityCheck, Store, StoreError, StoreResult,
+};
 use crate::transport::connection::{Connection, Received};
 use crate::transport::socket::SocketEvent;
 use crate::transport::wire::{socket_url, user_agent, JoinAuth};
@@ -43,15 +46,16 @@ mod tests;
 const COMMAND_BUFFER: usize = 32;
 /// How often the change log is read when nothing else wakes the owner (spec §8).
 const LOG_TICK: Duration = Duration::from_millis(250);
+/// While connected, the stored credentials are read every this many ticks (once a second).
+const SIGNED_IN_CHECK_TICKS: u32 = 4;
 
-/// Reads the stored credentials: at start, on `Command::CredentialsChanged`, and on a halted
-/// engine's periodic credential check.
-pub type CredentialLoader = Arc<dyn Fn() -> Option<JoinAuth> + Send + Sync>;
+/// Reads the stored credentials: `Ok(None)` = signed out, or stored but damaged beyond use;
+/// `Err` = present but unreadable right now (e.g. a locked file), which never counts as a sign-out.
+pub type CredentialLoader = Arc<dyn Fn() -> io::Result<Option<JoinAuth>> + Send + Sync>;
 
 pub struct EngineConfig {
     /// http(s) or ws(s), with or without `/socket/websocket`.
     pub server_url: String,
-    pub client_id: Uuid,
     /// Names the host in the `User-Agent`, e.g. "Entonal Studio" and "2.0.1".
     pub host_app: String,
     pub host_version: String,
@@ -59,6 +63,8 @@ pub struct EngineConfig {
     pub jitter_seed: u64,
     /// How lists that both this device and another changed are merged. Local to this device.
     pub list_merge: ListMergeConfig,
+    /// JSON Pointer to each document's title in its content; `None`: documents have no title.
+    pub title_pointer: Option<String>,
 }
 
 /// Idempotent, so a full command queue loses nothing.
@@ -78,6 +84,11 @@ pub enum EngineEvent {
     Changed(DocChange),
     /// Changes were trimmed before this engine read them; the host reloads its lists.
     DatabaseChanged,
+    /// The join's user id differs from the one this engine started with: this engine or another
+    /// process adopted it and restamped the owned documents.
+    IdentityAdopted {
+        user_id: Uuid,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -103,14 +114,16 @@ struct Controls {
 }
 
 impl Engine {
-    /// Opens the store at `db_path` (which needs a `user_config` row) and starts the owner.
-    /// Returns without waiting for the network.
+    /// Opens the store at `db_path` (creating its `user_config` row if needed) and starts the
+    /// owner. Returns without waiting for the network, once the stored credentials were read:
+    /// `state` is then `Halted(NotEnrolled)` with none usable, else `Connecting`.
     pub async fn start(
         db_path: &Path,
         config: EngineConfig,
         events: mpsc::UnboundedSender<EngineEvent>,
     ) -> Result<Engine, EngineError> {
-        let (owner, controls) = Owner::open(db_path, config, events).await?;
+        let (mut owner, controls) = Owner::open(db_path, config, events).await?;
+        owner.start().await;
         let task = tokio::spawn(owner.run());
         Ok(Engine { controls, task })
     }
@@ -134,12 +147,17 @@ impl Engine {
     }
 
     /// Stops the owner without waiting on the network, then closes the store.
-    pub async fn stop(mut self) {
+    pub async fn stop(self) {
+        self.stop_owner().await.close().await;
+    }
+
+    /// Stops the owner without waiting on the network; the caller closes the returned store.
+    pub async fn stop_owner(mut self) -> Arc<Store> {
         self.controls.cancel.cancel();
         if let Err(error) = (&mut self.task).await {
             warn!(%error, "engine owner task failed");
         }
-        self.controls.store.close().await;
+        self.controls.store.clone()
     }
 }
 
@@ -179,7 +197,8 @@ struct Owner {
     /// Fingerprint of the credentials that signed the most recently sent join; may differ from
     /// `auth_fingerprint` if credentials changed while that join was outstanding.
     join_fingerprint: Option<[u8; 32]>,
-    /// Fingerprint of credentials the server rejected with `auth_invalid`.
+    /// Fingerprint of credentials the server refused (`auth_invalid`, `account_disabled`), or that joined as
+    /// another user (`identity_drift`). Cleared by a sign-out: the same keys stored again are dialled.
     rejected: Option<[u8; 32]>,
     /// Seconds added to this machine's clock when signing a join; learnt from `clock_skew`.
     clock_offset: i64,
@@ -191,6 +210,8 @@ struct Owner {
     outbox: Arc<Notify>,
     cancel: CancellationToken,
     tick: Interval,
+    /// Ticks since the stored credentials were last read while connected.
+    ticks_since_signed_in_check: u32,
     #[cfg(test)]
     dropped_stale: usize,
 }
@@ -201,19 +222,44 @@ impl Owner {
         config: EngineConfig,
         events: mpsc::UnboundedSender<EngineEvent>,
     ) -> Result<(Owner, Controls), EngineError> {
-        let url = socket_url(&config.server_url, config.client_id).map_err(EngineError::Config)?;
         config.list_merge.validate().map_err(EngineError::Config)?;
-        let mut store = retry_migrate_once(|| Store::open(db_path)).await?;
-        store.list_merge = config.list_merge;
+        socket_url(&config.server_url, Uuid::nil()).map_err(EngineError::Config)?;
+        if let Some(pointer) = config.title_pointer.as_deref() {
+            if !is_json_pointer(pointer) {
+                return Err(EngineError::Config(format!(
+                    "title pointer is not a JSON Pointer: {pointer}"
+                )));
+            }
+        }
+        let mut store = retry_open(|| Store::open(db_path)).await?;
+        store.list_merge = config.list_merge.clone();
+        store.title_pointer = config.title_pointer.clone();
         let store = Arc::new(store);
+        match Self::prepare(store.clone(), config, events).await {
+            Ok(opened) => Ok(opened),
+            Err(error) => {
+                store.close().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn prepare(
+        store: Arc<Store>,
+        config: EngineConfig,
+        events: mpsc::UnboundedSender<EngineEvent>,
+    ) -> Result<(Owner, Controls), EngineError> {
+        let client_id = store.ensure_user_config(&config.server_url).await?;
+        if store.apply_title_pointer().await? {
+            info!(pointer = ?store.title_pointer, "recomputed every title for a new title pointer");
+        }
+        let url = socket_url(&config.server_url, client_id).map_err(EngineError::Config)?;
         let me = store.user_id().await?;
         let scopes = store.subscribed_scopes().await?;
         let reader = ChangeLogReader::open(&store, now_unix()).await?;
-        let auth = (config.credentials)();
-        let auth_fingerprint = auth.as_ref().map(fingerprint);
         let connection = Connection::new(
             url,
-            auth,
+            None,
             user_agent(&config.host_app, &config.host_version),
         );
         let core = Core::new(scopes, config.jitter_seed);
@@ -231,7 +277,7 @@ impl Owner {
             timers: Timers::default(),
             reader,
             credentials: config.credentials,
-            auth_fingerprint,
+            auth_fingerprint: None,
             join_fingerprint: None,
             rejected: None,
             clock_offset: 0,
@@ -243,6 +289,7 @@ impl Owner {
             outbox: outbox.clone(),
             cancel: cancel.clone(),
             tick,
+            ticks_since_signed_in_check: 0,
             #[cfg(test)]
             dropped_stale: 0,
         };
@@ -256,14 +303,18 @@ impl Owner {
         Ok((owner, controls))
     }
 
+    /// Call `start` first.
     async fn run(mut self) {
-        self.start().await;
         while self.turn().await {}
         self.shutdown().await;
     }
 
+    /// A credential file unreadable right now at start is not a sign-out: the join-time read decides.
     async fn start(&mut self) {
-        let has_credentials = self.auth_fingerprint.is_some();
+        let has_credentials = self.load_credentials().unwrap_or_else(|error| {
+            warn!(%error, "stored credentials unreadable at start");
+            true
+        });
         self.feed(Input::Start { has_credentials }).await;
     }
 
@@ -304,11 +355,13 @@ impl Owner {
         match wake {
             Wake::Cancelled => {}
             Wake::Command(Command::Reconnect) => self.feed(Input::Reconnect).await,
-            Wake::Command(Command::CredentialsChanged) => {
-                let has_credentials = self.reload_credentials();
-                self.feed(Input::CredentialsChanged { has_credentials })
-                    .await;
-            }
+            Wake::Command(Command::CredentialsChanged) => match self.load_credentials() {
+                Ok(has_credentials) => {
+                    self.feed(Input::CredentialsChanged { has_credentials })
+                        .await
+                }
+                Err(error) => warn!(%error, "stored credentials unreadable; keeping the last ones"),
+            },
             Wake::Socket(event) => {
                 if let Some(received) = self.connection.receive(event) {
                     let input = self.on_received(received).await;
@@ -324,7 +377,29 @@ impl Owner {
                 if self.read_change_log().await {
                     self.feed(Input::OutboxChanged).await;
                 }
+                self.check_still_signed_in().await;
             }
+        }
+    }
+
+    /// A sign-out in another process is never announced here: while connected, the stored
+    /// credentials are read once a second and their removal ends the connection. New or
+    /// unreadable credentials change nothing (the next join reads them again).
+    async fn check_still_signed_in(&mut self) {
+        if self.core.state().connection != ConnectionView::Connected {
+            self.ticks_since_signed_in_check = 0;
+            return;
+        }
+        self.ticks_since_signed_in_check += 1;
+        if self.ticks_since_signed_in_check < SIGNED_IN_CHECK_TICKS {
+            return;
+        }
+        self.ticks_since_signed_in_check = 0;
+        if let Ok(None) = (self.credentials)() {
+            self.feed(Input::CredentialsChanged {
+                has_credentials: false,
+            })
+            .await;
         }
     }
 
@@ -374,35 +449,60 @@ impl Owner {
             }
         };
         if result.is_ok() {
+            if self.me != user_id {
+                self.emit(EngineEvent::IdentityAdopted { user_id });
+            }
             self.me = user_id;
             self.rejected = None;
         }
         Input::Reply { req, result }
     }
 
-    /// An explicit credential change: whatever is stored now signs the next join.
-    fn reload_credentials(&mut self) -> bool {
-        let Some(auth) = (self.credentials)() else {
-            return false;
-        };
-        self.auth_fingerprint = Some(fingerprint(&auth));
-        self.connection.set_auth(auth);
-        true
+    /// Reads the stored credentials: what is stored now signs the next join, and with nothing
+    /// stored nothing may join. Runs on every explicit change and before every join, so a
+    /// sign-out in another process is honoured at this engine's next dial. An unreadable file
+    /// changes nothing: the last credentials loaded stay.
+    fn load_credentials(&mut self) -> io::Result<bool> {
+        match (self.credentials)()? {
+            Some(auth) => {
+                self.auth_fingerprint = Some(fingerprint(&auth));
+                self.connection.set_auth(auth);
+                Ok(true)
+            }
+            None => {
+                self.auth_fingerprint = None;
+                self.rejected = None;
+                Ok(false)
+            }
+        }
     }
 
-    /// A halted engine's periodic check: credentials the server rejected with `auth_invalid`
-    /// are not tried again until they change.
-    fn check_credentials(&mut self) -> bool {
-        let Some(auth) = (self.credentials)() else {
-            return false;
+    /// A halted engine's periodic check: credentials the server rejected with `auth_invalid` or
+    /// `account_disabled`, or that joined as another user, are not tried again until they change.
+    fn check_credentials(&mut self) -> Input {
+        let auth = match (self.credentials)() {
+            Ok(Some(auth)) => auth,
+            Ok(None) => {
+                self.auth_fingerprint = None;
+                self.rejected = None;
+                return Input::CredentialsChanged {
+                    has_credentials: false,
+                };
+            }
+            Err(error) => {
+                warn!(%error, "stored credentials unreadable");
+                return Input::CredentialsUnchanged;
+            }
         };
         let print = fingerprint(&auth);
         if self.rejected == Some(print) {
-            return false;
+            return Input::CredentialsUnchanged;
         }
         self.auth_fingerprint = Some(print);
         self.connection.set_auth(auth);
-        true
+        Input::CredentialsChanged {
+            has_credentials: true,
+        }
     }
 
     async fn feed(&mut self, input: Input) {
@@ -457,7 +557,30 @@ impl Owner {
             Effect::CloseSocket { gen } => self.connection.close(gen),
             Effect::Send { req, request } => {
                 if matches!(request, Request::Join) {
-                    self.join_fingerprint = self.auth_fingerprint;
+                    match self.load_credentials() {
+                        Ok(true) => self.join_fingerprint = self.auth_fingerprint,
+                        Ok(false) => {
+                            // Signed out since this dial began: the core halts instead of joining.
+                            self.queue.push_back(Queued {
+                                epoch: None,
+                                input: Input::CredentialsChanged {
+                                    has_credentials: false,
+                                },
+                            });
+                            return None;
+                        }
+                        Err(error) => {
+                            // Not a sign-out: drop this socket so the core backs off and dials again.
+                            warn!(%error, "stored credentials unreadable; retrying the dial");
+                            let gen = self.socket_gen;
+                            self.connection.close(gen);
+                            self.queue.push_back(Queued {
+                                epoch: Some(gen),
+                                input: Input::SocketClosed { gen },
+                            });
+                            return None;
+                        }
+                    }
                 }
                 // Marked before it can reach the server: an upload must never be sent unmarked.
                 if let Request::Upload(upload) = &request {
@@ -475,11 +598,8 @@ impl Owner {
             Effect::Schedule { timer, after } => self.timers.schedule(timer, after),
             Effect::Cancel(timer) => self.timers.cancel(&timer),
             Effect::CheckCredentials => {
-                let has_credentials = self.check_credentials();
-                self.queue.push_back(Queued {
-                    epoch: None,
-                    input: Input::CredentialsChanged { has_credentials },
-                });
+                let input = self.check_credentials();
+                self.queue.push_back(Queued { epoch: None, input });
             }
             Effect::LoadCursors => match twice(|| store.load_cursors()).await {
                 Ok(cursors) => self.answer(Input::Cursors(cursors)),
@@ -586,7 +706,15 @@ impl Owner {
             }
             Effect::Emit(lifecycle) => self.emit(EngineEvent::Lifecycle(lifecycle)),
             Effect::SetState(state) => {
-                if state.connection == ConnectionView::Halted(HaltReason::AuthInvalid) {
+                let refused = match &state.connection {
+                    ConnectionView::Halted(HaltReason::Other(code)) => code == "identity_drift",
+                    ConnectionView::Halted(reason) => matches!(
+                        reason,
+                        HaltReason::AuthInvalid | HaltReason::AccountDisabled
+                    ),
+                    _ => false,
+                };
+                if refused {
                     self.rejected = self.join_fingerprint;
                 }
                 self.state.send_replace(state);
@@ -655,6 +783,8 @@ fn fingerprint(auth: &JoinAuth) -> [u8; 32] {
     hasher.update(auth.email.as_bytes());
     hasher.update([0]);
     hasher.update(auth.api_key.as_bytes());
+    hasher.update([0]);
+    hasher.update(auth.api_secret.as_bytes());
     hasher.finalize().into()
 }
 
@@ -672,17 +802,30 @@ where
     }
 }
 
-/// Two processes opening a pre-v2 data dir at once can race the migration (sqlx's SQLite
-/// migrator takes no lock); the loser's second attempt finds it applied.
-async fn retry_migrate_once<T, Fut>(mut open: impl FnMut() -> Fut) -> StoreResult<T>
+const OPEN_ATTEMPTS: u64 = 4;
+
+/// Two processes opening a pre-v2 data dir at once race the migrations (sqlx's SQLite migrator
+/// takes no lock) and the connect; the loser retries until the winner has finished.
+async fn retry_open<T, Fut>(mut open: impl FnMut() -> Fut) -> StoreResult<T>
 where
     Fut: Future<Output = StoreResult<T>>,
 {
-    match open().await {
-        Err(StoreError::Migrate(error)) => {
-            warn!(%error, "store migration failed; retrying once");
-            open().await
+    let mut attempt = 1;
+    loop {
+        match open().await {
+            Err(error) if attempt < OPEN_ATTEMPTS && lost_an_open_race(&error) => {
+                warn!(%error, attempt, "store open raced another process; retrying");
+                tokio::time::sleep(Duration::from_millis(50 * attempt)).await;
+                attempt += 1;
+            }
+            done => return done,
         }
-        done => done,
+    }
+}
+
+fn lost_an_open_race(error: &StoreError) -> bool {
+    match error {
+        StoreError::Migrate(_) => !error.is_newer_schema(),
+        _ => error.is_busy(),
     }
 }

@@ -114,6 +114,18 @@ async fn push_gap_triggers_catch_up() {
     let server = ScriptedServer::start(ME).await;
     let (_dir, path) = seeded_db(ME, true).await;
     let (engine, _events) = live_engine(&server, &path).await;
+    // A catch-up from cursor 0 starts with a snapshot, so both request kinds count.
+    let own_catch_ups = || {
+        server
+            .frames()
+            .iter()
+            .filter(|frame| {
+                matches!(frame.event.as_str(), "get_changes_since" | "get_snapshot")
+                    && frame.payload["scope"] == "own"
+            })
+            .count()
+    };
+    let before = own_catch_ups();
     let (first, second) = (Uuid::from_u128(0xD1), Uuid::from_u128(0xD2));
     server.drop_next_push();
     server.put_doc(first, json!({"a": 1}));
@@ -123,12 +135,9 @@ async fn push_gap_triggers_catch_up() {
         snapshot(&store, first).await.exists && snapshot(&store, second).await.exists
     })
     .await;
-    let own_catch_ups = server
-        .frames()
-        .iter()
-        .filter(|frame| frame.event == "get_changes_since" && frame.payload["scope"] == "own")
-        .count();
-    assert!(own_catch_ups >= 2, "the gap started a second catch-up");
+    // The first document's push was dropped, so it can only have arrived by a catch-up, whose
+    // request the server recorded before answering it.
+    assert!(own_catch_ups() > before, "the gap started a catch-up");
     engine.stop().await;
 }
 
@@ -139,7 +148,7 @@ async fn local_edit_uploads_and_settles() {
     let (engine, mut events) = live_engine(&server, &path).await;
     let store = engine.store();
     let doc_id = store
-        .create_document(ME, None, json!({"title": "Scale"}))
+        .create_document(None, json!({"title": "Scale"}))
         .await
         .unwrap();
     engine.notify_outbox();
@@ -171,7 +180,7 @@ async fn killed_mid_upload_resends_same_upload_id() {
     let (first, _first_events) = live_engine(&server, &path).await;
     let doc_id = first
         .store()
-        .create_document(ME, None, json!({"n": 1}))
+        .create_document(None, json!({"n": 1}))
         .await
         .unwrap();
     first.notify_outbox();
@@ -218,7 +227,7 @@ async fn cursor_too_old_resync_sweeps_missing_docs() {
     // Let the catch-up's pump timers run out, so the edit below stays pending when we stop.
     tokio::time::sleep(Duration::from_millis(1200)).await;
     store
-        .update_document(ME, edited, json!({"w": 2}))
+        .update_document(edited, json!({"w": 2}))
         .await
         .unwrap();
     engine.stop().await;
@@ -238,11 +247,11 @@ async fn cursor_too_old_resync_sweeps_missing_docs() {
         &mut events,
         "ConflictDetected for the edited document",
         |event| {
-            *event
-                == EngineEvent::Doc(DocNotice {
-                    doc_id: edited,
-                    event: DocEvent::ConflictDetected,
-                })
+            matches!(
+                event,
+                EngineEvent::Doc(DocNotice { doc_id, event: DocEvent::ConflictDetected, .. })
+                    if *doc_id == edited
+            )
         },
     )
     .await;
@@ -264,7 +273,7 @@ async fn integral_float_create_uploads_once_after_a_lost_reply() {
     server.drop_after_next_upload();
     let store = engine.store();
     let doc_id = store
-        .create_document(ME, None, json!({"n": 1200.0}))
+        .create_document(None, json!({"n": 1200.0}))
         .await
         .unwrap();
     engine.notify_outbox();
@@ -304,7 +313,7 @@ async fn integral_float_edits_upload_once_per_edit(push_first: bool) {
         server.hold_uploads();
     }
     let doc_id = store
-        .create_document(ME, None, json!({"n": 1200.0, "m": 1}))
+        .create_document(None, json!({"n": 1200.0, "m": 1}))
         .await
         .unwrap();
     engine.notify_outbox();
@@ -320,7 +329,7 @@ async fn integral_float_edits_upload_once_per_edit(push_first: bool) {
         server.hold_uploads();
     }
     store
-        .update_document(ME, doc_id, json!({"n": 1200.0, "m": 2}))
+        .update_document(doc_id, json!({"n": 1200.0, "m": 2}))
         .await
         .unwrap();
     engine.notify_outbox();
@@ -375,7 +384,7 @@ async fn local_float_edit_survives_another_devices_edit(push_first: bool) {
         server.hold_uploads();
     }
     let doc_id = store
-        .create_document(ME, None, json!({"n": 1200.0, "m": 2}))
+        .create_document(None, json!({"n": 1200.0, "m": 2}))
         .await
         .unwrap();
     engine.notify_outbox();
@@ -389,7 +398,7 @@ async fn local_float_edit_survives_another_devices_edit(push_first: bool) {
 
     server.hold_uploads();
     store
-        .update_document(ME, doc_id, json!({"n": 1300.0, "m": 2}))
+        .update_document(doc_id, json!({"n": 1300.0, "m": 2}))
         .await
         .unwrap();
     engine.notify_outbox();
@@ -463,7 +472,7 @@ async fn another_devices_integral_float_does_not_collide_with_a_local_edit() {
 
     server.hold_uploads();
     store
-        .update_document(ME, doc_id, json!({"n": 1300, "m": 1}))
+        .update_document(doc_id, json!({"n": 1300, "m": 1}))
         .await
         .unwrap();
     engine.notify_outbox();
@@ -499,7 +508,7 @@ async fn lost_upload_reply_then_new_edit_appends_once() {
     let (engine, mut events) = live_engine(&server, &path).await;
     let store = engine.store();
     let doc_id = store
-        .create_document(ME, None, json!({"items": []}))
+        .create_document(None, json!({"items": []}))
         .await
         .unwrap();
     engine.notify_outbox();
@@ -510,7 +519,7 @@ async fn lost_upload_reply_then_new_edit_appends_once() {
 
     server.lose_next_upload();
     store
-        .update_document(ME, doc_id, json!({"items": ["a"]}))
+        .update_document(doc_id, json!({"items": ["a"]}))
         .await
         .unwrap();
     engine.notify_outbox();
@@ -521,7 +530,7 @@ async fn lost_upload_reply_then_new_edit_appends_once() {
     // The reply never comes: the request times out and the document backs off for 1 s.
     jump(Duration::from_secs(31)).await;
     store
-        .update_document(ME, doc_id, json!({"items": ["a", "b"]}))
+        .update_document(doc_id, json!({"items": ["a", "b"]}))
         .await
         .unwrap();
     engine.notify_outbox();
@@ -548,7 +557,7 @@ async fn lost_create_reply_then_edit_settles_without_conflict() {
     let store = engine.store();
     server.lose_next_upload();
     let doc_id = store
-        .create_document(ME, None, json!({"items": ["a"]}))
+        .create_document(None, json!({"items": ["a"]}))
         .await
         .unwrap();
     engine.notify_outbox();
@@ -558,7 +567,7 @@ async fn lost_create_reply_then_edit_settles_without_conflict() {
     .await;
     jump(Duration::from_secs(31)).await;
     store
-        .update_document(ME, doc_id, json!({"items": ["a", "b"]}))
+        .update_document(doc_id, json!({"items": ["a", "b"]}))
         .await
         .unwrap();
     engine.notify_outbox();
@@ -585,7 +594,7 @@ async fn snapshot_of_a_doc_with_only_a_pending_create_surfaces_conflict_detected
     let (_dir, path) = seeded_db(ME, true).await;
     let store = Store::open(&path).await.unwrap();
     store
-        .create_document(ME, Some(doc_id), json!({"v": "local"}))
+        .create_document(Some(doc_id), json!({"v": "local"}))
         .await
         .unwrap();
     store.close().await;
@@ -594,11 +603,11 @@ async fn snapshot_of_a_doc_with_only_a_pending_create_surfaces_conflict_detected
         .await
         .unwrap();
     wait_for(&mut events, "ConflictDetected", |event| {
-        *event
-            == EngineEvent::Doc(DocNotice {
-                doc_id,
-                event: DocEvent::ConflictDetected,
-            })
+        matches!(
+            event,
+            EngineEvent::Doc(DocNotice { doc_id: noticed, event: DocEvent::ConflictDetected, .. })
+                if *noticed == doc_id
+        )
     })
     .await;
     let store = engine.store();
@@ -626,19 +635,14 @@ async fn new_edit_unparks_a_rejected_document() {
     let (engine, mut events) = live_engine(&server, &path).await;
     server.reject_next_upload("validation");
     let store = engine.store();
-    let doc_id = store
-        .create_document(ME, None, json!({"n": 1}))
-        .await
-        .unwrap();
+    let doc_id = store.create_document(None, json!({"n": 1})).await.unwrap();
     engine.notify_outbox();
     wait_for(&mut events, "the park", |event| {
-        *event
-            == EngineEvent::Doc(DocNotice {
-                doc_id,
-                event: DocEvent::SyncError {
-                    code: "validation".into(),
-                },
-            })
+        matches!(
+            event,
+            EngineEvent::Doc(DocNotice { doc_id: noticed, event: DocEvent::SyncError { code }, .. })
+                if *noticed == doc_id && code == "validation"
+        )
     })
     .await;
     assert_eq!(
@@ -650,7 +654,7 @@ async fn new_edit_unparks_a_rejected_document() {
         1
     );
     store
-        .update_document(ME, doc_id, json!({"n": 2}))
+        .update_document(doc_id, json!({"n": 2}))
         .await
         .unwrap();
     engine.notify_outbox();
@@ -668,15 +672,12 @@ async fn delete_of_a_parked_document_is_uploaded() {
     let (_dir, path) = seeded_db(ME, true).await;
     let (engine, _events) = live_engine(&server, &path).await;
     let store = engine.store();
-    let doc_id = store
-        .create_document(ME, None, json!({"n": 1}))
-        .await
-        .unwrap();
+    let doc_id = store.create_document(None, json!({"n": 1})).await.unwrap();
     engine.notify_outbox();
     eventually("synced", || async { outbox_rows(&store).await == 0 }).await;
     server.reject_next_upload("validation");
     store
-        .update_document(ME, doc_id, json!({"n": 2}))
+        .update_document(doc_id, json!({"n": 2}))
         .await
         .unwrap();
     engine.notify_outbox();
@@ -689,7 +690,7 @@ async fn delete_of_a_parked_document_is_uploaded() {
             == 1
     })
     .await;
-    store.delete_document(ME, doc_id).await.unwrap();
+    store.delete_document(doc_id).await.unwrap();
     engine.notify_outbox();
     eventually("the delete is uploaded and settled", || async {
         server.doc(doc_id).is_some_and(|(_, _, deleted)| deleted) && outbox_rows(&store).await == 0
@@ -713,15 +714,12 @@ async fn update_after_local_delete_is_refused_and_the_delete_uploads() {
     let (_dir, path) = seeded_db(ME, true).await;
     let (engine, _events) = live_engine(&server, &path).await;
     let store = engine.store();
-    let doc_id = store
-        .create_document(ME, None, json!({"n": 1}))
-        .await
-        .unwrap();
+    let doc_id = store.create_document(None, json!({"n": 1})).await.unwrap();
     engine.notify_outbox();
     eventually("synced", || async { outbox_rows(&store).await == 0 }).await;
-    store.delete_document(ME, doc_id).await.unwrap();
+    store.delete_document(doc_id).await.unwrap();
     assert!(matches!(
-        store.update_document(ME, doc_id, json!({"n": 2})).await,
+        store.update_document(doc_id, json!({"n": 2})).await,
         Err(StoreError::NotFound(id)) if id == doc_id
     ));
     engine.notify_outbox();
@@ -737,11 +735,8 @@ async fn offline_create_then_delete_uploads_one_delete_and_tombstones_at_zero() 
     let server = ScriptedServer::start(ME).await;
     let (_dir, path) = seeded_db(ME, true).await;
     let store = Store::open(&path).await.unwrap();
-    let doc_id = store
-        .create_document(ME, None, json!({"n": 1}))
-        .await
-        .unwrap();
-    store.delete_document(ME, doc_id).await.unwrap();
+    let doc_id = store.create_document(None, json!({"n": 1})).await.unwrap();
+    store.delete_document(doc_id).await.unwrap();
     store.close().await;
     let (engine, _events) = live_engine(&server, &path).await;
     let store = engine.store();
@@ -774,10 +769,7 @@ async fn a_delete_after_a_lost_create_reply_never_destroys_another_devices_edit(
     let (engine, _events) = live_engine(&server, &path).await;
     let store = engine.store();
     server.lose_next_upload();
-    let doc_id = store
-        .create_document(ME, None, json!({"n": 1}))
-        .await
-        .unwrap();
+    let doc_id = store.create_document(None, json!({"n": 1})).await.unwrap();
     engine.notify_outbox();
     eventually("the create is applied", || async {
         server.doc(doc_id).is_some()
@@ -788,7 +780,7 @@ async fn a_delete_after_a_lost_create_reply_never_destroys_another_devices_edit(
     let theirs = json!({"n": 2, "note": "theirs"});
     server.put_doc(doc_id, theirs.clone());
     let store = Store::open(&path).await.unwrap();
-    store.delete_document(ME, doc_id).await.unwrap();
+    store.delete_document(doc_id).await.unwrap();
     store.close().await;
 
     let (events_tx, mut events) = mpsc::unbounded_channel();
@@ -797,11 +789,11 @@ async fn a_delete_after_a_lost_create_reply_never_destroys_another_devices_edit(
         .unwrap();
     let store = engine.store();
     wait_for(&mut events, "DeleteSuperseded", |event| {
-        *event
-            == EngineEvent::Doc(DocNotice {
-                doc_id,
-                event: DocEvent::DeleteSuperseded,
-            })
+        matches!(
+            event,
+            EngineEvent::Doc(DocNotice { doc_id: noticed, event: DocEvent::DeleteSuperseded, .. })
+                if *noticed == doc_id
+        )
     })
     .await;
     eventually("settled", || async { outbox_rows(&store).await == 0 }).await;
@@ -840,7 +832,7 @@ async fn app_and_daw_on_one_data_dir_upload_an_edit_once() {
     let (daw, _daw_events) = live_engine(&server, &path).await;
     let doc_id = app
         .store()
-        .create_document(ME, None, json!({"n": 1}))
+        .create_document(None, json!({"n": 1}))
         .await
         .unwrap();
     app.notify_outbox();
@@ -867,7 +859,7 @@ async fn lost_create_reply_across_a_reconnect_settles_without_conflict() {
     server.drop_after_next_upload();
     let store = engine.store();
     let doc_id = store
-        .create_document(ME, None, json!({"items": ["a"]}))
+        .create_document(None, json!({"items": ["a"]}))
         .await
         .unwrap();
     engine.notify_outbox();
@@ -903,7 +895,7 @@ async fn returning_user_offline_edits_rebase_onto_a_changed_snapshot() {
     // and the server trimmed the log past this data dir's cursor.
     let store = Store::open(&path).await.unwrap();
     store
-        .update_document(ME, doc_id, json!({"a": 2, "b": 1}))
+        .update_document(doc_id, json!({"a": 2, "b": 1}))
         .await
         .unwrap();
     store.close().await;
@@ -944,7 +936,7 @@ async fn an_edit_from_another_device_supersedes_an_offline_delete() {
 
     // Deleted offline here while another device edits the document.
     let store = Store::open(&path).await.unwrap();
-    store.delete_document(ME, doc_id).await.unwrap();
+    store.delete_document(doc_id).await.unwrap();
     store.close().await;
     server.put_doc(doc_id, json!({"title": "Scale", "n": 2}));
 
@@ -953,14 +945,18 @@ async fn an_edit_from_another_device_supersedes_an_offline_delete() {
         .await
         .unwrap();
     let store = engine.store();
-    wait_for(&mut events, "DeleteSuperseded", |event| {
-        *event
-            == EngineEvent::Doc(DocNotice {
-                doc_id,
-                event: DocEvent::DeleteSuperseded,
-            })
+    let superseded = wait_for(&mut events, "DeleteSuperseded", |event| {
+        matches!(
+            event,
+            EngineEvent::Doc(DocNotice { doc_id: noticed, event: DocEvent::DeleteSuperseded, .. })
+                if *noticed == doc_id
+        )
     })
     .await;
+    assert!(
+        matches!(superseded, EngineEvent::Doc(DocNotice { kept: None, .. })),
+        "unedited: no kept copy is named"
+    );
     eventually("settled", || async { outbox_rows(&store).await == 0 }).await;
     let after = snapshot(&store, doc_id).await;
     assert!(
@@ -987,11 +983,8 @@ async fn an_offline_edit_then_delete_superseded_by_another_device_keeps_the_edit
 
     let edited = json!({"title": "Scale", "n": 1, "note": "mine"});
     let store = Store::open(&path).await.unwrap();
-    store
-        .update_document(ME, doc_id, edited.clone())
-        .await
-        .unwrap();
-    store.delete_document(ME, doc_id).await.unwrap();
+    store.update_document(doc_id, edited.clone()).await.unwrap();
+    store.delete_document(doc_id).await.unwrap();
     store.close().await;
     server.put_doc(doc_id, json!({"title": "Scale", "n": 2}));
 
@@ -1000,14 +993,21 @@ async fn an_offline_edit_then_delete_superseded_by_another_device_keeps_the_edit
         .await
         .unwrap();
     let store = engine.store();
-    wait_for(&mut events, "DeleteSuperseded", |event| {
-        *event
-            == EngineEvent::Doc(DocNotice {
-                doc_id,
-                event: DocEvent::DeleteSuperseded,
-            })
+    let EngineEvent::Doc(superseded) = wait_for(&mut events, "DeleteSuperseded", |event| {
+        matches!(
+            event,
+            EngineEvent::Doc(DocNotice { doc_id: noticed, event: DocEvent::DeleteSuperseded, .. })
+                if *noticed == doc_id
+        )
     })
-    .await;
+    .await
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        superseded.kept.map(|kept| kept.reason).as_deref(),
+        Some("delete_superseded")
+    );
     eventually("settled", || async { outbox_rows(&store).await == 0 }).await;
     let after = snapshot(&store, doc_id).await;
     assert!(after.exists && !after.soft_deleted);
@@ -1038,14 +1038,14 @@ async fn a_delete_on_a_stale_version_is_refused_and_can_be_repeated() {
     // Another device's edit this client has not heard of yet.
     server.drop_next_push();
     server.put_doc(doc_id, json!({"n": 2}));
-    store.delete_document(ME, doc_id).await.unwrap();
+    store.delete_document(doc_id).await.unwrap();
     engine.notify_outbox();
     wait_for(&mut events, "DeleteSuperseded", |event| {
-        *event
-            == EngineEvent::Doc(DocNotice {
-                doc_id,
-                event: DocEvent::DeleteSuperseded,
-            })
+        matches!(
+            event,
+            EngineEvent::Doc(DocNotice { doc_id: noticed, event: DocEvent::DeleteSuperseded, .. })
+                if *noticed == doc_id
+        )
     })
     .await;
     let uploads = server.uploads_for(doc_id);
@@ -1058,7 +1058,7 @@ async fn a_delete_on_a_stale_version_is_refused_and_can_be_repeated() {
     assert!(!server.doc(doc_id).unwrap().2);
     assert_eq!(snapshot(&store, doc_id).await.content, json!({"n": 2}));
 
-    store.delete_document(ME, doc_id).await.unwrap();
+    store.delete_document(doc_id).await.unwrap();
     engine.notify_outbox();
     eventually("the repeated delete lands", || async {
         server.doc(doc_id).is_some_and(|(_, _, deleted)| deleted) && outbox_rows(&store).await == 0
@@ -1131,10 +1131,7 @@ async fn a_one_off_divergent_reply_is_corrected_by_one_more_upload() {
     let (_dir, path) = seeded_db(ME, true).await;
     let (engine, _events) = live_engine(&server, &path).await;
     let store = engine.store();
-    let doc_id = store
-        .create_document(ME, None, json!({"n": 1}))
-        .await
-        .unwrap();
+    let doc_id = store.create_document(None, json!({"n": 1})).await.unwrap();
     engine.notify_outbox();
     eventually("the create settles", || async {
         in_sync(&store, &server, doc_id).await
@@ -1143,7 +1140,7 @@ async fn a_one_off_divergent_reply_is_corrected_by_one_more_upload() {
 
     server.stamp_updates(1);
     store
-        .update_document(ME, doc_id, json!({"n": 2}))
+        .update_document(doc_id, json!({"n": 2}))
         .await
         .unwrap();
     engine.notify_outbox();
@@ -1169,10 +1166,7 @@ async fn a_persistent_divergent_reply_parks_the_document_after_a_bounded_number_
     let (_dir, path) = seeded_db(ME, true).await;
     let (engine, mut events) = live_engine(&server, &path).await;
     let store = engine.store();
-    let doc_id = store
-        .create_document(ME, None, json!({"n": 1}))
-        .await
-        .unwrap();
+    let doc_id = store.create_document(None, json!({"n": 1})).await.unwrap();
     engine.notify_outbox();
     eventually("the create settles", || async {
         in_sync(&store, &server, doc_id).await
@@ -1181,18 +1175,16 @@ async fn a_persistent_divergent_reply_parks_the_document_after_a_bounded_number_
 
     server.stamp_updates(u32::MAX);
     store
-        .update_document(ME, doc_id, json!({"n": 2}))
+        .update_document(doc_id, json!({"n": 2}))
         .await
         .unwrap();
     engine.notify_outbox();
     wait_for(&mut events, "the park", |event| {
-        *event
-            == EngineEvent::Doc(DocNotice {
-                doc_id,
-                event: DocEvent::SyncError {
-                    code: "diverged".into(),
-                },
-            })
+        matches!(
+            event,
+            EngineEvent::Doc(DocNotice { doc_id: noticed, event: DocEvent::SyncError { code }, .. })
+                if *noticed == doc_id && code == "diverged"
+        )
     })
     .await;
     let bound = 1 + MAX_DIVERGENT_REPLIES as usize + 1;
@@ -1221,10 +1213,7 @@ async fn a_delete_made_while_an_upload_is_refused_still_reaches_the_server() {
     let (_dir, path) = seeded_db(ME, true).await;
     let (engine, _events) = live_engine(&server, &path).await;
     let store = engine.store();
-    let doc_id = store
-        .create_document(ME, None, json!({"n": 1}))
-        .await
-        .unwrap();
+    let doc_id = store.create_document(None, json!({"n": 1})).await.unwrap();
     engine.notify_outbox();
     eventually("the create settles", || async {
         in_sync(&store, &server, doc_id).await
@@ -1234,7 +1223,7 @@ async fn a_delete_made_while_an_upload_is_refused_still_reaches_the_server() {
     server.hold_uploads();
     server.reject_next_upload("validation");
     store
-        .update_document(ME, doc_id, json!({"n": 2}))
+        .update_document(doc_id, json!({"n": 2}))
         .await
         .unwrap();
     engine.notify_outbox();
@@ -1242,7 +1231,7 @@ async fn a_delete_made_while_an_upload_is_refused_still_reaches_the_server() {
         server.uploads_for(doc_id).len() == 2
     })
     .await;
-    store.delete_document(ME, doc_id).await.unwrap();
+    store.delete_document(doc_id).await.unwrap();
     server.release_held();
     eventually("the delete reaches the server", || async {
         server.doc(doc_id).is_some_and(|(_, _, deleted)| deleted) && outbox_rows(&store).await == 0
@@ -1264,7 +1253,7 @@ async fn a_trimmed_cursor_holds_uploads_until_the_resync_and_keeps_no_copy() {
     // data dir's nonzero cursor.
     let store = Store::open(&path).await.unwrap();
     store
-        .update_document(ME, doc_id, json!({"a": 2, "b": 1}))
+        .update_document(doc_id, json!({"a": 2, "b": 1}))
         .await
         .unwrap();
     store.close().await;
@@ -1320,30 +1309,35 @@ async fn refuse_a_delete(local_edit: Option<Value>) -> Vec<(String, Value)> {
     let (_dir, path) = seeded_db(ME, true).await;
     let (engine, mut events) = live_engine(&server, &path).await;
     let store = engine.store();
-    let doc_id = store
-        .create_document(ME, None, json!({"n": 1}))
-        .await
-        .unwrap();
+    let doc_id = store.create_document(None, json!({"n": 1})).await.unwrap();
     engine.notify_outbox();
     eventually("synced", || async { outbox_rows(&store).await == 0 }).await;
     server.reject_deletes("forbidden");
+    let edited = local_edit.is_some();
     if let Some(edit) = local_edit {
-        store.update_document(ME, doc_id, edit).await.unwrap();
+        store.update_document(doc_id, edit).await.unwrap();
     }
-    store.delete_document(ME, doc_id).await.unwrap();
+    store.delete_document(doc_id).await.unwrap();
     engine.notify_outbox();
-    let refusal = EngineEvent::Doc(DocNotice {
-        doc_id,
-        event: DocEvent::SyncError {
-            code: "forbidden".into(),
-        },
-    });
-    wait_for(&mut events, "the refusal", |event| *event == refusal).await;
+    let refused = |event: &EngineEvent| {
+        matches!(
+            event,
+            EngineEvent::Doc(DocNotice { doc_id: noticed, event: DocEvent::SyncError { code }, .. })
+                if *noticed == doc_id && code == "forbidden"
+        )
+    };
+    let EngineEvent::Doc(refusal) = wait_for(&mut events, "the refusal", refused).await else {
+        unreachable!()
+    };
+    assert_eq!(refusal.kept.is_some(), edited, "a copy exactly when edited");
+    if let Some(kept) = &refusal.kept {
+        assert_eq!(kept.reason, "delete_refused");
+    }
     let uploads_then = server.uploads_for(doc_id).len();
     tokio::time::sleep(Duration::from_millis(500)).await;
     let mut refusals = 0;
     while let Ok(event) = events.try_recv() {
-        refusals += usize::from(event == refusal);
+        refusals += usize::from(refused(&event));
     }
     let uploads = server.uploads_for(doc_id);
     let deletes = uploads

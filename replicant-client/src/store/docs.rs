@@ -4,13 +4,13 @@ use serde_json::Value;
 use sqlx::{Row, SqliteConnection};
 use uuid::Uuid;
 
-use super::{now_rfc3339, now_unix, DocNotice, StoreError, StoreResult};
+use super::reads::{DELETE_FTS_ENTRY, HAS_SEARCH_CONFIG, UPDATE_FTS_ENTRY};
+use super::{now_rfc3339, now_unix, DocNotice, KeptCopy, StoreError, StoreResult};
 use crate::engine::doc::{
     DocOp, DocSnapshot, Membership, OutboxRow, RecoverReason, RowKind, Shadow,
 };
 use crate::engine::hash::content_hash;
 use crate::engine::types::DocEnvelope;
-use crate::queries::Queries;
 
 const TITLE_MAX_CHARS: usize = 128;
 
@@ -72,7 +72,13 @@ pub(crate) async fn load_snapshot(
             snap.shadow = Some(Shadow {
                 content: serde_json::from_str(&server_content)?,
                 hash,
-                seq: row.try_get::<Option<i64>, _>("server_seq")?.unwrap_or(0),
+                seq: row
+                    .try_get::<Option<i64>, _>("server_seq")?
+                    .ok_or_else(|| {
+                        StoreError::Corrupt(format!(
+                            "document {doc_id}: server_content without server_seq"
+                        ))
+                    })?,
             });
         }
     }
@@ -124,9 +130,11 @@ pub(crate) async fn apply_ops(
     snap: &DocSnapshot,
     ops: &[DocOp],
     envelope: Option<&DocEnvelope>,
+    title_pointer: Option<&str>,
 ) -> StoreResult<Vec<DocNotice>> {
     let id = snap.doc_id.to_string();
     let mut notices = Vec::new();
+    let mut kept: Option<KeptCopy> = None;
     for op in ops {
         match op {
             DocOp::DeleteRows(mutation_ids) => {
@@ -184,7 +192,7 @@ pub(crate) async fn apply_ops(
                 .await?;
             }
             DocOp::Recover { content, reason } => {
-                sqlx::query(
+                let inserted = sqlx::query(
                     "INSERT INTO recovered (doc_id, content, reason, recovered_at) VALUES (?, ?, ?, ?)",
                 )
                 .bind(&id)
@@ -193,9 +201,13 @@ pub(crate) async fn apply_ops(
                 .bind(now_unix())
                 .execute(&mut *conn)
                 .await?;
+                kept = Some(KeptCopy {
+                    recovered_id: inserted.last_insert_rowid(),
+                    reason: reason_str(*reason).to_string(),
+                });
             }
             DocOp::RecoverFields { content, fields } => {
-                sqlx::query(
+                let inserted = sqlx::query(
                     "INSERT INTO recovered (doc_id, content, reason, recovered_at, fields) \
                      VALUES (?, ?, 'field_conflict', ?, ?)",
                 )
@@ -205,10 +217,15 @@ pub(crate) async fn apply_ops(
                 .bind(serde_json::to_string(fields)?)
                 .execute(&mut *conn)
                 .await?;
+                kept = Some(KeptCopy {
+                    recovered_id: inserted.last_insert_rowid(),
+                    reason: "field_conflict".to_string(),
+                });
             }
             DocOp::Emit(event) => notices.push(DocNotice {
                 doc_id: snap.doc_id,
                 event: event.clone(),
+                kept: kept.take(),
             }),
             DocOp::SetShadow(_)
             | DocOp::SetContent(_)
@@ -218,7 +235,7 @@ pub(crate) async fn apply_ops(
         }
     }
     let after = snap.project(ops);
-    write_document(&mut *conn, snap, &after, envelope).await?;
+    write_document(&mut *conn, snap, &after, envelope, title_pointer).await?;
     if visible_change(snap, &after) {
         append_change_log(&mut *conn, writer, snap.doc_id, !after.exists).await?;
     }
@@ -230,6 +247,7 @@ async fn write_document(
     before: &DocSnapshot,
     after: &DocSnapshot,
     envelope: Option<&DocEnvelope>,
+    title_pointer: Option<&str>,
 ) -> StoreResult<()> {
     let id = before.doc_id.to_string();
     if !after.exists {
@@ -255,7 +273,7 @@ async fn write_document(
              server_seq, read_only, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              ON CONFLICT(id) DO UPDATE SET user_id = excluded.user_id, content = excluded.content, \
-             hash = excluded.hash, title = COALESCE(excluded.title, documents.title), \
+             hash = excluded.hash, title = excluded.title, \
              server_content = excluded.server_content, server_hash = excluded.server_hash, \
              server_seq = excluded.server_seq, read_only = excluded.read_only, \
              updated_at = CASE WHEN documents.content = excluded.content \
@@ -265,7 +283,7 @@ async fn write_document(
         .bind(after.owner_id.map(|owner| owner.to_string()))
         .bind(after.content.to_string())
         .bind(content_hash(&after.content))
-        .bind(title_of(&after.content, envelope))
+        .bind(title_of(&after.content, title_pointer))
         .bind(shadow.map(|s| s.content.to_string()))
         .bind(shadow.map(|s| s.hash.clone()))
         .bind(shadow.map(|s| s.seq))
@@ -363,29 +381,39 @@ pub(crate) async fn append_change_log(
 
 /// Keeps the v1 full-text index in step when search paths are configured.
 pub(crate) async fn refresh_search(conn: &mut SqliteConnection, doc_id: Uuid) -> StoreResult<()> {
-    let configured: i64 = sqlx::query_scalar(Queries::HAS_SEARCH_CONFIG)
+    let configured: i64 = sqlx::query_scalar(HAS_SEARCH_CONFIG)
         .fetch_one(&mut *conn)
         .await?;
     if configured == 0 {
         return Ok(());
     }
-    sqlx::query(Queries::DELETE_FTS_ENTRY)
+    sqlx::query(DELETE_FTS_ENTRY)
         .bind(doc_id.to_string())
         .execute(&mut *conn)
         .await?;
-    sqlx::query(Queries::UPDATE_FTS_ENTRY)
+    sqlx::query(UPDATE_FTS_ENTRY)
         .bind(doc_id.to_string())
         .execute(&mut *conn)
         .await?;
     Ok(())
 }
 
-pub(crate) fn title_of(content: &Value, envelope: Option<&DocEnvelope>) -> Option<String> {
+/// The string at `title_pointer` in `content`, cut to `TITLE_MAX_CHARS`; `None` without a
+/// pointer or when the value there is missing or not a string.
+pub(crate) fn title_of(content: &Value, title_pointer: Option<&str>) -> Option<String> {
     content
-        .get("title")
+        .pointer(title_pointer?)
         .and_then(Value::as_str)
         .map(|title| title.chars().take(TITLE_MAX_CHARS).collect())
-        .or_else(|| envelope.and_then(|env| env.title.clone()))
+}
+
+/// RFC 6901: empty, or `/`-separated tokens where `~` only starts `~0` or `~1`.
+pub fn is_json_pointer(text: &str) -> bool {
+    (text.is_empty() || text.starts_with('/'))
+        && text
+            .split('~')
+            .skip(1)
+            .all(|rest| rest.starts_with('0') || rest.starts_with('1'))
 }
 
 fn row_kind_str(kind: RowKind) -> &'static str {
@@ -413,6 +441,7 @@ fn reason_str(reason: RecoverReason) -> &'static str {
         RecoverReason::CreateRejected => "create_rejected",
         RecoverReason::DeleteSuperseded => "delete_superseded",
         RecoverReason::DeleteRefused => "delete_refused",
+        RecoverReason::DeletePublication => "delete_publication",
     }
 }
 
@@ -433,6 +462,91 @@ mod tests {
         let content = json!({"title": "A", "n": 1});
         seed_synced(&t.store, DOC, SCOPE_OWN, Some(ME), content.clone(), 3).await;
         assert_eq!(snapshot(&t.store, DOC).await, synced(content, 3));
+    }
+
+    #[tokio::test]
+    async fn a_kept_copy_is_named_in_the_notice_that_reports_it() {
+        let t = temp_store().await;
+        seed_synced(&t.store, DOC, "own", Some(ME), json!({"a": 1}), 1).await;
+        let notices = apply(&t.store, DOC, |_| {
+            vec![
+                DocOp::Emit(DocEvent::SyncError {
+                    code: "validation".into(),
+                }),
+                DocOp::Recover {
+                    content: json!({"a": 2}),
+                    reason: RecoverReason::DeleteWins,
+                },
+                DocOp::Emit(DocEvent::ConflictDetected),
+            ]
+        })
+        .await;
+        assert_eq!(
+            notices[0].kept, None,
+            "no copy was written before this notice"
+        );
+        let kept = notices[1]
+            .kept
+            .clone()
+            .expect("the copy written just before it");
+        assert_eq!(kept.reason, "delete_wins");
+        assert_eq!(
+            t.store.list_recovered().await.unwrap()[0].id,
+            kept.recovered_id
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kept_copy_attaches_to_the_next_notice_only() {
+        let t = temp_store().await;
+        seed_synced(&t.store, DOC, "own", Some(ME), json!({"a": 1}), 1).await;
+        let notices = apply(&t.store, DOC, |_| {
+            vec![
+                DocOp::Recover {
+                    content: json!({"a": 2}),
+                    reason: RecoverReason::DeleteWins,
+                },
+                DocOp::Emit(DocEvent::ConflictDetected),
+                DocOp::Emit(DocEvent::ConflictDetected),
+            ]
+        })
+        .await;
+        assert!(notices[0].kept.is_some());
+        assert_eq!(notices[1].kept, None);
+    }
+
+    #[tokio::test]
+    async fn superseded_and_refused_deletes_name_their_kept_copy() {
+        let t = temp_store().await;
+        seed_synced(&t.store, DOC, "own", Some(ME), json!({"a": 1}), 1).await;
+        let notices = apply(&t.store, DOC, |_| {
+            vec![
+                DocOp::Recover {
+                    content: json!({"a": 2}),
+                    reason: RecoverReason::DeleteSuperseded,
+                },
+                DocOp::Emit(DocEvent::DeleteSuperseded),
+                DocOp::Recover {
+                    content: json!({"a": 3}),
+                    reason: RecoverReason::DeleteRefused,
+                },
+                DocOp::Emit(DocEvent::SyncError {
+                    code: "forbidden".into(),
+                }),
+            ]
+        })
+        .await;
+        let reasons: Vec<Option<String>> = notices
+            .iter()
+            .map(|notice| notice.kept.as_ref().map(|kept| kept.reason.clone()))
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                Some("delete_superseded".to_string()),
+                Some("delete_refused".to_string())
+            ]
+        );
     }
 
     #[tokio::test]
@@ -464,7 +578,11 @@ mod tests {
             notices,
             vec![DocNotice {
                 doc_id: DOC,
-                event: DocEvent::ConflictDetected
+                event: DocEvent::ConflictDetected,
+                kept: Some(KeptCopy {
+                    recovered_id: 1,
+                    reason: "conflict".into()
+                })
             }]
         );
         let recovered: Vec<(String, String)> =
@@ -630,7 +748,7 @@ mod tests {
     async fn undelete_clears_the_soft_delete_and_logs_an_upsert() {
         let t = temp_store().await;
         seed_synced(&t.store, DOC, SCOPE_OWN, Some(ME), json!({"a": 1}), 1).await;
-        t.store.delete_document(ME, DOC).await.unwrap();
+        t.store.delete_document(DOC).await.unwrap();
         apply(&t.store, DOC, |_| vec![DocOp::DropAllRows, DocOp::Undelete]).await;
         let after = snapshot(&t.store, DOC).await;
         assert!(after.exists && !after.soft_deleted);
@@ -645,7 +763,8 @@ mod tests {
 
     #[tokio::test]
     async fn title_hash_and_envelope_metadata_follow_the_applied_version() {
-        let t = temp_store().await;
+        let mut t = temp_store().await;
+        t.store.title_pointer = Some("/title".into());
         let mut doc = envelope(DOC, None, json!({"title": "Just Intonation"}), 5);
         doc.author_id = Some(Uuid::from_u128(0xB));
         doc.source_doc_id = Some(Uuid::from_u128(0x5));
@@ -667,5 +786,78 @@ mod tests {
         assert_eq!(hash, content_hash(&json!({"title": "Just Intonation"})));
         assert_eq!(author, Uuid::from_u128(0xB).to_string());
         assert_eq!(source, Uuid::from_u128(0x5).to_string());
+    }
+
+    #[tokio::test]
+    async fn the_server_s_title_is_ignored_and_titles_follow_only_the_pointer() {
+        let mut t = temp_store().await;
+        t.store.title_pointer = Some("/name".into());
+        let title = |store: &crate::store::Store| {
+            let pool = store.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>("SELECT title FROM documents WHERE id = ?")
+                    .bind(DOC.to_string())
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        for (seq, content, expected) in [
+            (5, json!({"name": "First"}), Some("First".to_string())),
+            (6, json!({"body": "no name here"}), None),
+        ] {
+            let mut doc = envelope(DOC, None, content, seq);
+            doc.title = Some("From the server".into());
+            let change = upsert_change(SCOPE_CURATED, doc.clone());
+            apply_with_envelope(&t.store, DOC, Some(&doc), |snap| {
+                apply_change(snap, &change, ME, &APPEND)
+            })
+            .await;
+            assert_eq!(title(&t.store).await, expected, "seq {seq}");
+        }
+    }
+
+    #[test]
+    fn title_of_reads_a_string_at_the_pointer_and_nothing_else() {
+        let content = json!({"title": "T", "meta": {"name": "N", "n": 3}, "a/b": "slash"});
+        let long = json!({"title": "x".repeat(200)});
+        assert_eq!(title_of(&content, None), None);
+        assert_eq!(title_of(&content, Some("")), None, "the whole document");
+        assert_eq!(title_of(&content, Some("/meta/name")).as_deref(), Some("N"));
+        assert_eq!(title_of(&content, Some("/meta/n")), None);
+        assert_eq!(title_of(&content, Some("/missing")), None);
+        assert_eq!(title_of(&content, Some("/a~1b")).as_deref(), Some("slash"));
+        assert_eq!(
+            title_of(&long, Some("/title")).map(|title| title.chars().count()),
+            Some(TITLE_MAX_CHARS)
+        );
+    }
+
+    #[test]
+    fn json_pointers_follow_rfc_6901() {
+        for valid in ["", "/", "/title", "/a/0/b", "/a~0b", "/a~1b"] {
+            assert!(is_json_pointer(valid), "{valid}");
+        }
+        for invalid in ["title", "a/b", "/a~", "/a~2", "~0"] {
+            assert!(!is_json_pointer(invalid), "{invalid}");
+        }
+    }
+
+    #[tokio::test]
+    async fn server_content_without_a_server_seq_is_corrupt() {
+        let t = temp_store().await;
+        exec(
+            &t.store,
+            &format!(
+                "INSERT INTO documents (id, user_id, content, hash, server_content, server_hash, \
+                 created_at, updated_at) VALUES ('{DOC}', '{ME}', '{{}}', 'h', '{{}}', 'h', 't', 't')"
+            ),
+        )
+        .await;
+        let mut tx = t.store.begin().await.unwrap();
+        assert!(matches!(
+            load_snapshot(&mut tx, DOC).await,
+            Err(StoreError::Corrupt(_))
+        ));
     }
 }

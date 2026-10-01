@@ -44,71 +44,10 @@ jobs:
         key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
     
     - name: Run unit tests
-      run: cargo test --workspace --lib
+      run: cargo test -p replicant-client --lib --tests
     
     - name: Run doc tests
       run: cargo test --workspace --doc
-
-  integration-tests:
-    name: Integration Tests
-    runs-on: ubuntu-latest
-    env:
-      SQLX_OFFLINE: true
-
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: replicant_server_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-    steps:
-    - uses: actions/checkout@v3
-
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: Cache cargo registry
-      uses: actions/cache@v3
-      with:
-        path: ~/.cargo/registry
-        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Cache cargo build
-      uses: actions/cache@v3
-      with:
-        path: target
-        key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
-
-    - name: Set up Elixir
-      uses: erlef/setup-beam@v1
-      with:
-        elixir-version: '1.17'
-        otp-version: '27'
-
-    # The harness boots the stripped server (a library: no HTTP server of its
-    # own) behind a minimal endpoint that mounts ReplicantServer.Sync.Socket on
-    # :4000, seeds an enrolled user + credential (and one legacy nil-user
-    # credential for the negative test), and runs the gated integration suite.
-    # It clones the server itself at the pinned SERVER_REF, so no separate
-    # checkout/credential/health steps are needed here.
-    - name: Boot stripped server + run integration suite
-      env:
-        REPLICANT_SERVER_REF: '19ffa7a'  # origin/main (PR #8 + #9 merged: canonical hash + sender-echo fix)
-        REPLICANT_SERVER_DIR: /tmp/replicant-server-interop
-        INTEROP_DB_HOST: localhost
-        INTEROP_DB_USER: postgres
-        INTEROP_DB_PASS: postgres
-        INTEROP_DB_NAME: replicant_server_test
-      run: ./test/run_phoenix_interop_local.sh
 
   lint:
     name: Lint

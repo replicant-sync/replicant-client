@@ -43,7 +43,17 @@ impl Store {
         for change in changes {
             let snap = load_snapshot(&mut tx, change.doc_id).await?;
             let ops = apply_change(&snap, change, me, &self.list_merge);
-            notices.extend(apply_ops(&mut tx, &writer, &snap, &ops, change.doc.as_ref()).await?);
+            notices.extend(
+                apply_ops(
+                    &mut tx,
+                    &writer,
+                    &snap,
+                    &ops,
+                    change.doc.as_ref(),
+                    self.title_pointer.as_deref(),
+                )
+                .await?,
+            );
         }
         advance_cursor(&mut tx, scope, new_cursor).await?;
         tx.commit().await?;
@@ -64,7 +74,17 @@ impl Store {
         for doc in docs {
             let snap = load_snapshot(&mut tx, doc.doc_id).await?;
             let ops = apply_snapshot_doc(&snap, scope, doc, me, &self.list_merge);
-            notices.extend(apply_ops(&mut tx, &writer, &snap, &ops, Some(doc)).await?);
+            notices.extend(
+                apply_ops(
+                    &mut tx,
+                    &writer,
+                    &snap,
+                    &ops,
+                    Some(doc),
+                    self.title_pointer.as_deref(),
+                )
+                .await?,
+            );
         }
         tx.commit().await?;
         Ok(notices)
@@ -95,7 +115,15 @@ impl Store {
             }
             let snap = load_snapshot(&mut tx, doc_id).await?;
             let ops = sweep_doc(&snap, scope, snapshot_seq);
-            apply_ops(&mut tx, &writer, &snap, &ops, None).await?;
+            apply_ops(
+                &mut tx,
+                &writer,
+                &snap,
+                &ops,
+                None,
+                self.title_pointer.as_deref(),
+            )
+            .await?;
         }
         advance_cursor(&mut tx, scope, snapshot_seq).await?;
         tx.commit().await?;
@@ -251,7 +279,7 @@ mod tests {
         .await;
         let local = json!({"items": ["a", "b"]});
         t.store
-            .update_document(ME, doc(1), local.clone())
+            .update_document(doc(1), local.clone())
             .await
             .unwrap();
         // The append went out and its reply was lost.
@@ -269,7 +297,11 @@ mod tests {
             notices,
             vec![crate::store::DocNotice {
                 doc_id: doc(1),
-                event: crate::engine::doc::DocEvent::ConflictDetected
+                event: crate::engine::doc::DocEvent::ConflictDetected,
+                kept: Some(crate::store::KeptCopy {
+                    recovered_id: 1,
+                    reason: "conflict".into()
+                })
             }]
         );
         let recovered: Vec<(String, String)> =
@@ -302,7 +334,7 @@ mod tests {
         )
         .await;
         t.store
-            .update_document(ME, doc(1), json!({"a": 2, "b": 1}))
+            .update_document(doc(1), json!({"a": 2, "b": 1}))
             .await
             .unwrap();
         // Months later: another device changed `b`; the resync delivers it as a snapshot.
@@ -351,7 +383,7 @@ mod tests {
         )
         .await;
         t.store
-            .update_document(ME, doc(3), json!({"pending": 2}))
+            .update_document(doc(3), json!({"pending": 2}))
             .await
             .unwrap();
         seed_synced(
@@ -470,7 +502,7 @@ mod tests {
             tokio::join!(t.store.apply_snapshot_page(ME, SCOPE_OWN, &docs), async {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 let began = std::time::Instant::now();
-                let created = other.create_document(ME, None, json!({"n": 1})).await;
+                let created = other.create_document(None, json!({"n": 1})).await;
                 (created, began.elapsed())
             });
         page.unwrap();
@@ -485,5 +517,96 @@ mod tests {
             waited < bound,
             "a host write in another process waited {waited:?} behind a snapshot page"
         );
+    }
+
+    #[tokio::test]
+    async fn a_pending_delete_on_a_document_that_became_a_publication_leaves_it_visible() {
+        let t = temp_store().await;
+        seed_synced(
+            &t.store,
+            doc(1),
+            SCOPE_OWN,
+            Some(ME),
+            json!({"title": "Mine"}),
+            3,
+        )
+        .await;
+        t.store.delete_document(doc(1)).await.unwrap();
+        let mut publication = envelope(doc(1), Some(ME), json!({"title": "Mine"}), 4);
+        publication.read_only = true;
+        t.store
+            .apply_changes(
+                ME,
+                SCOPE_CURATED,
+                &[upsert_change(SCOPE_CURATED, publication)],
+                4,
+            )
+            .await
+            .unwrap();
+        let visible = format!(
+            "SELECT COUNT(*) FROM documents WHERE id = '{}' AND deleted_at IS NULL AND read_only = 1",
+            doc(1)
+        );
+        assert_eq!(count(&t.store, &visible).await, 1);
+        assert_eq!(count(&t.store, "SELECT COUNT(*) FROM outbox").await, 0);
+        assert_eq!(
+            count(&t.store, "SELECT COUNT(*) FROM recovered").await,
+            0,
+            "deleted without an edit: nothing kept"
+        );
+        let last_kind: String =
+            sqlx::query_scalar("SELECT kind FROM change_log ORDER BY local_seq DESC LIMIT 1")
+                .fetch_one(&t.store.pool)
+                .await
+                .unwrap();
+        assert_eq!(last_kind, "upsert", "the host is told it is back");
+    }
+
+    #[tokio::test]
+    async fn an_edited_pending_delete_on_a_document_that_became_a_publication_names_its_kept_copy()
+    {
+        let t = temp_store().await;
+        seed_synced(
+            &t.store,
+            doc(1),
+            SCOPE_OWN,
+            Some(ME),
+            json!({"title": "Mine"}),
+            3,
+        )
+        .await;
+        let edited = json!({"title": "Mine", "n": 2});
+        t.store
+            .update_document(doc(1), edited.clone())
+            .await
+            .unwrap();
+        t.store.delete_document(doc(1)).await.unwrap();
+        let mut publication = envelope(doc(1), Some(ME), json!({"title": "Mine"}), 4);
+        publication.read_only = true;
+        let notices = t
+            .store
+            .apply_changes(
+                ME,
+                SCOPE_CURATED,
+                &[upsert_change(SCOPE_CURATED, publication)],
+                4,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            notices,
+            vec![crate::store::DocNotice {
+                doc_id: doc(1),
+                event: crate::engine::doc::DocEvent::SyncError {
+                    code: "became_publication".into()
+                },
+                kept: Some(crate::store::KeptCopy {
+                    recovered_id: 1,
+                    reason: "delete_publication".into()
+                })
+            }]
+        );
+        let kept = t.store.list_recovered().await.unwrap();
+        assert_eq!(kept[0].content, edited);
     }
 }

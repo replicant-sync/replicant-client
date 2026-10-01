@@ -114,6 +114,11 @@ pub fn socket_url(server_url: &str, client_id: Uuid) -> Result<String, String> {
     if !matches!(url.scheme(), "ws" | "wss") {
         return Err(format!("unsupported server url scheme: {server_url}"));
     }
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(format!(
+            "server url must not carry a query string or fragment: {server_url}"
+        ));
+    }
     if !url.path().ends_with("/socket/websocket") {
         let path = format!("{}/socket/websocket", url.path().trim_end_matches('/'));
         url.set_path(&path);
@@ -153,6 +158,13 @@ mod tests {
     use super::*;
     use crate::engine::types::ServerError;
     use serde_json::json;
+
+    #[test]
+    fn socket_url_refuses_a_query_string_or_fragment() {
+        let id = Uuid::from_u128(1);
+        assert!(socket_url("wss://sync.example.com/?vsn=1.0.0", id).is_err());
+        assert!(socket_url("wss://sync.example.com/#top", id).is_err());
+    }
 
     #[test]
     fn join_signature_matches_the_server_hmac_scheme() {

@@ -67,6 +67,7 @@ pub enum RecoverReason {
     CreateRejected,
     DeleteSuperseded,
     DeleteRefused,
+    DeletePublication,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -265,6 +266,33 @@ fn apply_upsert(
     let pending = snap.exists && !snap.rows.is_empty();
 
     if pending && doc.read_only {
+        if delete_pending(snap) {
+            // A publication cannot be deleted through sync: it stays visible and read-only,
+            // like every subscriber's copy, and the pending delete is dropped. Local content
+            // is kept only if the publication replaced it and the user had edited it.
+            let local = content_hash(&snap.content);
+            let edited = content_hash(&doc.content) != local
+                && snap
+                    .shadow
+                    .as_ref()
+                    .is_none_or(|shadow| content_hash(&shadow.content) != local);
+            if edited {
+                ops.push(DocOp::Recover {
+                    content: snap.content.clone(),
+                    reason: RecoverReason::DeletePublication,
+                });
+            }
+            ops.push(DocOp::DropAllRows);
+            ops.push(DocOp::Undelete);
+            ops.push(DocOp::SetShadow(new_shadow));
+            ops.push(DocOp::SetContent(doc.content.clone()));
+            if edited {
+                ops.push(DocOp::Emit(DocEvent::SyncError {
+                    code: "became_publication".into(),
+                }));
+            }
+            return ops;
+        }
         ops.push(DocOp::Recover {
             content: snap.content.clone(),
             reason: RecoverReason::BecamePublication,
@@ -716,7 +744,7 @@ fn merges_as_one_value(
         return false;
     };
     match lists.policy_for(path) {
-        ListMergePolicy::Atomic => true,
+        ListMergePolicy::Atomic | ListMergePolicy::Full => true,
         ListMergePolicy::Append => {
             let old_value = old_base.pointer(path);
             let local_value = local.pointer(path);
@@ -740,7 +768,6 @@ fn merges_as_one_value(
                 _ => true,
             }
         }
-        ListMergePolicy::Full => unreachable!("Engine::start refuses the Full list merge policy"),
     }
 }
 
@@ -1403,6 +1430,134 @@ mod apply_change_tests {
             code: "became_publication".into()
         })));
         assert!(s.project(&ops).rows.is_empty());
+    }
+
+    #[test]
+    fn becoming_a_publication_over_an_unedited_pending_delete_unhides_it_without_a_kept_copy() {
+        let mut s = synced(json!({"a": 1}), 1);
+        s.soft_deleted = true;
+        s.rows = vec![row(5, RowKind::Delete)];
+        let mut c = upsert("collection:curated", json!({"a": 2}), 2);
+        c.doc.as_mut().unwrap().read_only = true;
+        let ops = apply_change(&s, &c, ME, &APPEND);
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, DocOp::Recover { .. } | DocOp::Emit(_))),
+            "unedited: nothing of the user's to keep, nothing to report"
+        );
+        let after = s.project(&ops);
+        assert!(after.exists && !after.soft_deleted && after.read_only);
+        assert!(after.rows.is_empty());
+        assert_eq!(after.content, json!({"a": 2}));
+    }
+
+    #[test]
+    fn becoming_a_publication_over_an_edited_pending_delete_keeps_the_edit() {
+        let mut s = synced(json!({"a": 1}), 1);
+        s.content = json!({"a": 9});
+        s.soft_deleted = true;
+        s.rows = vec![row(4, RowKind::Update), row(5, RowKind::Delete)];
+        let mut c = upsert("collection:curated", json!({"a": 2}), 2);
+        c.doc.as_mut().unwrap().read_only = true;
+        let ops = apply_change(&s, &c, ME, &APPEND);
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"a": 9}),
+            reason: RecoverReason::DeletePublication
+        }));
+        assert!(ops.contains(&DocOp::Emit(DocEvent::SyncError {
+            code: "became_publication".into()
+        })));
+        let after = s.project(&ops);
+        assert!(after.exists && !after.soft_deleted && after.read_only);
+        assert!(after.rows.is_empty());
+        assert_eq!(after.content, json!({"a": 2}));
+    }
+
+    fn published(content: serde_json::Value, seq: i64) -> Change {
+        let mut c = upsert("collection:curated", content, seq);
+        c.doc.as_mut().unwrap().read_only = true;
+        c
+    }
+
+    #[test]
+    fn a_publication_equal_to_the_local_edit_keeps_no_copy() {
+        let mut s = synced(json!({"a": 1}), 1);
+        s.content = json!({"a": 9});
+        s.soft_deleted = true;
+        s.rows = vec![row(4, RowKind::Update), row(5, RowKind::Delete)];
+        s.unacked_upload = Some(m(4));
+        let ops = apply_change(&s, &published(json!({"a": 9}), 3), ME, &APPEND);
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, DocOp::Recover { .. } | DocOp::Emit(_))),
+            "{ops:?}"
+        );
+        let after = s.project(&ops);
+        assert!(after.exists && !after.soft_deleted && after.read_only);
+        assert!(after.rows.is_empty());
+    }
+
+    #[test]
+    fn a_parked_delete_of_a_never_shadowed_document_is_undone_by_a_publication() {
+        let mut s = synced(json!({"a": 1}), 1);
+        s.shadow = None;
+        s.soft_deleted = true;
+        let mut create = row(4, RowKind::Create);
+        create.parked = true;
+        let mut delete = row(5, RowKind::Delete);
+        delete.parked = true;
+        s.rows = vec![create, delete];
+        let ops = apply_change(&s, &published(json!({"a": 1}), 3), ME, &APPEND);
+        let after = s.project(&ops);
+        assert!(after.exists && !after.soft_deleted && after.read_only && after.rows.is_empty());
+        assert!(!ops
+            .iter()
+            .any(|op| matches!(op, DocOp::Recover { .. } | DocOp::Emit(_))));
+        let ops = apply_change(&s, &published(json!({"a": 2}), 3), ME, &APPEND);
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"a": 1}),
+            reason: RecoverReason::DeletePublication
+        }));
+        assert_eq!(
+            ops.iter().filter(|op| matches!(op, DocOp::Emit(_))).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_echo_of_our_own_update_as_a_publication_unhides_a_document_deleted_after() {
+        let mut s = synced(json!({"a": 1}), 1);
+        s.content = json!({"a": 9});
+        s.soft_deleted = true;
+        s.rows = vec![row(4, RowKind::Update), row(5, RowKind::Delete)];
+        s.unacked_upload = Some(m(4));
+        let mut c = published(json!({"a": 9}), 3);
+        c.seq = 2;
+        c.scope = "own".into();
+        c.upload_id = Some(m(4));
+        let ops = apply_change(&s, &c, ME, &APPEND);
+        let after = s.project(&ops);
+        assert!(
+            after.exists && !after.soft_deleted && after.read_only && after.rows.is_empty(),
+            "{ops:?}"
+        );
+    }
+
+    #[test]
+    fn a_server_copy_that_is_a_publication_over_a_never_shadowed_delete_keeps_the_local_content() {
+        let mut s = synced(json!({"a": 1}), 1);
+        s.shadow = None;
+        s.soft_deleted = true;
+        s.rows = vec![row(5, RowKind::Delete)];
+        let mut e = env(json!({"a": 2}), 3);
+        e.read_only = true;
+        let ops = apply_server_copy(&s, &e, ME, &APPEND);
+        let after = s.project(&ops);
+        assert!(after.exists && !after.soft_deleted && after.read_only && after.rows.is_empty());
+        assert!(ops.contains(&DocOp::Recover {
+            content: json!({"a": 1}),
+            reason: RecoverReason::DeletePublication
+        }));
     }
 
     #[test]
@@ -2168,6 +2323,20 @@ mod rebase_tests {
         let theirs = pitches(json!([0, 200, 400, 500, 700, 884]));
         assert_eq!(
             rebase(&scale(), &theirs, &mine, &atomic()),
+            list_kept_aside(theirs, mine)
+        );
+    }
+
+    #[test]
+    fn a_full_policy_that_bypassed_start_rebases_like_atomic() {
+        let full = ListMergeConfig {
+            default: ListMergePolicy::Full,
+            rules: Vec::new(),
+        };
+        let mine = pitches(json!([0, 200, 386, 500, 700, 900]));
+        let theirs = pitches(json!([0, 200, 400, 500, 700, 884]));
+        assert_eq!(
+            rebase(&scale(), &theirs, &mine, &full),
             list_kept_aside(theirs, mine)
         );
     }

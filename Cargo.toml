@@ -1,5 +1,5 @@
 [workspace]
-members = ["replicant", "replicant-core", "replicant-client", "replicant-seed"]
+members = ["replicant-client"]
 resolver = "2"
 
 [profile.release]

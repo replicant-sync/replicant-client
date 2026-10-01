@@ -17,6 +17,10 @@ fn main() {
         .expect("Unable to generate bindings")
         .write_to_file(&output_file);
 
+    println!(
+        "cargo:rustc-env=REPLICANT_GENERATED_HEADER={}",
+        output_file.display()
+    );
     println!("cargo:rerun-if-changed=src/");
     println!("cargo:rerun-if-changed=migrations");
     println!("cargo:rerun-if-changed=cbindgen.toml");
