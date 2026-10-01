@@ -20,6 +20,7 @@
 #                          suites, e.g. entonal-common); gets the seeded env
 #   INTEROP_SEED_USER_ID   fixed user id for the enrolled user
 #   INTEROP_IMPORT_DOCS    JSON file of [{id, content}] to create for the user
+#   INTEROP_DB_NAME        throwaway database to drop and recreate (replicant_interop_v2)
 #   REPLICANT_SERVER_REF   server SHA to test
 #
 # Requires: a running PostgreSQL, Elixir/mix, cargo, and curl.
@@ -48,7 +49,7 @@ export MIX_HOME="${INTEROP_MIX_HOME:-/tmp/replicant-interop-mix}"
 mkdir -p "$HEX_HOME" "$MIX_HOME"
 
 # --- Configuration -----------------------------------------------------------
-DB_NAME="${INTEROP_DB_NAME:-replicant_server_test}"
+DB_NAME="${INTEROP_DB_NAME:-replicant_interop_v2}"
 DB_USER="${INTEROP_DB_USER:-postgres}"
 DB_PASS="${INTEROP_DB_PASS:-postgres}"
 DB_HOST="${INTEROP_DB_HOST:-localhost}"
@@ -124,6 +125,15 @@ if grep -q 'Ecto.Adapters.SQL.Sandbox' "$SERVER_DIR/config/test.exs"; then
     perl -0pi -e 's/\s*pool: Ecto\.Adapters\.SQL\.Sandbox,//' "$SERVER_DIR/config/test.exs"
     perl -0pi -e 's/pool_size: System\.schedulers_online\(\) \* 2/pool_size: 20/' "$SERVER_DIR/config/test.exs"
 fi
+
+# config/test.exs hard-codes the database name; make it read INTEROP_DB_NAME so
+# the harness never drops or recreates the server's own replicant_server_test.
+if ! grep -q 'INTEROP_DB_NAME' "$SERVER_DIR/config/test.exs"; then
+    log "Pointing the test Repo at INTEROP_DB_NAME (harness-only)"
+    perl -pi -e 's/^(\s*)database: .*$/$1database: System.fetch_env!("INTEROP_DB_NAME"),/' "$SERVER_DIR/config/test.exs"
+    grep -q 'INTEROP_DB_NAME' "$SERVER_DIR/config/test.exs" || { err "Failed to point the Repo at INTEROP_DB_NAME"; exit 1; }
+fi
+export INTEROP_DB_NAME="$DB_NAME"
 
 # --- Build server ------------------------------------------------------------
 log "Fetching + compiling server deps (MIX_ENV=test)"
