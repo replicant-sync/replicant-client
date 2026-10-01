@@ -401,3 +401,65 @@ fn a_silently_dropped_connection_is_detected_and_recovered() {
     assert!(content(&handle, doc_id).is_some());
     close(handle);
 }
+
+#[test]
+#[ignore = "probe: REPLICANT_PROBE_DATA_DIR holds a copy of a v1 library; run through the harness"]
+fn a_migrated_library_syncs_against_a_server_holding_its_synced_state() {
+    let Ok(dir) = std::env::var("REPLICANT_PROBE_DATA_DIR") else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    let seed = Seed::from_env();
+    sign_in(&dir, &seed);
+    let started = Instant::now();
+    let handle = host::attach(config(&dir, &seed.server_url)).unwrap();
+    let store = handle.store();
+    let before = handle.block_on(store.count_documents()).unwrap();
+    let mut events = Vec::new();
+    let mut first_completed = None;
+    let completed = wait_until(Duration::from_secs(60), || {
+        events.extend(handle.take_events());
+        if first_completed.is_none() && events.contains(&HostEvent::SyncCompleted) {
+            first_completed = Some(started.elapsed());
+        }
+        first_completed.is_some() && handle.block_on(store.count_pending_sync()).unwrap() == 0
+    });
+    events.extend(handle.take_events());
+    let after = handle.block_on(store.count_documents()).unwrap();
+    println!("STATE {:?}", handle.state());
+    println!(
+        "FIRST_SYNC_COMPLETED_MS {:?}",
+        first_completed.map(|d| d.as_millis())
+    );
+    println!(
+        "DOCS before={before} after={after} pending={} parked={}",
+        handle.block_on(store.count_pending_sync()).unwrap(),
+        handle.block_on(store.list_parked()).unwrap().len(),
+    );
+    for copy in handle.block_on(store.list_recovered()).unwrap() {
+        println!("RECOVERED {} {} {}", copy.id, copy.doc_id, copy.reason);
+    }
+    let changed = |wanted: Origin| {
+        events
+            .iter()
+            .filter(|e| matches!(e, HostEvent::DocumentChanged { origin, .. } if *origin == wanted))
+            .count()
+    };
+    println!(
+        "CHANGED local={} server={} other_process={}",
+        changed(Origin::Local),
+        changed(Origin::Server),
+        changed(Origin::OtherProcess)
+    );
+    for e in &events {
+        if !matches!(e, HostEvent::DocumentChanged { .. }) {
+            println!("EVENT {e:?}");
+        }
+    }
+    assert!(
+        completed,
+        "never reached SyncCompleted with an empty outbox"
+    );
+    assert!(after >= before, "documents were lost: {before} -> {after}");
+    close(handle);
+}
