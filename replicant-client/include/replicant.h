@@ -369,7 +369,9 @@ typedef struct ReplicantConfig {
   /**
    * May be null (`""` counts as null). Signs joins when the stored credentials carry no email.
    * Credentials stored by 0.6 carry none: with a null email here the engine reports
-   * `NotEnrolled`, so a host upgrading from 0.6 must pass the user's email.
+   * `NotEnrolled`, so a host upgrading from 0.6 must pass the user's email. Not part of the
+   * shared-engine check: a later handle on an open data dir never gets `ErrorConfigMismatch`
+   * for a different email, and the email of the handle that started the engine is the one used.
    */
   const char *email;
   /**
