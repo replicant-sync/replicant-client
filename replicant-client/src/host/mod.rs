@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::JoinHandle as ThreadHandle;
 use std::time::{Duration, Instant};
@@ -335,10 +336,24 @@ impl Teardown {
     }
 }
 
-/// `Err` when the stored file cannot be read right now; never reported as signed out.
+/// `Err` when the stored files cannot be read right now; never reported as signed out. Damaged
+/// files (see [`secret_store::is_damaged`]) read as signed out, so the user is asked to sign in.
 fn credential_loader(data_dir: PathBuf, fallback_email: Option<String>) -> CredentialLoader {
+    let damaged_reported = AtomicBool::new(false);
     Arc::new(move || {
-        let Some(stored) = secret_store::load(&data_dir)? else {
+        let stored = match secret_store::load(&data_dir) {
+            Ok(stored) => stored,
+            Err(error) if secret_store::is_damaged(&error) => {
+                // Reported once per run of damaged reads, not at every recheck.
+                if !damaged_reported.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(%error, "stored credentials are damaged; treating them as signed out");
+                }
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        damaged_reported.store(false, Ordering::Relaxed);
+        let Some(stored) = stored else {
             return Ok(None);
         };
         Ok(stored

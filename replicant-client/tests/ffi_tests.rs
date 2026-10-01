@@ -500,6 +500,48 @@ fn create_returns_with_the_state_the_stored_credentials_give() {
 }
 
 #[test]
+fn create_with_damaged_credentials_returns_halted_not_enrolled_and_reports_it_once() {
+    for damage in ["key missing", "undecryptable"] {
+        let dir = tempfile::tempdir().unwrap();
+        secret_store::store(
+            dir.path(),
+            &secret_store::Credentials {
+                api_key: "k1".into(),
+                secret: "rps_test".into(),
+                user_id: Uuid::new_v4(),
+                email: Some("a@b.c".into()),
+            },
+        )
+        .unwrap();
+        match damage {
+            "key missing" => std::fs::remove_file(dir.path().join("key.bin")).unwrap(),
+            _ => std::fs::write(dir.path().join("credentials.enc"), [7u8; 40]).unwrap(),
+        }
+        let handle = open(dir.path());
+        assert!(halted_not_enrolled(handle), "{damage}: {:?}", state(handle));
+        let seen: Log = Mutex::new(Vec::new());
+        assert_eq!(
+            unsafe { replicant_register_error_callback(handle, Some(on_error), context(&seen)) },
+            SyncResult::Success
+        );
+        pump_until(handle, &seen, "the not_enrolled error", |lines| {
+            !lines.is_empty()
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            unsafe { replicant_process_events(handle, ptr::null_mut()) },
+            SyncResult::Success
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["SyncError 1003 not_enrolled null null true -1".to_string()],
+            "{damage}"
+        );
+        close(handle);
+    }
+}
+
+#[test]
 fn credentials_stored_by_0_6_need_the_config_email_to_sign_in() {
     let store_0_6 = |dir: &Path| {
         secret_store::store(

@@ -81,7 +81,7 @@ impl SwitchableCredentials {
         *self.stored.lock().unwrap() = None;
     }
 
-    /// As if the file were half-written or corrupt: every read fails until `false`.
+    /// As if the file could not be read right now (e.g. locked): every read fails until `false`.
     pub fn set_unreadable(&self, unreadable: bool) {
         self.unreadable.store(unreadable, Ordering::SeqCst);
     }
@@ -90,7 +90,7 @@ impl SwitchableCredentials {
         let (stored, unreadable) = (self.stored.clone(), self.unreadable.clone());
         Arc::new(move || {
             if unreadable.load(Ordering::SeqCst) {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "decrypt failed"));
+                return Err(io::Error::other("file locked"));
             }
             Ok(stored
                 .lock()

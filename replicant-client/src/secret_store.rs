@@ -160,9 +160,15 @@ pub fn load(dir: &Path) -> io::Result<Option<Credentials>> {
         .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
         .map_err(|_| Error::new(ErrorKind::InvalidData, "decrypt failed"))?;
 
-    let creds =
-        serde_json::from_slice(&plaintext).map_err(|e| Error::new(ErrorKind::InvalidData, e))?;
+    let creds = serde_json::from_slice(&plaintext)
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "credentials unparseable"))?;
     Ok(Some(creds))
+}
+
+/// True for a [`load`] error no retry can fix: the key is missing or the wrong size, or the
+/// credentials are truncated, do not decrypt or do not parse. Other errors may pass.
+pub fn is_damaged(error: &io::Error) -> bool {
+    matches!(error.kind(), ErrorKind::NotFound | ErrorKind::InvalidData)
 }
 
 pub fn clear(dir: &Path) -> io::Result<()> {
@@ -251,7 +257,7 @@ mod tests {
         )
         .unwrap();
         std::fs::remove_file(dir.path().join(KEY_FILE)).unwrap();
-        assert!(load(dir.path()).is_err());
+        assert!(is_damaged(&load(dir.path()).unwrap_err()));
         assert!(
             !dir.path().join(KEY_FILE).exists(),
             "load() must never mint a key"
@@ -276,7 +282,7 @@ mod tests {
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF;
         std::fs::write(&cred_path, bytes).unwrap();
-        assert!(load(dir.path()).is_err());
+        assert!(is_damaged(&load(dir.path()).unwrap_err()));
     }
 
     #[test]

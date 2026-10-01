@@ -49,8 +49,8 @@ const LOG_TICK: Duration = Duration::from_millis(250);
 /// While connected, the stored credentials are read every this many ticks (once a second).
 const SIGNED_IN_CHECK_TICKS: u32 = 4;
 
-/// Reads the stored credentials: `Ok(None)` = signed out; `Err` = present but unreadable right
-/// now (a torn or corrupt file), which never counts as a sign-out.
+/// Reads the stored credentials: `Ok(None)` = signed out, or stored but damaged beyond use;
+/// `Err` = present but unreadable right now (e.g. a locked file), which never counts as a sign-out.
 pub type CredentialLoader = Arc<dyn Fn() -> io::Result<Option<JoinAuth>> + Send + Sync>;
 
 pub struct EngineConfig {
@@ -116,7 +116,7 @@ struct Controls {
 impl Engine {
     /// Opens the store at `db_path` (creating its `user_config` row if needed) and starts the
     /// owner. Returns without waiting for the network, once the stored credentials were read:
-    /// `state` is then `Halted(NotEnrolled)` with none, else `Connecting`.
+    /// `state` is then `Halted(NotEnrolled)` with none usable, else `Connecting`.
     pub async fn start(
         db_path: &Path,
         config: EngineConfig,
@@ -309,7 +309,7 @@ impl Owner {
         self.shutdown().await;
     }
 
-    /// An unreadable credential file at start is not a sign-out: the join-time read decides.
+    /// A credential file unreadable right now at start is not a sign-out: the join-time read decides.
     async fn start(&mut self) {
         let has_credentials = self.load_credentials().unwrap_or_else(|error| {
             warn!(%error, "stored credentials unreadable at start");

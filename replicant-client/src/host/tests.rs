@@ -430,8 +430,67 @@ fn the_join_email_comes_from_the_stored_credentials_before_the_fallback() {
     .unwrap();
     assert_eq!(with_fallback().unwrap().unwrap().email, "stored@x.io");
     assert_eq!(without_fallback().unwrap().unwrap().api_key, "k2");
-    std::fs::write(dir.path().join("credentials.enc"), b"torn").unwrap();
-    assert!(with_fallback().is_err(), "unreadable is not signed out");
+}
+
+#[test]
+fn damaged_credentials_read_as_signed_out_and_unreadable_ones_as_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let loader = credential_loader(dir.path().to_path_buf(), Some("a@b.c".into()));
+    let credentials = dir.path().join("credentials.enc");
+    sign_in(dir.path(), "k1");
+    std::fs::write(&credentials, b"short").unwrap();
+    assert!(loader().unwrap().is_none(), "truncated");
+    std::fs::write(&credentials, [7u8; 40]).unwrap();
+    assert!(loader().unwrap().is_none(), "undecryptable");
+    sign_in(dir.path(), "k1");
+    std::fs::remove_file(dir.path().join("key.bin")).unwrap();
+    assert!(loader().unwrap().is_none(), "key missing");
+    std::fs::write(dir.path().join("key.bin"), [1u8; 5]).unwrap();
+    assert!(loader().unwrap().is_none(), "key the wrong size");
+
+    std::fs::remove_file(dir.path().join("key.bin")).unwrap();
+    std::fs::remove_file(&credentials).unwrap();
+    sign_in(dir.path(), "k1");
+    std::fs::remove_file(&credentials).unwrap();
+    // Stands in for any read error that may pass, such as a locked file.
+    std::fs::create_dir(&credentials).unwrap();
+    assert!(loader().is_err(), "unreadable right now is not signed out");
+}
+
+#[test]
+fn damaged_credentials_at_attach_halt_until_a_sign_in_the_recheck_reads() {
+    let (_server_runtime, server) = live_server();
+    let dir = tempfile::tempdir().unwrap();
+    sign_in(dir.path(), "k1");
+    // What a read racing a sign-in by another process can see: a new key, the old credentials.
     std::fs::write(dir.path().join("credentials.enc"), [7u8; 40]).unwrap();
-    assert!(with_fallback().is_err(), "undecryptable is not signed out");
+    let handle = attach(config(dir.path(), &server.url)).unwrap();
+    assert!(halted_not_enrolled(&handle), "{:?}", handle.state());
+    sign_in(dir.path(), "k2");
+    wait_until("live without a credentials_changed", || {
+        handle.state().sync == SyncView::Live
+    });
+    assert_eq!(server.join_keys(), vec!["k2".to_string()]);
+    assert!(handle.close().wait(WAIT));
+}
+
+#[test]
+fn credentials_unreadable_right_now_keep_the_engine_dialling() {
+    let (_server_runtime, server) = live_server();
+    let dir = tempfile::tempdir().unwrap();
+    sign_in(dir.path(), "k1");
+    let credentials = dir.path().join("credentials.enc");
+    std::fs::remove_file(&credentials).unwrap();
+    std::fs::create_dir(&credentials).unwrap();
+    let handle = attach(config(dir.path(), &server.url)).unwrap();
+    wait_until("a second dial abandoned before its join", || {
+        server.stats.upgrades() >= 2
+    });
+    assert!(!halted_not_enrolled(&handle), "{:?}", handle.state());
+    assert!(server.join_keys().is_empty());
+    std::fs::remove_dir(&credentials).unwrap();
+    sign_in(dir.path(), "k1");
+    wait_until("live", || handle.state().sync == SyncView::Live);
+    assert_eq!(server.join_keys(), vec!["k1".to_string()]);
+    assert!(handle.close().wait(WAIT));
 }
