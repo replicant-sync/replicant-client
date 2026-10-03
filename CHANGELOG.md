@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.5
+
+Packaging release from the 0.6 line (branch `release/0.6`, from v0.6.4): no API
+or behaviour change.
+
+- New release asset `replicant-sdk-v0.6.5-ios-xcframework.tar.gz`: `include/` and a
+  static `lib/libreplicant_client.xcframework` with arm64 device and arm64 simulator
+  slices, built for iOS 16.0. `FetchReplicant.cmake` from `main` links it when
+  `CMAKE_SYSTEM_NAME` is `iOS` (needs CMake 3.28+).
+
 ## 0.6.4
 
 Patch release: no API change. Event timing changes for hosts that relied on the
