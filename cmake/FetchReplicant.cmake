@@ -10,6 +10,12 @@
 #
 # After calling fetch_replicant(), the target 'replicant_client' is available
 # for linking with target_link_libraries().
+#
+# iOS (CMAKE_SYSTEM_NAME iOS) links a static libreplicant_client.xcframework
+# (arm64 device and arm64 simulator slices) and needs CMake 3.28+. Releases ship
+# it from 0.6.5 and 0.7.1. CMake picks the slice for CMAKE_OSX_SYSROOT at
+# configure time; to switch with `xcodebuild -sdk` instead, set
+# CMAKE_XCODE_LINK_BUILD_PHASE_MODE to KNOWN_LOCATION so Xcode picks it.
 
 include(FetchContent)
 
@@ -29,7 +35,15 @@ function(fetch_replicant)
     endif()
 
     # Determine platform-specific asset pattern
-    if(APPLE)
+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        if(CMAKE_VERSION VERSION_LESS 3.28)
+            message(FATAL_ERROR "The Replicant iOS SDK is an .xcframework, which needs CMake 3.28 or newer (this is ${CMAKE_VERSION})")
+        endif()
+        if(REPLICANT_SHARED)
+            message(FATAL_ERROR "The Replicant iOS SDK ships a static library only")
+        endif()
+        set(ASSET_PATTERN "ios-xcframework\\.tar\\.gz")
+    elseif(APPLE)
         set(ASSET_PATTERN "macos-universal\\.tar\\.gz")
     elseif(WIN32)
         # Default to static CRT (self-contained, no runtime dependencies)
@@ -73,6 +87,9 @@ function(fetch_replicant)
             string(REGEX REPLACE "\"browser_download_url\"[^\"]*\"([^\"]*)\"" "\\1" ASSET_URL "${URL_ENTRY}")
             message(STATUS "  - ${ASSET_URL}")
         endforeach()
+        if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+            message(FATAL_ERROR "This Replicant release (${RELEASE_API_URL}) has no iOS SDK. The first releases with one are 0.6.5 and 0.7.1.")
+        endif()
         message(FATAL_ERROR "Could not find Replicant SDK asset for pattern: ${ASSET_PATTERN}")
     endif()
     message(STATUS "Replicant SDK URL: ${SDK_URL}")
@@ -85,7 +102,12 @@ function(fetch_replicant)
     FetchContent_MakeAvailable(replicant)
 
     # Find the library (static or shared based on option)
-    if(REPLICANT_STATIC)
+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        set(REPLICANT_CLIENT_LIB "${replicant_SOURCE_DIR}/lib/libreplicant_client.xcframework")
+        if(NOT EXISTS "${REPLICANT_CLIENT_LIB}")
+            message(FATAL_ERROR "Could not find libreplicant_client.xcframework in ${replicant_SOURCE_DIR}/lib")
+        endif()
+    elseif(REPLICANT_STATIC)
         if(WIN32)
             set(LIB_NAME "replicant_client.lib")
         else()
