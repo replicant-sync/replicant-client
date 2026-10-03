@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.7.1
+
+Packaging release: no API or behaviour change.
+
+- New release asset `replicant-sdk-v0.7.1-ios-xcframework.tar.gz`: `include/` and a
+  static `lib/libreplicant_client.xcframework` with arm64 device and arm64 simulator
+  slices, built for iOS 16.0.
+- `FetchReplicant.cmake` links the xcframework when `CMAKE_SYSTEM_NAME` is `iOS`
+  (needs CMake 3.28+).
+- The release workflow runs by hand (`workflow_dispatch`) to build and upload the
+  archives without publishing a release.
+
 ## 0.7.0 - 2026-10-01
 
 ### Breaking: protocol v2 and C API v2 (server 0.5.0 required)

@@ -4,10 +4,14 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual runs build and upload the archives as workflow artifacts but publish no release.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Archive names carry the tag; a manual run on a branch uses the commit instead.
+  SDK_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('dev-{0}', github.sha) }}
 
 jobs:
   build-dist:
@@ -37,7 +41,7 @@ jobs:
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
       with:
-        targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+        targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim' || '' }}
 
     - name: Cache cargo
       uses: actions/cache@v4
@@ -72,17 +76,34 @@ jobs:
 
         # Build dist with universal binaries
         python scripts/build_dist.py --skip-build
-        cd dist && tar -czvf ../replicant-sdk-${{ github.ref_name }}-macos-universal.tar.gz . && cd ..
+        cd dist && tar -czvf ../replicant-sdk-${{ env.SDK_VERSION }}-macos-universal.tar.gz . && cd ..
 
         # Swap in ARM64 libraries and create archive
         cp target/aarch64-apple-darwin/release/libreplicant_client.a dist/lib/
         cp target/aarch64-apple-darwin/release/libreplicant_client.dylib dist/lib/
-        cd dist && tar -czvf ../replicant-sdk-${{ github.ref_name }}-macos-arm64.tar.gz . && cd ..
+        cd dist && tar -czvf ../replicant-sdk-${{ env.SDK_VERSION }}-macos-arm64.tar.gz . && cd ..
 
         # Swap in x86_64 libraries and create archive
         cp target/x86_64-apple-darwin/release/libreplicant_client.a dist/lib/
         cp target/x86_64-apple-darwin/release/libreplicant_client.dylib dist/lib/
-        cd dist && tar -czvf ../replicant-sdk-${{ github.ref_name }}-macos-x86_64.tar.gz . && cd ..
+        cd dist && tar -czvf ../replicant-sdk-${{ env.SDK_VERSION }}-macos-x86_64.tar.gz . && cd ..
+
+    - name: Build SDK (iOS xcframework)
+      if: runner.os == 'macOS'
+      env:
+        IPHONEOS_DEPLOYMENT_TARGET: '16.0'
+      run: |
+        cargo build --package replicant-client --release --target aarch64-apple-ios
+        cargo build --package replicant-client --release --target aarch64-apple-ios-sim
+
+        # Static library only; headers are the same ones the macOS archives ship
+        mkdir -p ios-dist/lib
+        cp -R dist/include ios-dist/include
+        xcodebuild -create-xcframework \
+          -library target/aarch64-apple-ios/release/libreplicant_client.a -headers dist/include \
+          -library target/aarch64-apple-ios-sim/release/libreplicant_client.a -headers dist/include \
+          -output ios-dist/lib/libreplicant_client.xcframework
+        cd ios-dist && tar -czvf ../replicant-sdk-${{ env.SDK_VERSION }}-ios-xcframework.tar.gz . && cd ..
 
     - name: Build SDK (Linux)
       if: runner.os == 'Linux'
@@ -105,7 +126,7 @@ jobs:
 
         # Package static CRT variant
         python scripts/build_dist.py --skip-build
-        Compress-Archive -Path dist/* -DestinationPath replicant-sdk-${{ github.ref_name }}-windows-x64-static-crt.zip
+        Compress-Archive -Path dist/* -DestinationPath replicant-sdk-${{ env.SDK_VERSION }}-windows-x64-static-crt.zip
 
         # Clean for next build
         Remove-Item -Recurse -Force target/release
@@ -117,13 +138,13 @@ jobs:
 
         # Package dynamic CRT variant
         python scripts/build_dist.py --skip-build
-        Compress-Archive -Path dist/* -DestinationPath replicant-sdk-${{ github.ref_name }}-windows-x64-dynamic-crt.zip
+        Compress-Archive -Path dist/* -DestinationPath replicant-sdk-${{ env.SDK_VERSION }}-windows-x64-dynamic-crt.zip
 
     - name: Create archive (Linux)
       if: runner.os == 'Linux'
       run: |
         cd dist
-        tar -czvf ../replicant-sdk-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz .
+        tar -czvf ../replicant-sdk-${{ env.SDK_VERSION }}-${{ matrix.platform }}.tar.gz .
 
     - name: Upload artifact (macOS)
       if: runner.os == 'macOS'
@@ -131,9 +152,10 @@ jobs:
       with:
         name: replicant-sdk-macos
         path: |
-          replicant-sdk-${{ github.ref_name }}-macos-universal.tar.gz
-          replicant-sdk-${{ github.ref_name }}-macos-arm64.tar.gz
-          replicant-sdk-${{ github.ref_name }}-macos-x86_64.tar.gz
+          replicant-sdk-${{ env.SDK_VERSION }}-macos-universal.tar.gz
+          replicant-sdk-${{ env.SDK_VERSION }}-macos-arm64.tar.gz
+          replicant-sdk-${{ env.SDK_VERSION }}-macos-x86_64.tar.gz
+          replicant-sdk-${{ env.SDK_VERSION }}-ios-xcframework.tar.gz
         retention-days: 7
 
     - name: Upload artifact (Linux)
@@ -141,7 +163,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: replicant-sdk-${{ matrix.platform }}
-        path: replicant-sdk-${{ github.ref_name }}-${{ matrix.platform }}.${{ matrix.archive-ext }}
+        path: replicant-sdk-${{ env.SDK_VERSION }}-${{ matrix.platform }}.${{ matrix.archive-ext }}
         retention-days: 7
 
     - name: Upload artifact (Windows)
@@ -150,13 +172,14 @@ jobs:
       with:
         name: replicant-sdk-windows
         path: |
-          replicant-sdk-${{ github.ref_name }}-windows-x64-static-crt.zip
-          replicant-sdk-${{ github.ref_name }}-windows-x64-dynamic-crt.zip
+          replicant-sdk-${{ env.SDK_VERSION }}-windows-x64-static-crt.zip
+          replicant-sdk-${{ env.SDK_VERSION }}-windows-x64-dynamic-crt.zip
         retention-days: 7
 
   create-release:
     name: Create GitHub Release
     needs: [build-dist]
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
