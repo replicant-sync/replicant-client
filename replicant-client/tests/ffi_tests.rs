@@ -1313,9 +1313,11 @@ fn a_config_or_state_from_a_later_version_is_accepted_and_its_new_fields_left_al
     close(handle);
 }
 
+/// With LF line endings: a Windows checkout may give the committed header CRLF.
 fn committed_header() -> String {
     std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("include/replicant.h"))
         .unwrap()
+        .replace("\r\n", "\n")
 }
 
 #[test]
