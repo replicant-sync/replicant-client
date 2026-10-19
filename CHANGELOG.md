@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.2 - 2026-10-19
 
 - Windows: opening a 0.6 data dir no longer fails with `ErrorMigrationFailed`. The
   backup copy taken before migrating was flushed through a read-only handle, which
