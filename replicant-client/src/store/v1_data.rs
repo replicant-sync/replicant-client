@@ -448,7 +448,10 @@ async fn write_backup(pool: &SqlitePool, partial: &Path, backup: &Path) -> Store
             busy if busy.is_busy() => busy,
             error => backup_failed(error),
         })?;
-    std::fs::File::open(partial)
+    // Windows flushes only a handle opened for writing.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(partial)
         .and_then(|file| file.sync_all())
         .map_err(backup_failed)?;
     std::fs::rename(partial, backup).map_err(backup_failed)?;

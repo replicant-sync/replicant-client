@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Windows: opening a 0.6 data dir no longer fails with `ErrorMigrationFailed`. The
+  backup copy taken before migrating was flushed through a read-only handle, which
+  Windows refuses (access denied), so no 0.6 library could be migrated there.
+
 ## 0.7.1
 
 Packaging release: no API or behaviour change.
