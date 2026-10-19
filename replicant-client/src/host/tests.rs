@@ -15,7 +15,7 @@ use crate::driver::test_server::ScriptedServer;
 use crate::engine::list_merge::{ListMergeConfig, ListMergePolicy};
 use crate::engine::machine::{ConnectionView, HaltReason, SyncView};
 use crate::secret_store::{self, Credentials};
-use crate::store::test_support::{count, exec, ME};
+use crate::store::test_support::{count, exec, v012_db, v1_doc, v1_user, ME};
 use crate::store::Store;
 
 /// Nothing listens here, so an engine with credentials keeps failing to connect.
@@ -119,6 +119,23 @@ fn a_different_server_for_an_open_data_dir_is_refused() {
         Err(OpenError::ConfigMismatch(_))
     ));
     assert!(open.close().wait(WAIT));
+}
+
+/// Runs the open path a 0.6 library takes on its first 0.7 launch, backup included.
+#[test]
+fn attaching_to_a_v1_data_dir_backs_it_up_and_migrates_it() {
+    let (dir, path) = Runtime::new().unwrap().block_on(async {
+        let (dir, path, pool) = v012_db().await;
+        v1_user(&pool, ME, true).await;
+        let doc_id = uuid::Uuid::from_u128(0xD001).to_string();
+        v1_doc(&pool, &doc_id, Some(ME), json!({"n": 1}), "synced", None).await;
+        pool.close().await;
+        (dir, path)
+    });
+    let handle = attach(config(dir.path(), OFFLINE)).unwrap();
+    let backup = path.with_file_name("replicant.sqlite3.v1-backup");
+    assert!(backup.exists(), "no backup at {}", backup.display());
+    assert!(handle.close().wait(WAIT));
 }
 
 #[test]
